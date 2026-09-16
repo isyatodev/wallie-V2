@@ -347,6 +347,7 @@
             <button :class="{on: cfg.tts.provider==='elevenlabs'}" @click="cfg.tts.provider='elevenlabs'">ElevenLabs</button>
             <button :class="{on: cfg.tts.provider==='piper'}" @click="cfg.tts.provider='piper'">Piper (local · free)</button>
             <button :class="{on: cfg.tts.provider==='kokoro'}" @click="cfg.tts.provider='kokoro'">Kokoro (local · free)</button>
+            <button :class="{on: cfg.tts.provider==='openai_compatible'}" @click="cfg.tts.provider='openai_compatible'">OpenAI-Compatible (gateway)</button>
           </div>
         </div>
         <div class="field">
@@ -462,9 +463,18 @@
         </template>
         <template x-if="cfg.tts.provider==='openai_compatible'">
           <div class="field">
-            <label>Voice</label>
-            <input x-model="cfg.tts.openai_compatible_voice" placeholder="alloy / af_heart / …" />
-            <small class="hint">Voice name as the endpoint expects it.</small>
+            <label>Voice <button type="button" class="mini-btn" style="float:right;font-size:.72rem;padding:.1rem .55rem"
+              @click="loadTtsVoices()" :disabled="ttsVoicesBusy"
+              x-text="ttsVoicesBusy ? 'listing…' : 'list voices'"></button></label>
+            <input list="tts-voice-options" x-model="cfg.tts.openai_compatible_voice" placeholder="alloy / af_heart / …" />
+            <datalist id="tts-voice-options">
+              <template x-for="v in ttsVoices" :key="v">
+                <option :value="v"></option>
+              </template>
+            </datalist>
+            <small class="hint" x-show="ttsVoicesMsg" x-text="ttsVoicesMsg"></small>
+            <small class="hint" x-show="!ttsVoicesMsg && ttsVoices.length">Voices listed from <code x-text="ttsVoicesEndpoint"></code> — pick from the dropdown or type free-form.</small>
+            <small class="hint" x-show="!ttsVoicesMsg && !ttsVoices.length">Voice name as the endpoint expects it. <b>list voices</b> queries the endpoint's /models.</small>
           </div>
         </template>
         <template x-if="cfg.tts.provider==='openai_compatible'">
@@ -488,7 +498,8 @@
 
       <div class="test-strip">
         <input class="test-input" x-model="voiceTestText" placeholder="Type a line to test the voice..." />
-        <button class="btn primary" @click="testVoice()" :disabled="!voiceTestText || testing">▶ Play</button>
+        <button class="btn primary" @click="testVoice()" :disabled="!voiceTestText || testing" x-text="testing ? '… playing' : '▶ Play'"></button>
+        <small class="hint" x-show="voiceTestMsg" x-text="voiceTestMsg" style="flex-basis:100%;"></small>
       </div>
 
       <!-- ============ Speaker ID (voice prints) ============ -->

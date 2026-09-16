@@ -225,6 +225,7 @@ function app() {
     testResult: "",
     donationTest: { donor: "TestDonor", amount: 10, message: "manda o salve", msg: "" },
     voiceTestText: "",
+    voiceTestMsg: "",
     avatarTestExpr: "",
     avatarTestMsg: "",
     visionTestResult: "",
@@ -257,6 +258,13 @@ function app() {
     secretMsg: {},       // env -> "saved" / "tested ✓" / error text
     secretBusy: {},      // env -> bool (test in flight)
 
+    // TTS voice discovery (Voice page, openai_compatible provider)
+    ttsVoices: [],
+    ttsVoicesEndpoint: "",
+    ttsVoicesSource: "",
+    ttsVoicesBusy: false,
+    ttsVoicesMsg: "",
+
     // First-run setup wizard (additive — reuses config/secrets/start APIs, breaks nothing).
     wizard: { open: false, step: 1, path: "", busy: false, keyDrafts: {}, keyMsg: {}, keyBusy: {} },
 
@@ -276,6 +284,33 @@ function app() {
       setInterval(() => this.loadLtm(), 5000);
     },
 
+    // ----- TTS voice discovery (Voice page) -----
+    async loadTtsVoices() {
+      if (this.ttsVoicesBusy) return;
+      this.ttsVoicesBusy = true;
+      this.ttsVoicesMsg = "";
+      try {
+        const r = await fetch("/api/tts/voices", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider_ref: this.cfg.tts.provider_ref || "" }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+        this.ttsVoices = data.voices || [];
+        this.ttsVoicesEndpoint = data.endpoint || "";
+        this.ttsVoicesSource = data.source || "";
+        this.ttsVoicesMsg = this.ttsVoices.length
+          ? `${this.ttsVoices.length} voices`
+          : "endpoint reachable but no voices listed — type the name manually";
+      } catch (e) {
+        this.ttsVoices = [];
+        this.ttsVoicesMsg = "✗ " + (e.message || e);
+      } finally {
+        this.ttsVoicesBusy = false;
+      }
+    },
+
     // ----- dynamic provider blocks (API Keys page) -----
     async loadProviders() {
       try {
@@ -286,6 +321,12 @@ function app() {
           this.providerCategories = data.categories || [];
         }
       } catch (e) { console.warn("loadProviders:", e); }
+    },
+
+    async refreshProviders() {
+      // Same as loadProviders but updates the in-place state the cfg dropdowns
+      // read; called after save so block ids/refs stay fresh everywhere.
+      await this.loadProviders();
     },
 
     providerAdd() {
@@ -310,6 +351,7 @@ function app() {
         this.providers = data.providers || [];
         this.providerMsg = "saved";
         await this.loadSecrets();   // new blocks immediately get their key field
+        await this.loadConfig();    // re-sync cfg (dropdowns read block ids)
       } catch (e) {
         this.providerMsg = e.message || "fail";
       } finally {
@@ -1132,14 +1174,24 @@ function app() {
     async _voice(text) {
       await this.save();
       this.testing = true;
+      this.voiceTestMsg = "";
       try {
-        await fetch("/api/test/voice", {
+        const r = await fetch("/api/test/voice", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text }),
         });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceTestMsg = "✗ " + (data.detail || `HTTP ${r.status}`);
+          return;
+        }
+        this.voiceTestMsg = "✓ " + (data.note || "playing");
+      } catch (e) {
+        this.voiceTestMsg = "✗ " + e;
       } finally {
         this.testing = false;
+        setTimeout(() => (this.voiceTestMsg = ""), 6000);
       }
     },
 

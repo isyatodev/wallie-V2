@@ -195,6 +195,10 @@ class SecretBulkBody(BaseModel):
     values: dict[str, str]
 
 
+class TtsVoicesBody(BaseModel):
+    provider_ref: str = ""
+
+
 class TestProviderBody(BaseModel):
     # "openai" | "groq" | "openrouter" | "anthropic" | "gemini" | "fish" | "elevenlabs" | "piper"
     provider: str
@@ -331,6 +335,10 @@ def _build_app(
     async def put_config(payload: dict[str, Any]) -> dict[str, Any]:
         # Merge onto the existing profile so any config section the UI doesn't send
         # (e.g. hearing) is preserved instead of being silently reset to defaults.
+        # Provider blocks are NOT accepted here: the UI's cfg.providers copy is
+        # stale the moment /api/providers saved something, and merging it back
+        # would silently wipe blocks. Blocks are owned by PUT /api/providers.
+        payload.pop("providers", None)
         existing = load_profile().model_dump()
         existing.update(payload)
         cfg = AppConfig(**existing)
@@ -359,6 +367,21 @@ def _build_app(
         except Exception as e:
             logger.exception("dashboard: preflight failed")
             raise HTTPException(status_code=500, detail=str(e) or e.__class__.__name__)
+
+    @app.post("/api/tts/voices")
+    async def api_tts_voices(body: TtsVoicesBody) -> dict[str, Any]:
+        """Query the configured TTS endpoint's /models for available voices,
+        so the Voice page can offer a dropdown instead of a blind text input."""
+        from wallie import fetch_tts_voices
+        from config import get_runtime
+        try:
+            runtime = get_runtime()
+            return await fetch_tts_voices(runtime.config, runtime.secrets, ref=body.provider_ref)
+        except (ValueError, RuntimeError) as e:
+            raise HTTPException(status_code=400, detail=str(e)[:220])
+        except Exception as e:
+            logger.exception("dashboard: tts voices fetch failed")
+            raise HTTPException(status_code=500, detail=str(e)[:220])
 
     @app.post("/api/start")
     async def api_start() -> dict[str, Any]:
@@ -1167,31 +1190,105 @@ def _build_app(
 
     @app.post("/api/test/voice")
     async def test_voice(body: TestVoiceBody) -> dict[str, Any]:
+        """Synthesize a sample line with the CONFIGURED TTS and play it.
+
+        Uses the same block/legacy resolution as the real build (via
+        wallie._effective_tts), and reports what happened: bytes received,
+        whether the payload needed ffmpeg decoding, and the real reason on
+        failure (empty synthesis, non-PCM without ffmpeg, bad config…).
+        """
+        from wallie import _effective_tts
+        from tts.decode import sniff_compressed, find_ffmpeg
+        from tts.base import TTSError
+        from config import get_runtime
+
+        text = (body.text or "").strip()
+        if not text:
+            return JSONResponse(status_code=400, content={"detail": "empty text"})
+        if len(text) > 600:
+            return JSONResponse(status_code=400, content={"detail": "text too long (max 600 chars)"})
+
         cfg = load_profile()
-        orch = state.orchestrator
-        if orch and orch.status().get("running"):
-            player = orch._player  # noqa: SLF001
-            tts = build_tts(cfg.tts, Secrets())
-            try:
-                async for pcm in tts.synthesize(body.text):
-                    await player.write(pcm)
-            finally:
-                await tts.aclose()
-            return {"ok": True, "routed": "live-player"}
-        from audio import AudioPlayer
-        tts = build_tts(cfg.tts, Secrets())
-        player = AudioPlayer(sample_rate=tts.sample_rate, channels=tts.channels,
-                             device=(cfg.tts.output_device or None))
-        player.start()
+        runtime = get_runtime()
         try:
-            async for pcm in tts.synthesize(body.text):
-                await player.write(pcm)
-            await asyncio.sleep(0.3)
-            await player.wait_drained()
+            tts_cfg, tts_secrets = _effective_tts(runtime)
+        except (ValueError, RuntimeError) as e:
+            return JSONResponse(status_code=400, content={"detail": str(e)[:220]})
+
+        def _fail(msg: str) -> JSONResponse:
+            return JSONResponse(status_code=400, content={"detail": msg})
+
+        orch = state.orchestrator
+        live = bool(orch and orch.status().get("running"))
+
+        try:
+            tts = build_tts(tts_cfg, tts_secrets)
+        except TTSError as e:
+            return _fail(str(e))
+
+        routed = "live-player" if live else "preview-player"
+        chunks: list[bytes] = []
+        try:
+            async for pcm in tts.synthesize(text):
+                chunks.append(pcm)
+        except TTSError as e:
+            return _fail(str(e))
+        except Exception as e:
+            logger.exception("dashboard: tts test synthesis failed")
+            return _fail(f"synthesis failed: {e}")
         finally:
-            player.close()
             await tts.aclose()
-        return {"ok": True, "routed": "preview-player"}
+
+        raw = b"".join(chunks)
+        if not raw:
+            return _fail(
+                "endpoint returned no audio — check the model/voice names and "
+                "that the key has TTS access"
+            )
+
+        decoded = False
+        if sniff_compressed(raw[:12]):
+            ffmpeg = find_ffmpeg()
+            if not ffmpeg:
+                return _fail(
+                    "endpoint answered a compressed format (MP3/OGG) and ffmpeg "
+                    "is unavailable — install ffmpeg, `pip install imageio-ffmpeg`, "
+                    "or set WALLIE_FFMPEG"
+                )
+            from tts.decode import decode_to_pcm16
+            try:
+                raw = await decode_to_pcm16(raw, ffmpeg, tts.sample_rate)
+            except RuntimeError as e:
+                return _fail(f"ffmpeg decode failed: {e}")
+            decoded = True
+
+        if len(raw) < 64:  # plausible audio of a sentence is way longer
+            return _fail(f"audio too short ({len(raw)} bytes) — endpoint likely rejected the request")
+        if len(raw) % 2:
+            raw = raw[:-1]
+
+        # ---- playback ----
+        if live:
+            player = orch._player  # noqa: SLF001
+            await player.write(raw)
+        else:
+            from audio import AudioPlayer
+            player = AudioPlayer(sample_rate=tts.sample_rate, channels=tts.channels,
+                                 device=(cfg.tts.output_device or None))
+            player.start()
+            try:
+                await player.write(raw)
+                await asyncio.sleep(0.3)
+                await player.wait_drained()
+            finally:
+                player.close()
+
+        dur = len(raw) / (tts.sample_rate * tts.channels * 2)
+        note = f"{len(raw)} bytes · {dur:.1f}s"
+        if decoded:
+            note += " · decoded via ffmpeg (gateway ignored pcm)"
+        return {"ok": True, "routed": routed, "decoded": decoded,
+                "bytes": len(raw), "duration_sec": round(dur, 2), "note": note}
 
     @app.websocket("/ws/events")
     async def ws_events(ws: WebSocket) -> None:

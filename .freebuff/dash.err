@@ -1,0 +1,14 @@
+[32m2026-09-16 19:30:04.877[0m | [1mINFO    [0m | [36mdashboard.server[0m:[36mserve[0m:[36m1424[0m - [1mdashboard: http://127.0.0.1:8799[0m
+INFO:     Started server process [5016]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8799 (Press CTRL+C to quit)
+INFO:     127.0.0.1:52148 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:52149 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:52159 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:52160 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+[32m2026-09-16 19:31:06.081[0m | [1mINFO    [0m | [36maudio.player[0m:[36mstart[0m:[36m99[0m - [1maudio: playing at 24000 Hz, 1ch, block=960[0m

@@ -86,6 +86,93 @@ def _resolve_provider(cfg, secrets, category: str, ref: str = "", allow_default:
     }
 
 
+def _tts_voices_from_models(data: Any) -> list[str]:
+    """Extract voice names from an OpenAI-compatible /models payload.
+
+    Endpoints differ wildly: OpenAI lists models (tts-1…), gateways list
+    voices as models (af_heart, alloy…), some add a "voices" field. The
+    extractor is deliberately permissive — whatever it finds feeds a
+    suggestion dropdown, never a hard gate.
+    """
+    voices: list[str] = []
+    if not isinstance(data, dict):
+        return voices
+    raw_voices = data.get("voices")
+    if isinstance(raw_voices, list):
+        for v in raw_voices:
+            if isinstance(v, str):
+                voices.append(v)
+            elif isinstance(v, dict):
+                name = v.get("id") or v.get("name") or v.get("voice_id")
+                if name:
+                    voices.append(str(name))
+    for m in data.get("data") or []:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("id") or "")
+        if not mid:
+            continue
+        if _re.search(r"tts|whisper|embed|dall-e|moderation|gpt|o1|o3|o4|rerank", mid, _re.I):
+            continue
+        voices.append(mid)
+    out, seen = [], set()
+    for v in voices:
+        v = v.strip()
+        if v and v.lower() not in seen:
+            out.append(v)
+            seen.add(v.lower())
+    return out
+
+
+def _effective_tts(runtime: Runtime) -> tuple:
+    """(tts_cfg, secrets) with a TTS provider block's endpoint/model/key applied
+    when tts.provider is openai_compatible — mirrors the build's _effective_compat
+    so a voice test exercises EXACTLY what a live session would use."""
+    cfg = runtime.config
+    if cfg.tts.provider != "openai_compatible":
+        return cfg.tts, runtime.secrets
+    prov = _resolve_provider(cfg, runtime.secrets, "tts", ref=cfg.tts.provider_ref,
+                             allow_default=False)
+    if prov["from"] == "legacy" or not prov["base_url"]:
+        return cfg.tts, runtime.secrets
+    updates: dict = {"openai_compatible_base_url": prov["base_url"]}
+    if prov["model"]:
+        updates["openai_compatible_model"] = prov["model"]
+    tts_cfg = cfg.tts.model_copy(update=updates)
+    secrets_eff = runtime.secrets.model_copy(
+        update={"openai_compatible_tts_api_key":
+                _compat_api_key(prov["api_key"], prov["base_url"], "tts provider block")})
+    return tts_cfg, secrets_eff
+
+
+async def fetch_tts_voices(cfg, secrets, ref: str = "") -> dict:
+    """Resolve the TTS endpoint (provider block → legacy fields, same order as
+    the build) and query its /models for available voices."""
+    import httpx
+    r = _resolve_provider(cfg, secrets, "tts", ref=ref, allow_default=False)
+    base = (r.get("base_url") or "").strip().rstrip("/")
+    if not base:
+        raise ValueError(
+            "no TTS endpoint configured — create a TTS block on the API Keys "
+            "page or fill the legacy Base URL"
+        )
+    api_key = _compat_api_key(r.get("api_key") or "", base, "openai_compatible (tts)")
+    headers = {"Authorization": f"Bearer {api_key}"}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+        resp = await client.get(f"{base}/models", headers=headers)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code} from {base}/models: {resp.text[:160]}")
+    try:
+        data = resp.json()
+    except ValueError as e:
+        raise RuntimeError(f"{base}/models returned non-JSON") from e
+    return {
+        "endpoint": base,
+        "source": r.get("from", ""),
+        "voices": _tts_voices_from_models(data),
+    }
+
+
 def _compat_api_key(api_key: str, base_url: str, purpose: str) -> str:
     """Local OpenAI-compatible servers (Ollama, LM Studio, kokoro-fastapi…)
     don't need a key; remote ones do. Send a placeholder for localhost so the
@@ -183,6 +270,16 @@ def _pf_dep_missing(pkg: str) -> bool:
         return True
 
 
+def _pf_ffmpeg_available() -> bool:
+    """True when an ffmpeg binary can be located (WALLIE_FFMPEG env override,
+    PATH, or the imageio-ffmpeg wheel) — used only by the TTS MP3 decoder."""
+    try:
+        from tts.decode import find_ffmpeg
+        return bool(find_ffmpeg())
+    except Exception:
+        return False
+
+
 def preflight(runtime: Optional[Runtime] = None) -> list[dict]:
     """Static pre-start checklist for the dashboard.
 
@@ -253,6 +350,11 @@ def preflight(runtime: Optional[Runtime] = None) -> list[dict]:
             add("error", "Voice (TTS)", f"endpoint {base} is remote and has no API key")
         if base and not model:
             add("warn", "Voice (TTS)", "no TTS model set — the endpoint's default will be used")
+        if base and _pf_dep_missing("imageio_ffmpeg") and not _pf_ffmpeg_available():
+            add("warn", "Voice (TTS)",
+                "ffmpeg not found — if the gateway ignores response_format=pcm and "
+                "answers MP3, sentences will fail. Fix: install ffmpeg, or "
+                "`pip install imageio-ffmpeg`, or set WALLIE_FFMPEG")
 
     # ---- Hearing (STT) — remote STT is lenient in the build, so warns there ----
     hearing = cfg.hearing
@@ -346,7 +448,13 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
             "memory": "openai_compatible_memory_api_key",
             "thoughts": "openai_compatible_thoughts_api_key",
         }[category]
-        secrets_eff = runtime.secrets.model_copy(update={key_field: prov["api_key"]})
+        # Localhost blocks don't need a key — same rule as everywhere else;
+        # without this the provider constructor rejects an empty credential
+        # even though preflight (correctly) passes localhost blocks.
+        secrets_eff = runtime.secrets.model_copy(update={
+            key_field: _compat_api_key(prov["api_key"], prov["base_url"],
+                                       f"{category} provider block"),
+        })
         return sub_cfg, secrets_eff
 
     llm_cfg_eff, llm_secrets_eff = (

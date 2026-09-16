@@ -46,8 +46,11 @@ def test_preflight_clean_config_reports_nothing(tmp_path):
     assert _issues(cfg, tmp_path) == []
 
 
-def test_preflight_flags_unconfigured_tts(tmp_path):
+def test_preflight_flags_unconfigured_tts(tmp_path, monkeypatch):
     """The default profile (groq brain, fish TTS, no keys) is two errors."""
+    # Hermetic: a real GROQ_API_KEY in the machine's .env would mask the error.
+    for env in ("GROQ_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(env, raising=False)
     issues = _issues(AppConfig(), tmp_path)
     sections = _sections(issues)
     assert sorted(sections) == ["Engine (LLM)", "Voice (TTS)"]
