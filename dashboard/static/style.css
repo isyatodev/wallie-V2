@@ -818,3 +818,24 @@ input[type=password]:focus-visible, select:focus-visible, textarea:focus-visible
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: #384259; }
+
+/* ===== Memory section (durable fact store) ===== */
+.memory-crud { display: flex; flex-direction: column; gap: 10px; }
+.memory-list { display: flex; flex-direction: column; gap: 6px; max-height: 420px; overflow-y: auto; padding-right: 4px; }
+.memory-row { border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg-2); }
+.memory-main { display: flex; align-items: center; gap: 10px; padding: 8px 10px; }
+.memory-main.editing { flex-wrap: wrap; background: var(--bg-3); border-radius: var(--radius); }
+.memory-kind {
+  flex: 0 0 22px; height: 22px; display: flex; align-items: center; justify-content: center;
+  border-radius: 6px; font-size: 11px; font-weight: 700;
+}
+.memory-kind.long { background: rgba(96,165,250,.15); color: #7fb1f7; border: 1px solid rgba(96,165,250,.35); }
+.memory-kind.short { background: rgba(251,191,36,.14); color: #fbbf24; border: 1px solid rgba(251,191,36,.35); }
+.memory-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.memory-text > span { overflow-wrap: anywhere; }
+.memory-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.memory-feed { display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow-y: auto; padding-right: 4px; }
+.memory-feed .memory-row { animation: memIn .25s ease-out; }
+.memory-feed .memory-row.undone { opacity: 0.45; }
+.memory-feed .memory-row.undone .memory-text > span { text-decoration: line-through; }
+@keyframes memIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }

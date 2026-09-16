@@ -49,6 +49,29 @@ def build_provider(cfg: LLMConfig, secrets: Secrets) -> LLMProvider:
             },
         )
 
+    if p == "openai_compatible":
+        # GENERIC OpenAI-compatible endpoint: any provider implementing the
+        # chat/completions API. Base URL (with version path), model and API key
+        # are all user-configured — no provider is hardcoded here.
+        try:
+            from .openai_compat import OpenAICompatProvider
+        except ModuleNotFoundError as e:
+            raise _missing_sdk(p, "openai") from e
+        base_url = (cfg.openai_compatible_base_url or "").strip()
+        if not base_url:
+            raise LLMError(
+                "openai_compatible: set llm.openai_compatible_base_url in the profile "
+                '(e.g. "https://example.com/v1") — it must include the version path'
+            )
+        return OpenAICompatProvider(
+            name="openai_compatible",
+            model=cfg.model,
+            api_key=secrets.openai_compatible_api_key,
+            base_url=base_url,
+            supports_vision=cfg.vision_capable,
+            timeout=cfg.openai_compatible_timeout,
+        )
+
     if p == "anthropic":
         try:
             from .anthropic import AnthropicProvider

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Wallie Captions — disabled</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: transparent; overflow: hidden;
+  }
+  #msg {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    font-family: "Segoe UI", Arial, sans-serif; font-size: 20px;
+    color: rgba(255,255,255,.65); text-shadow: 0 1px 4px rgba(0,0,0,.8);
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+<div id="msg">Captions are disabled —<br />enable them in the Wallie dashboard (Captions section)</div>
+<script>
+// Auto-reload every 30s so a browser source left open picks up the toggle
+// without anyone touching OBS.
+setTimeout(() => location.reload(), 30000);
+</script>
+</body>
+</html>

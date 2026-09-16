@@ -15,6 +15,7 @@ from audio import AudioPlayer
 from chat import ChatManager, ChatMessage
 from config import AppConfig, Runtime
 from core.context import Conversation, ImageBlock, pick_topic
+from donations.base import DonationDedupe
 from core.highlights import HighlightTracker
 from core.persona import Persona
 from llm import LLMProvider
@@ -69,12 +70,25 @@ class Orchestrator:
         self._llm = llm
         self._tts = tts
         self._player = player
+        # Dedicated vision model (optional): when set, vision-intent segments and
+        # the on-demand "grab + describe" path use this provider instead of the
+        # main brain LLM (e.g. qwen-vl via an OpenAI-compatible gateway). Built in
+        # wallie.build_orchestrator; None = the main LLM handles vision too.
+        self._vision_llm: Optional[LLMProvider] = None
         self._chat = chat_manager
         self._vision_loop = vision_loop
         self._vision_queue = vision_queue
         self._vision_ready_at: float = 0.0
         self._avatar = avatar
         self._memory = memory_store
+        # Long-term fact memory (short+long tier store) + its extractor, and the
+        # spontaneous-thought scheduler. Built in wallie.build_orchestrator;
+        # None = feature off.
+        self._ltm: Any = None
+        self._memory_capture: Any = None
+        self._memory_consolidator: Any = None
+        self._thoughts: Any = None
+        self._ltm_last_janitor_ts: float = 0.0
         self._highlights = HighlightTracker(
             self._cfg.profile_name or "default",
             enabled=self._cfg.orchestrator.auto_highlight,
@@ -84,6 +98,14 @@ class Orchestrator:
         self._hearing_queue = hearing_queue
         self._latest_heard: str = ""       # most recent transcript Wallie "hears"
         self._latest_heard_ts: float = 0.0
+        # Broadcaster identity (e.g. detected from Twitch badges). Never hardcoded —
+        # it comes from the authenticated/configured channel, and is only used so
+        # the LLM can tell the STREAMER apart from viewers and donations.
+        self._streamer_name: str = ""
+        # Donation idempotency (shared with platform integrations) + the
+        # Streamlabs socket monitor, both attached by wallie.build_orchestrator.
+        self._donation_dedupe: DonationDedupe = DonationDedupe()
+        self._streamlabs_monitor: Any = None
         self._last_reacted_heard: str = ""   # last audio context Wallie reacted to
         self._last_hearing_turn_ts: float = 0.0
         # Rolling log of (ts, normalized_text) Wallie recently SPOKE — used to reject
@@ -103,6 +125,7 @@ class Orchestrator:
         self._main_task: Optional[asyncio.Task] = None
         self._segment_task: Optional[asyncio.Task] = None
         self._summarizer_task: Optional[asyncio.Task] = None
+        self._pending_thought_seed: Optional[str] = None
         self._recent_topics: list[str] = []
         self._last_chat_reply_ts = 0.0
         self._current_topic: Optional[str] = None
@@ -145,6 +168,9 @@ class Orchestrator:
         self._next_break_at = float("inf")
         self._enrich_this_turn = False
         self._break_event: asyncio.Event = asyncio.Event()
+        # Caption bridge (optional): receives every spoken sentence and brackets
+        # the segment so the browser-source overlay can clear itself afterwards.
+        self._captions: Any = None
 
     # --- lifecycle ---
     async def start(self) -> None:
@@ -179,7 +205,11 @@ class Orchestrator:
         if self._hearing_loop:
             self._hearing_loop.start()
             logger.info("orchestrator: hearing started")
+        if getattr(self, "_streamlabs_monitor", None) is not None:
+            self._streamlabs_monitor.start()
         self._highlights.start()
+        if self._captions is not None:
+            self._captions.speech_started()
         self._main_task = asyncio.create_task(self._run(), name="orchestrator")
         d = self._cfg.orchestrator.session_duration_min
         if d > 0:
@@ -201,17 +231,46 @@ class Orchestrator:
             await self._vision_loop.stop()
         if self._hearing_loop:
             await self._hearing_loop.stop()
+        if getattr(self, "_streamlabs_monitor", None) is not None:
+            try:
+                await self._streamlabs_monitor.stop()
+            except Exception as e:
+                logger.debug(f"streamlabs stop failed (non-fatal): {e}")
         if self._chat:
             await self._chat.stop()
         self._highlights.stop()
         self._player.close()
+        if self._captions is not None:
+            try:
+                self._captions.clear()
+            except Exception:
+                pass
+        if self._vision_llm is not None:
+            try:
+                await self._vision_llm.aclose()
+            except Exception as e:
+                logger.debug(f"vision llm close failed (non-fatal): {e}")
         await self._llm.aclose()
         await self._tts.aclose()
+        if self._memory_capture is not None:
+            await self._memory_capture.aclose()
+        if self._memory_consolidator is not None:
+            await self._memory_consolidator.aclose()
         if self._memory:
             self._memory.save()
+        if self._ltm is not None:
+            self._ltm.save()
         logger.info("orchestrator: stopped")
 
     # --- status ---
+    def set_streamer_name(self, name: str) -> None:
+        """Record the broadcaster's display name (from chat platform detection).
+        Used to tag [STREAMER] turns for the LLM."""
+        name = (name or "").strip()
+        if name and name.lower() != self._streamer_name.lower():
+            self._streamer_name = name
+            logger.info(f"orchestrator: streamer identity: {name}")
+
     def status(self) -> dict[str, Any]:
         elapsed = time.time() - self._session_start_ts if self._session_start_ts else 0.0
         d = self._cfg.orchestrator.session_duration_min
@@ -241,6 +300,23 @@ class Orchestrator:
             "next_break_in_sec": (
                 round(max(0.0, self._next_break_at - time.time()), 1)
                 if self._next_break_at != float("inf") else None
+            ),
+            "memory_stats": (
+                self._ltm.stats()
+                if (self._ltm is not None and self._cfg.memory.enabled) else None
+            ),
+            "memory_consolidation": (
+                {
+                    "enabled": self._memory_consolidator.enabled,
+                    "last": self._memory_consolidator.last_result,
+                    "last_run_ts": self._memory_consolidator.last_run_ts or None,
+                }
+                if self._memory_consolidator is not None else None
+            ),
+            "next_thought_in_sec": (
+                round(self._thoughts.seconds_until_next(), 1)
+                if (self._thoughts is not None and self._cfg.random_thoughts.enabled)
+                else None
             ),
         }
 
@@ -296,6 +372,7 @@ class Orchestrator:
                     await asyncio.sleep(random.uniform(1.5, 3.0))
 
                 self._maybe_kick_summarizer()
+                self._maybe_capture_memory()
                 self._mood.tick()
                 await self._sync_mood_to_avatar()
 
@@ -385,6 +462,23 @@ class Orchestrator:
                               vision_directive=directive)
             return Intent(kind="monologue", vision_directive=VisionDirective(
                 reaction=VisionReaction.SILENCE, target_sentences=0, rationale="play: quiet beat"))
+
+        # SPONTANEOUS THOUGHTS: quiet stretch + timer due → a seed line makes the
+        # next monologue bring up something on its own (question, take, memory).
+        if (self._thoughts is not None
+                and self._thoughts.due(last_spoken_ts=self._last_segment_spoken_ts)):
+            seed = await self._thoughts.generate_seed(
+                current_topic=self._current_topic or "",
+                last_spoken=self._last_spoken,
+                memory_hints=(
+                    self._ltm.prompt_block(max_chars=400)
+                    if (self._ltm and self._cfg.memory.enabled) else ""
+                ),
+            )
+            if seed:
+                self._pending_thought_seed = seed
+                logger.info(f"thoughts: firing spontaneous thought: {seed[:80]}")
+                return Intent(kind="monologue")
 
         vision = self._pop_latest_vision()
         if vision is not None:
@@ -711,6 +805,12 @@ class Orchestrator:
         if self._on_break:
             self._break_event.set()
 
+    def _note_streamer_identity(self, msg: ChatMessage) -> None:
+        """Capture the broadcaster's name the first time the chat platform
+        identifies one (Twitch broadcaster badge). Never hardcoded."""
+        if not self._streamer_name and getattr(msg, "is_streamer", False) and msg.username:
+            self.set_streamer_name(msg.username)
+
     def _pop_highlight_chat_peek(self) -> Optional[ChatMessage]:
         if not self._chat:
             return None
@@ -719,6 +819,7 @@ class Orchestrator:
             msg = self._chat.next_nowait()
             if msg is None:
                 break
+            self._note_streamer_identity(msg)
             drained.append(msg)
         highlight = next((m for m in drained if m.is_highlight), None)
         for m in drained:
@@ -737,6 +838,7 @@ class Orchestrator:
             msg = self._chat.next_nowait()
             if msg is None:
                 break
+            self._note_streamer_identity(msg)
             if found is None and msg.is_highlight:
                 found = msg
             else:
@@ -759,6 +861,7 @@ class Orchestrator:
             msg = self._chat.next_nowait()
             if msg is None:
                 return None
+            self._note_streamer_identity(msg)
             if now - msg.ts <= max_age:
                 break
             logger.debug(f"chat: dropping stale message from {msg.username} ({now - msg.ts:.0f}s old)")
@@ -932,11 +1035,18 @@ class Orchestrator:
             vision_enabled=self._cfg.vision.enabled,
             session_notes=self._conv.session_notes or None,
             persistent_notes=self._memory.summary_for_prompt() if self._memory else None,
+            long_term_memory=(
+                self._ltm.prompt_block(max_chars=self._cfg.memory.prompt_max_chars)
+                if (self._ltm and self._cfg.memory.enabled)
+                else None
+            ),
+            thought_seed=self._pending_thought_seed,
             topic_drift_style=self._cfg.topics.drift_style,
             allow_vision_skip=self._cfg.llm.allow_vision_skip,
             current_goal=self._current_session_goal(),
             enable_callbacks=self._cfg.persona.enable_callbacks,
         )
+        self._pending_thought_seed = None
         provider_msgs = self._conv.to_provider_messages(
             system_prompt,
             max_history_messages=self._cfg.orchestrator.llm_history_messages,
@@ -956,6 +1066,12 @@ class Orchestrator:
         elif intent.kind == "hearing":
             max_tok = min(max_tok, 140)
         allow_repeat = intent.kind == "outro"
+
+        # Vision segments run on the DEDICATED vision model when one is configured,
+        # falling back to the main LLM for everything else in the segment pipeline.
+        segment_llm = self._llm
+        if intent.kind == "vision" and self._vision_llm is not None:
+            segment_llm = self._vision_llm
 
         streamer = SentenceStreamer()
         spoken_parts: list[str] = []
@@ -992,7 +1108,7 @@ class Orchestrator:
             first_seen = False
             capped = False
             try:
-                async for token in self._llm.stream(
+                async for token in segment_llm.stream(
                     provider_msgs,
                     temperature=self._cfg.llm.temperature,
                     top_p=self._cfg.llm.top_p,
@@ -1127,11 +1243,30 @@ class Orchestrator:
                 self._scene_memory.record_spoken(full)
                 self._last_vision_turn_ts = time.time()
             if intent.kind == "chat" and intent.chat is not None and self._memory:
-                self._memory.log_viewer(
-                    username=intent.chat.username,
-                    platform=intent.chat.platform,
-                    text=intent.chat.text,
-                )
+                if intent.chat.donation is not None:
+                    self._memory.log_viewer(
+                        username=intent.chat.donation.donor_name,
+                        platform=intent.chat.donation.source,
+                        text=(
+                            f"[DONATION {intent.chat.donation.formatted_amount}] "
+                            f"{intent.chat.donation.message}".strip()
+                        ),
+                    )
+                    if self._memory_capture is not None:
+                        self._memory_capture.observe_event(
+                            f"[DONATION {intent.chat.donation.formatted_amount} from "
+                            f"{intent.chat.donation.donor_name}] {intent.chat.donation.message}".strip()
+                        )
+                else:
+                    self._memory.log_viewer(
+                        username=intent.chat.username,
+                        platform=intent.chat.platform,
+                        text=intent.chat.text,
+                    )
+                    if self._memory_capture is not None:
+                        self._memory_capture.observe_event(
+                            f"[{intent.chat.username} on {intent.chat.platform}] {intent.chat.text}"
+                        )
             self._mood.on_segment_spoken(length_chars=len(full))
             if is_fallback_vision:
                 self._attention.on_segment_spoken(intent_kind="monologue")
@@ -1139,6 +1274,17 @@ class Orchestrator:
                 self._attention.on_segment_spoken(intent_kind=intent.kind)
             self._last_segment_spoken_ts = time.time()
             self._target_silence_sec = self._compute_next_silence_target()
+            # Feed the memory extractor and the thought cadence tracker.
+            if self._memory_capture is not None:
+                self._memory_capture.observe_spoken(full)
+            if self._thoughts is not None:
+                self._thoughts.on_segment_spoken()
+
+        # Caption end-of-speech: the overlay empties itself here — either right
+        # away or after the configured hold — so an old line never lingers once
+        # Wallie stops talking. Even skipped/empty segments clear the box.
+        if self._captions is not None:
+            self._caption_clear()
 
         if intent.kind == "monologue":
             if self._cfg.topics.mode == "list" and random.random() < self._cfg.topics.switch_chance:
@@ -1190,6 +1336,7 @@ class Orchestrator:
         finally:
             self._player.boundary()
             await self._avatar_safe_call("set_speaking", False)
+            self._caption_note(sentence)
 
     async def _buffer_tts(self, sentence: str) -> bytes:
         """Used by the consumer to pre-fire a sentence's TTS in parallel."""
@@ -1227,8 +1374,28 @@ class Orchestrator:
         finally:
             self._player.boundary()
             await self._avatar_safe_call("set_speaking", False)
+            if sentence_for_log:
+                self._caption_note(sentence_for_log)
 
-    # ----- avatar safety wrapper -----
+    # ----- captions -----
+    def _caption_note(self, sentence: str) -> None:
+        """Push one spoken sentence to the caption bridge (fire-and-forget)."""
+        if self._captions is None:
+            return
+        try:
+            self._captions.note_sentence(sentence)
+        except Exception as e:
+            logger.debug(f"captions: note failed: {e}")
+
+    def _caption_clear(self) -> None:
+        """Tell the overlay the segment is over; it clears after the hold delay."""
+        if self._captions is None:
+            return
+        try:
+            self._captions.clear()
+        except Exception as e:
+            logger.debug(f"captions: clear failed: {e}")
+
     async def _avatar_safe_call(self, method: str, *args: Any) -> None:
         """Avatar errors must never abort audio. Swallow everything.
 
@@ -1273,12 +1440,22 @@ class Orchestrator:
     async def _build_user_turn(self, intent: Intent) -> tuple[str, list[ImageBlock], str]:
         if intent.kind == "chat" and intent.chat is not None:
             m = intent.chat
+            # A normalized donation is NOT ordinary chat: it gets its own turn shape
+            # so the LLM can distinguish DONATION from VIEWER (source/amount/message).
+            if m.donation is not None:
+                return (
+                    self._persona.donation_turn(event=m.donation),
+                    [],
+                    f"donation:{m.donation.source}:{m.donation.donor_name}",
+                )
             return (
                 self._persona.chat_turn(
                     username=m.username,
                     platform=m.platform,
                     text=m.text,
                     is_highlight=m.is_highlight,
+                    is_streamer=bool(getattr(m, "is_streamer", False)),
+                    streamer_name=self._streamer_name,
                 ),
                 [],
                 f"chat:{m.platform}:{m.username}",
@@ -1517,6 +1694,30 @@ class Orchestrator:
             self._recent_themes.pop(0)
 
     # ----- rolling summarizer -----
+    # ----- memory capture (durable facts) -----
+    def _maybe_capture_memory(self) -> None:
+        """After each segment: fold what just happened into the fact store."""
+        if self._memory_capture is None:
+            return
+        try:
+            self._memory_capture.schedule_extraction()
+            if self._ltm is not None:
+                # Periodic janitor: expire stale short-term entries, promote
+                # recurring ones to long-term, and persist to disk.
+                now = time.time()
+                if now - getattr(self, "_ltm_last_janitor_ts", 0.0) >= self._cfg.memory.janitor_interval_sec:
+                    self._ltm_last_janitor_ts = now
+                    self._ltm.janitor_pass(promote_hits=self._cfg.memory.promote_hits)
+                    self._ltm.save()
+                # Auto-consolidation: once the long-term tier passes the
+                # threshold, the memory model merges related old entries into
+                # general summaries (non-fatal, one pass in flight at a time;
+                # apply_consolidation persists the result itself).
+                if self._memory_consolidator is not None:
+                    self._memory_consolidator.maybe_consolidate()
+        except Exception as e:
+            logger.debug(f"memory: capture tick failed (non-fatal): {e}")
+
     def _maybe_kick_summarizer(self) -> None:
         self._segments_since_summary += 1
         if self._segments_since_summary < self._cfg.orchestrator.summarize_every_n:

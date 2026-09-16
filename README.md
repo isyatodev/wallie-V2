@@ -103,14 +103,19 @@ These aren't edge cases. They're the default behavior of most AI streamer projec
 
 Six LLM providers. Three TTS engines. Three chat platforms. Mix and match per profile.
 
-| LLM | TTS | Chat | Avatar |
-|---|---|---|---|
-| OpenAI | Fish Audio | Twitch | VTube Studio (Live2D) |
-| Anthropic (Claude) | ElevenLabs | YouTube | — |
-| Google (Gemini) | Piper (local, free) | Kick | — |
-| Groq | — | — | — |
-| OpenRouter | — | — | — |
-| Ollama (local, free) | — | — | — |
+| LLM | TTS | Chat | Donations | Avatar |
+|---|---|---|---|---|
+| OpenAI | Fish Audio | Twitch | LivePix (webhook) | VTube Studio (Live2D) |
+| Anthropic (Claude) | ElevenLabs | YouTube | Streamlabs (Socket API) | — |
+| Google (Gemini) | Piper (local, free) | Kick | — | — |
+| Groq | Kokoro (local, free) | — | — | — |
+| OpenRouter | **OpenAI-Compatible (speech)** | — | — | — |
+| Ollama (local, free) | — | — | — | — |
+| **OpenAI-Compatible (any endpoint)** | — | — | — | — |
+
+Beyond that, **Vision** and **Hearing (STT)** can each run on their own OpenAI-compatible
+block — see [Dedicated vision & STT blocks](#dedicated-vision--stt-blocks) — and Wallie ships a
+self-clearing **caption overlay** for OBS: [Captions](#captions-browser-source-overlay).
 
 Swap providers without changing code. Run a fully offline stream with Ollama + Piper, or go premium with Claude + ElevenLabs.
 
@@ -134,6 +139,7 @@ Wallie's approach:
 - **Rolling summarizer** — every ~14 segments, a background LLM call compresses older history into tight bullet notes
 - **Session notes** — that compressed memory is injected into every system prompt, so the streamer knows what it already said
 - **Cross-session memory** — key facts and viewer interactions persist across streams
+- **Auto-consolidation** — when the long-term store passes the configured threshold (default 300), the memory model merges groups of related old entries into single general summaries, so the store keeps growing in *depth* instead of only in *size*. Summaries inherit the group's importance (sum of hits) and original age, are excluded from future merge passes, and never replace high-traffic facts the AI keeps re-learning.
 - **Dedupe engine** — paraphrase-aware similarity check (bigram + trigram Jaccard) catches the model repeating itself in different words
 
 ### Organic pacing
@@ -312,6 +318,99 @@ Wallie outputs audio through your system's default audio device. To route it int
 
 ---
 
+## AI Providers — OpenAI-Compatible
+
+Beyond the built-in providers, Wallie speaks the **generic OpenAI chat/completions API**: any endpoint that implements it works — no per-provider code.
+
+Configure (dashboard → **Engine**, or the profile YAML):
+
+| Setting | Where | Example |
+|---|---|---|
+| Provider | Engine → Provider | `openai_compatible` |
+| Base URL | Engine → Base URL | `https://api.openai.com/v1` · `https://openrouter.ai/api/v1` · `https://api.groq.com/openai/v1` · your own gateway |
+| Model | Engine → Model | exact model id your endpoint exposes |
+| API key | **API Keys → OpenAI-Compatible (generic)** or `.env` | `OPENAI_COMPATIBLE_API_KEY=…` |
+
+The Base URL must include the version path (`…/v1`). Streaming, temperature/top-p, max tokens, penalties, timeout and retries all work as with the named providers. Vision works the same way as everywhere else: tick **Model supports vision** only if your model accepts images — Wallie refuses to attach screenshots to a text-only model and disables the vision loop instead of shipping it a broken request.
+
+Only the OpenAI-compatible surface is used — no provider-specific extensions are sent (prompt-cache breakpoints, for example, remain an OpenRouter-only feature).
+
+### Dedicated vision & STT blocks
+
+Some hosts split models across different providers — a Qwen-VL endpoint for vision while the
+brain stays on Claude, a hosted Whisper for hearing while the brain runs locally. Each subsystem
+therefore has its own OpenAI-compatible block:
+
+| Subsystem | Config (dashboard) | API key (.env) | Endpoint shape |
+|---|---|---|---|
+| **Vision** | Engine → Vision model source → *Separate block*, then Vision → Vision model | `OPENAI_COMPATIBLE_VISION_API_KEY` | `POST {base}/chat/completions` (images in, text out) |
+| **TTS** | Voice → Provider → *OpenAI-Compatible* | `OPENAI_COMPATIBLE_TTS_API_KEY` | `POST {base}/audio/speech` (PCM16 out) |
+| **STT (Hearing)** | Hearing → STT engine → *OpenAI-Compatible (remote)* | `OPENAI_COMPATIBLE_STT_API_KEY` | `POST {base}/audio/transcriptions` |
+
+Vision routing: when the dedicated block is configured, every vision-intent segment runs on it;
+monologue/chat/outro stay on the main LLM. If the dedicated block is missing or fails to build,
+vision falls back to the main LLM with a logged warning — the stream never dies over config.
+
+Remote STT swaps the local Whisper model for an HTTP call — same hallucination guards, VAD path
+and self-echo filter, without the VRAM cost. The local model stays selected whenever the engine
+is left on **Local Whisper**.
+
+## Captions — browser source overlay
+
+Wallie's speech can be rendered as live captions on stream via a self-contained web page:
+
+1. **Captions** → toggle **Enable caption overlay** → Save.
+2. Start the orchestrator. The dashboard shows the overlay URL (default
+   `http://127.0.0.1:8765/captions`).
+3. In OBS: Sources → **+** → **Browser** → paste the URL (width 1280, height 200 works well).
+
+How it behaves:
+
+- Sentences stream in **as they are TTS'd**, sentence-by-sentence, over Server-Sent Events.
+- **The caption box is emptied when the TTS segment ends** (after an optional hold, 0s default)
+  — an old message never lingers on screen. This is the whole point: captions track the voice,
+  then disappear.
+- Style knobs live in the dashboard: font size, box opacity, max lines, lowercase, persona-name
+  prefix. The page is transparent, so it composites cleanly over any scene.
+- The **Push to overlay** test button exercises the real bridge — you should see the line appear
+  and then vanish ~2.5s later.
+
+## Donations
+
+Two platforms are supported out of the box, and both feed the **same** pipeline as chat — no second AI path:
+
+```
+LivePix (webhook) ──┐
+                    ├──► DonationEvent (normalized) ──► orchestrator queue
+Streamlabs (socket)─┘         (as highlight chat)            │
+                                                        LLM → TTS → avatar
+```
+
+A donation replies in Wallie's voice through the existing TTS, thanks the donor by name, and reacts to their message. The LLM sees donations as their own turn type (`[DONATION — donor — amount]` + source + message), never as indistinguishable chat text. The streamer's own messages are tagged `[STREAMER]` (detected from the Twitch broadcaster badge) and viewer messages `[VIEWER]`.
+
+**LivePix** ([docs](https://docs.livepix.gg))
+1. Create an app in your LivePix account settings → get `client_id` / `client_secret` → put them in `.env` (`LIVEPIX_CLIENT_ID`, `LIVEPIX_CLIENT_SECRET`) or API Keys.
+2. Optionally set `LIVEPIX_USER_ID` — webhook payloads for other accounts are then rejected.
+3. Enable **LivePix** in dashboard → Donations. The webhook is mounted on the dashboard app at `livepix_webhook_path` (default `/webhooks/livepix`). The dashboard must be reachable from the internet: run with `DASHBOARD_HOST=0.0.0.0` behind a tunnel/reverse proxy, then register `http://<host>:<port>/webhooks/livepix` as a LivePix webhook (or let `LIVEPIX_ACCESS_TOKEN` + enrichment client create it via the API).
+4. Flow: webhook validates the payload → dedupes by the real LivePix resource id → answers `HTTP 200` immediately → enrichment (`GET /v2/messages/{id}`) and queuing happen in the background. The webhook never waits for the LLM/TTS. LivePix's docs document no signature header; validation is structural + the optional userId allowlist.
+
+**Streamlabs** ([docs](https://dev.streamlabs.com/docs/socket-api))
+1. Easiest: Streamlabs Dashboard → Settings → API Settings → API Tokens → copy the **Socket API Token** → `STREAMLABS_SOCKET_TOKEN` in `.env`.
+2. Or authorize OAuth with `donations.read` + `socket.token` scopes and set `STREAMLABS_ACCESS_TOKEN`; the socket token is fetched from `/socket/token` automatically.
+3. Enable **Streamlabs** in dashboard → Donations. Wallie connects to `sockets.streamlabs.com`, auto-reconnects with jittered exponential backoff, keeps exactly one live connection, and cleans up on shutdown.
+4. Only `type === "donation"` events are processed (the `message` field is an array and every item is normalized). Follows/subs/bits/raids are ignored by design. Dedupe uses Streamlabs' own `_id` / `event_id`.
+
+**Testing without money (mock mode)**
+
+- Dashboard → Donations → **Test strip**: inject a fake LivePix/Streamlabs donation into the real queue, POST a LivePix-shaped payload through the actual webhook route, or verify your Streamlabs token reaches a live socket.
+- CLI with the dashboard running:
+
+```
+python scripts/test_donations.py livepix     --donor Maria --amount 10 --message "manda salve"
+python scripts/test_donations.py streamlabs  --donor Joao  --amount 5  --message "gg"
+python scripts/test_donations.py both
+```
+
 ## Architecture
 
 ```
@@ -319,10 +418,14 @@ Wallie outputs audio through your system's default audio device. To route it int
   (mss + pHash)          │
                          ▼
   Chat ─────────►  Orchestrator  ◄──── Persona + Topics + Mood
-  (YT/Twitch/Kick)      │
+  (YT/Twitch/Kick)      ▲
+                        │
+  LivePix (webhook) ────┤
+                        │        donation events enter the SAME queue
+  Streamlabs (socket) ──┘        as highlight chat — one pipeline only
                          │  intent → system prompt + user message
                          ▼
-                   LLM (streaming)     ← 5 providers
+                   LLM (streaming)     ← 6 providers (incl. any OpenAI-compatible endpoint)
                          │
                          │  token stream
                          ▼
@@ -343,7 +446,7 @@ Wallie outputs audio through your system's default audio device. To route it int
 
 **One pipeline. One conversation history. No competing buffers.** This is the defining design choice. Early prototypes had parallel generation paths and went insane — the streamer would repeat itself, contradict itself, and lose all continuity. Everything goes through one orchestrator, one set of messages, one output path.
 
-**Intent priority:** highlight chat (barge in) → vision event → ordinary chat → monologue. Higher-priority intents preempt lower ones.
+**Intent priority:** highlight chat (barge in) → vision event → ordinary chat → monologue. Higher-priority intents preempt lower ones. **Donations ride the highlight path** — they preempt vision/monologue exactly like bits/superchats, never waiting, never overlapping speech.
 
 **Continuity machinery:**
 - Rolling summary of older turns → injected into system prompt
@@ -364,11 +467,14 @@ wallie-v2/
 │   ├── attention.py       # vision reaction decisions
 │   ├── mood.py            # slow-evolving emotional state
 │   └── memory_store.py    # cross-session persistent memory
-├── llm/                   # 5 LLM provider adapters
-├── tts/                   # 3 TTS provider adapters
+├── llm/                   # LLM provider adapters (incl. generic OpenAI-compatible)
+├── tts/                   # TTS provider adapters (incl. OpenAI-compatible speech)
 ├── audio/                 # sounddevice player with alignment safety
 ├── vision/                # screen capture + change detection + activity classification
+├── hearing/               # system-audio loopback + local/remote STT + music analysis
+├── captions/              # TTS → SSE caption bridge (self-clearing OBS overlay)
 ├── chat/                  # YouTube, Twitch, Kick monitors
+├── donations/             # LivePix + Streamlabs → normalized DonationEvent → orchestrator queue
 ├── avatar/                # VTube Studio WebSocket client
 ├── dashboard/             # FastAPI + Alpine.js (no build step)
 ├── profiles/              # saved persona profiles (YAML)
@@ -397,6 +503,7 @@ wallie-v2/
 | **Fish Audio** | ✅ | ✅ | ~$15/M chars |
 | **ElevenLabs** | ✅ | ✅ | ~$30/M chars |
 | **Piper** | ✅ (local) | ❌ | $0 |
+| **OpenAI-Compatible (speech)** | ✅ | ❌ | any speech gateway |
 
 ---
 
@@ -475,6 +582,7 @@ What's coming next:
 - **Cost meter** — running spend tally in the live drawer
 - **OBS WebSocket integration** — scene switching tied to stream events
 - **Voice cloning UI** — upload reference audio, create a voice from the dashboard
+- **More donation platforms** — Pix/Mercado Pago, YouTube Super Chat via Streamlabs, Kick — all plug into the same DonationEvent normalizer without touching the orchestrator
 
 If any of these matter to you — open an issue, or better yet, a PR.
 

@@ -28,6 +28,9 @@ google-api-python-client>=2.100.0
 google-auth-httplib2>=0.1.1
 google-auth-oauthlib>=1.1.0
 
+# Donations — Streamlabs Socket API (Socket.IO 2.x protocol; v5+ speaks 3.x and will NOT connect)
+python-socketio>=4.7.0,<5
+
 # Dashboard
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.0

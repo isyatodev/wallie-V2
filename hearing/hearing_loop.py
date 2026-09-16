@@ -93,6 +93,9 @@ class HearingLoop:
         self._queue = out_queue
         self._capture = SystemAudioCapture(samplerate=16000)
         self._model = None
+        # Remote STT (OpenAI-compatible) credentials, injected by wallie.build_orchestrator.
+        self._stt_api_key: str = ""
+        self._stt_base_url: str = ""
         self._task: Optional[asyncio.Task] = None
         # Returns True if Wallie is currently speaking — those windows are skipped
         # so Wallie never transcribes/reacts to its own TTS (timing-based guard).
@@ -265,13 +268,25 @@ class HearingLoop:
             await asyncio.sleep(poll)
 
     def _load_model(self):
-        """Load Whisper on the best available device — GPU (fast, lets you run a
-        bigger/more accurate model) with a clean fallback to CPU int8.
+        """Load the STT engine — remote (OpenAI-compatible transcription API) when
+        ``hearing.engine == "openai_compatible"``, else local faster-whisper with the
+        best available device.
 
-        The GPU path is *probed* with a tiny inference: CTranslate2 builds the model
-        handle lazily, so a missing cublas/cudnn DLL only blows up on the first real
-        transcribe. We trigger that here and fall back to CPU instead of crashing the
-        loop mid-session."""
+        The local GPU path is *probed* with a tiny inference: CTranslate2 builds the
+        model handle lazily, so a missing cublas/cudnn DLL only blows up on the first
+        real transcribe. We trigger that here and fall back to CPU instead of crashing
+        the loop mid-session."""
+        if getattr(self._cfg, "engine", "") == "openai_compatible":
+            from .openai_stt import RemoteWhisperModel
+            return RemoteWhisperModel(
+                api_key=self._stt_api_key,
+                base_url=self._stt_base_url,
+                model=getattr(self._cfg, "openai_compatible_model", "whisper-1"),
+                language=getattr(self._cfg, "language", ""),
+                prompt=getattr(self._cfg, "openai_compatible_prompt", ""),
+                timeout=getattr(self._cfg, "openai_compatible_timeout", 20.0),
+            )
+
         from faster_whisper import WhisperModel
         size = self._cfg.model_size
         _register_cuda_dll_dirs()

@@ -11,6 +11,9 @@ const SECTIONS = [
   { id: "play",        label: "Play (MC)",    ico: "🎮" },
   { id: "hearing",     label: "Hearing",      ico: "🎧" },
   { id: "chat",        label: "Chat",         ico: "💬" },
+  { id: "donations",   label: "Donations",    ico: "💸" },
+  { id: "captions",    label: "Captions",     ico: "💬" },
+  { id: "memory",      label: "Memory",        ico: "🧠" },
   { id: "avatar",      label: "Avatar",       ico: "🎴" },
   { id: "engine",      label: "Engine",       ico: "🧠" },
   { id: "secrets",     label: "API Keys",     ico: "🔑" },
@@ -94,12 +97,15 @@ function emptyCfg() {
       address_style: "by_name", reply_length: "snappy", react_to_highlights_hype: true,
       vision_first_person: true, vision_commentary_density: "balanced",
     },
-    llm: { provider: "groq", model: "", temperature: 0.85, top_p: 0.95, max_tokens: 500, presence_penalty: 0.3, frequency_penalty: 0.4, vision_capable: false, ollama_base_url: "http://localhost:11434", ollama_keep_alive: "5m" },
-    tts: { provider: "fish", voice_id: "", sample_rate: 24000, el_model_id: "eleven_turbo_v2_5", el_stability: 0.45, el_similarity_boost: 0.75, el_style: 0.0, fish_latency_mode: "balanced", fish_chunk_length: 100, piper_model_path: "", piper_length_scale: 1.0, kokoro_voice: "af_heart", kokoro_lang_code: "a", kokoro_speed: 1.0 },
+    llm: { provider: "groq", model: "", temperature: 0.85, top_p: 0.95, max_tokens: 500, presence_penalty: 0.3, frequency_penalty: 0.4, vision_capable: false, ollama_base_url: "http://localhost:11434", ollama_keep_alive: "5m", vision_provider: "main", vision_model: "", vision_openai_compatible_base_url: "", vision_openai_compatible_timeout: 30, vision_max_tokens: 200 },
+    tts: { provider: "fish", voice_id: "", sample_rate: 24000, el_model_id: "eleven_turbo_v2_5", el_stability: 0.45, el_similarity_boost: 0.75, el_style: 0.0, fish_latency_mode: "balanced", fish_chunk_length: 100, piper_model_path: "", piper_length_scale: 1.0, kokoro_voice: "af_heart", kokoro_lang_code: "a", kokoro_speed: 1.0, openai_compatible_base_url: "", openai_compatible_model: "", openai_compatible_timeout: 30, openai_compatible_voice: "alloy", openai_compatible_speed: 1.0, openai_compatible_pcm_sample_rate: 24000 },
     vision: { enabled: false, source: "monitor", monitor_index: 1, interval_sec: 3.0, min_change_threshold: 8, max_edge_px: 768, startup_delay_sec: 5 },
     play: { enabled: false, game: "minecraft", goal: "Build a thriving Minecraft empire LIVE for an audience — gather, craft full gear, build, fight and explore. Make the journey entertaining, not a speedrun.", talk_from_agent: true, hide_chat: true, avoid_water: true },
-    hearing: { enabled: false, window_sec: 5.0, model_size: "small", language: "", silence_threshold: 0.006, sound_event_threshold: 0.06, max_context_age_sec: 12.0 },
+    hearing: { enabled: false, window_sec: 5.0, model_size: "small", language: "", silence_threshold: 0.006, sound_event_threshold: 0.06, max_context_age_sec: 12.0, engine: "", openai_compatible_base_url: "", openai_compatible_model: "whisper-1", openai_compatible_timeout: 20, openai_compatible_prompt: "" },
     chat: { youtube_enabled: false, twitch_enabled: false, kick_enabled: false, reply_probability: 0.35, min_reply_interval_sec: 8.0, max_message_age_sec: 45.0 },
+    memory: { enabled: false, extractor: "openai_compatible", openai_compatible_base_url: "", model: "", timeout: 12.0, max_memories: 500, short_term_ttl_sec: 86400.0, promote_hits: 3, prompt_max_chars: 1200, janitor_interval_sec: 300.0 },
+    random_thoughts: { enabled: false, schedule: "fixed", interval_sec: 180.0, min_interval_sec: 90.0, max_interval_sec: 420.0, jitter: 0.35, style: "mix", generator: "main", openai_compatible_base_url: "", model: "", timeout: 12.0, seed_topics: [], seed_topics_text: "", memory_callback_chance: 0.35, memory_callback_kinds: ["long_term", "short_term"] },
+    donations: { livepix_enabled: false, livepix_webhook_path: "/webhooks/livepix", livepix_enrich: true, livepix_verify_user_id: true, streamlabs_enabled: false, streamlabs_url: "https://sockets.streamlabs.com", streamlabs_reconnect_max_sec: 60.0, donation_reply_probability: 1.0, donation_cooldown_sec: 0.0 },
     topics: { mode: "ai_picks", topics: [], switch_min_sec: 90, switch_chance: 0.15 },
     orchestrator: {
       segment_target_sec: 12,
@@ -144,6 +150,17 @@ function emptyCfg() {
       expr_smug: "", expr_eyeroll: "", expr_confused: "",
       expr_hype: "", expr_deadpan: "",
     },
+    captions: {
+      enabled: false,
+      path: "/captions",
+      language: "",
+      max_lines: 3,
+      clear_delay_sec: 0.0,
+      font_size: 40,
+      background_opacity: 0.55,
+      lowercase: false,
+      show_avatar_name: false,
+    },
   };
 }
 
@@ -175,10 +192,28 @@ function app() {
     _nextLogId: 1,
     _ws: null,
 
+    // Durable memory (long-term store) UI state.
+    ltm: { long_term: [], short_term: [], tags: [], stats: {} },
+    ltmDraft: { text: "", tag: "", kind: "long_term" },
+    ltmEditId: null,
+    ltmEdit: { text: "", tag: "", kind: "long_term" },
+    ltmQuery: "",
+    ltmFilter: "all",
+    memoryBusy: false,
+    memoryMsg: "",
+    // Live feed of facts the AI captured this session (newest first).
+    memoryFeed: [],
+    memoryUndone: {},      // id -> true after the user undid that capture
+    _nextMemorySeq: 1,
+
     drawerOpen: true,
     saveMsg: "",
     testing: false,
+    captionsStatus: { enabled: false, clients: 0, url: null },
+    captionsTestText: "",
+    captionsTestMsg: "",
     testResult: "",
+    donationTest: { donor: "TestDonor", amount: 10, message: "manda o salve", msg: "" },
     voiceTestText: "",
     avatarTestExpr: "",
     avatarTestMsg: "",
@@ -204,10 +239,13 @@ function app() {
       await this.loadConfig();
       await this.refreshStatus();
       await this.loadSecrets();
+      await this.loadLtm();
       this.wizardMaybeOpen();
       this.connectWs();
       setInterval(() => this.refreshStatus(), 2000);
       setInterval(() => this.refreshAvatarStatus(), 3000);
+      setInterval(() => this.refreshCaptions(), 3000);
+      setInterval(() => this.loadLtm(), 5000);
     },
 
     // ----- secrets -----
@@ -425,9 +463,17 @@ function app() {
       // Merge into empty to ensure newly added fields exist.
       const base = emptyCfg();
       this.cfg = deepMerge(base, fetched);
+      // Textarea <-> list bridge for the thought seed pool.
+      this.cfg.random_thoughts.seed_topics_text =
+        (this.cfg.random_thoughts.seed_topics || []).join("\n");
     },
 
     async save() {
+      // Fold the seed-topics textarea back into the list before saving.
+      if (this.cfg.random_thoughts) {
+        this.cfg.random_thoughts.seed_topics = (this.cfg.random_thoughts.seed_topics_text || "")
+          .split("\n").map(s => s.trim()).filter(Boolean);
+      }
       const r = await fetch("/api/config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -435,6 +481,144 @@ function app() {
       });
       this.saveMsg = r.ok ? "saved" : "fail";
       setTimeout(() => (this.saveMsg = ""), 1400);
+    },
+
+    // ----- durable memory (long-term store) -----
+    toggleCallbackKind(kind) {
+      const kinds = this.cfg.random_thoughts.memory_callback_kinds || [];
+      const i = kinds.indexOf(kind);
+      if (i === -1) kinds.push(kind);
+      else if (kinds.length > 1) kinds.splice(i, 1);  // keep at least one tier
+    },
+
+    async loadLtm() {
+      try {
+        const r = await fetch("/api/longterm");
+        if (r.ok) this.ltm = await r.json();
+      } catch (e) { console.warn("loadLtm:", e); }
+    },
+
+    ltmVisible() {
+      const q = (this.ltmQuery || "").toLowerCase();
+      return [...(this.ltm.long_term || []), ...(this.ltm.short_term || [])]
+        .filter(m => this.ltmFilter === "all" || m.kind === this.ltmFilter)
+        .filter(m => !q
+          || (m.text || "").toLowerCase().includes(q)
+          || (m.tag || "").toLowerCase().includes(q));
+    },
+
+    async ltmAdd() {
+      const text = this.ltmDraft.text.trim();
+      if (!text) return;
+      this.memoryBusy = true;
+      try {
+        const r = await fetch("/api/longterm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, kind: this.ltmDraft.kind, tag: this.ltmDraft.tag }),
+        });
+        if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+        this.ltmDraft.text = "";
+        this.ltmDraft.tag = "";
+        await this.loadLtm();
+      } catch (e) {
+        this.memoryMsg = `error: ${e}`;
+        setTimeout(() => (this.memoryMsg = ""), 2500);
+      } finally { this.memoryBusy = false; }
+    },
+
+    ltmStartEdit(m) {
+      this.ltmEditId = m.id;
+      this.ltmEdit = { text: m.text, tag: m.tag || "", kind: m.kind };
+    },
+
+    async ltmSave() {
+      if (this.ltmEditId == null) return;
+      this.memoryBusy = true;
+      try {
+        const r = await fetch(`/api/longterm/${this.ltmEditId}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: this.ltmEdit.text,
+            tag: this.ltmEdit.tag,
+            kind: this.ltmEdit.kind,
+          }),
+        });
+        if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+        this.ltmEditId = null;
+        await this.loadLtm();
+      } catch (e) {
+        this.memoryMsg = `error: ${e}`;
+        setTimeout(() => (this.memoryMsg = ""), 2500);
+      } finally { this.memoryBusy = false; }
+    },
+
+    async ltmRemove(id) {
+      this.memoryBusy = true;
+      try {
+        await fetch(`/api/longterm/${id}`, { method: "DELETE" });
+        await this.loadLtm();
+      } finally { this.memoryBusy = false; }
+    },
+
+    async ltmClearAll() {
+      if (!confirm("Delete ALL memories (long + short)? This cannot be undone.")) return;
+      this.memoryBusy = true;
+      try {
+        await fetch("/api/longterm/clear", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        await this.loadLtm();
+      } finally { this.memoryBusy = false; }
+    },
+
+    async captureMemoryNow() {
+      this.memoryBusy = true;
+      this.memoryMsg = "extracting…";
+      try {
+        const r = await fetch("/api/memory/capture-now", { method: "POST" });
+        const d = await r.json();
+        if (r.ok) {
+          const facts = d.captured || [];
+          this.memoryMsg = facts.length
+            ? `captured ${facts.length}: ${facts.map(f => f.text).join(" | ")}`
+            : "nothing new worth remembering";
+          await this.loadLtm();
+        } else {
+          this.memoryMsg = d.detail || `HTTP ${r.status}`;
+        }
+      } catch (e) {
+        this.memoryMsg = `error: ${e}`;
+      } finally {
+        this.memoryBusy = false;
+        setTimeout(() => (this.memoryMsg = ""), 5000);
+      }
+    },
+
+    async consolidateMemoryNow() {
+      this.memoryBusy = true;
+      this.memoryMsg = "consolidating…";
+      try {
+        const r = await fetch("/api/memory/consolidate-now", { method: "POST" });
+        const d = await r.json();
+        if (r.ok) {
+          const { removed, added, skipped } = d;
+          this.memoryMsg = skipped
+            ? "not enough mergeable entries yet (need ≥ 2)"
+            : `consolidated: ${removed} old memories → ${added} summaries`;
+          await this.loadLtm();
+        } else {
+          this.memoryMsg = d.detail || `HTTP ${r.status}`;
+        }
+      } catch (e) {
+        this.memoryMsg = `error: ${e}`;
+      } finally {
+        this.memoryBusy = false;
+        setTimeout(() => (this.memoryMsg = ""), 5000);
+      }
     },
 
     // ----- orchestrator -----
@@ -448,6 +632,54 @@ function app() {
 
     async start() { await fetch("/api/start", { method: "POST" }); await this.refreshStatus(); },
     async stop()  { await fetch("/api/stop",  { method: "POST" }); await this.refreshStatus(); },
+
+    // ----- donation test strip -----
+    async testDonation(source) {
+      this.testing = true;
+      this.donationTest.msg = "queueing…";
+      try {
+        const r = await fetch("/api/test/donation", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            source,
+            donor: this.donationTest.donor || "TestDonor",
+            amount: this.donationTest.amount || 10,
+            currency: "BRL",
+            message: this.donationTest.message || "",
+          }),
+        });
+        const d = await r.json();
+        this.donationTest.msg = r.ok && d.ok
+          ? `✓ queued (${source}) — Wallie will react if the queue path is live`
+          : `✗ ${d.error || d.detail || "failed"}`;
+      } catch (e) { this.donationTest.msg = `✗ ${e}`; }
+      finally { this.testing = false; }
+    },
+    async testWebhookPath() {
+      this.testing = true;
+      this.donationTest.msg = "posting to webhook…";
+      try {
+        const r = await fetch("/api/donations/webhook-test", { method: "POST" });
+        const d = await r.json();
+        this.donationTest.msg = d.status === 200
+          ? "✓ webhook validated and queued the event"
+          : `✗ webhook answered ${d.status}: ${(d.body && d.body.error) || "error"}`;
+      } catch (e) { this.donationTest.msg = `✗ ${e}`; }
+      finally { this.testing = false; }
+    },
+    async testStreamlabsToken() {
+      this.testing = true;
+      this.donationTest.msg = "checking Streamlabs…";
+      try {
+        const r = await fetch("/api/test/streamlabs-connect", { method: "POST" });
+        const d = await r.json();
+        this.donationTest.msg = d.ok
+          ? "✓ Streamlabs token valid — socket can connect"
+          : `✗ ${d.error || "token invalid"}`;
+      } catch (e) { this.donationTest.msg = `✗ ${e}`; }
+      finally { this.testing = false; }
+    },
 
     async installMinecraft() {
       this.playBusy = true; this.playLog = "Installing… downloading Fabric + mods, this can take a minute.";
@@ -475,6 +707,45 @@ function app() {
       } catch (e) { console.warn(e); }
     },
 
+    // ----- captions panel -----
+    async refreshCaptions() {
+      try {
+        const r = await fetch("/api/captions/status");
+        this.captionsStatus = await r.json();
+      } catch { this.captionsStatus = { enabled: false, clients: 0, url: null }; }
+    },
+
+    async testCaption() {
+      this.testing = true;
+      this.captionsTestMsg = "pushing…";
+      try {
+        const r = await fetch("/api/test/caption", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: this.captionsTestText || "this is how the caption overlay looks on stream",
+            clear_after: true,
+          }),
+        });
+        const d = await r.json();
+        this.captionsTestMsg = r.ok && d.ok
+          ? "✓ pushed — check the overlay page, it should clear itself"
+          : (d.detail || "failed");
+      } catch (e) { this.captionsTestMsg = "error: " + e; }
+      finally {
+        this.testing = false;
+        setTimeout(() => (this.captionsTestMsg = ""), 3500);
+      }
+    },
+
+    copyCaptionsUrl() {
+      const url = this.captionsStatus?.url;
+      if (!url) return;
+      navigator.clipboard?.writeText(url).catch(() => {});
+      this.captionsTestMsg = "URL copied — paste it in OBS → Browser Source";
+      setTimeout(() => (this.captionsTestMsg = ""), 3000);
+    },
+
     // ----- live log -----
     connectWs() {
       const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -486,10 +757,32 @@ function app() {
             entry.id = this._nextLogId++;
             this.logs.push(entry);
             if (this.logs.length > 400) this.logs.splice(0, this.logs.length - 400);
+          } else if (entry.type === "memory") {
+            this.onMemoryEvent(entry.data);
           }
         } catch {}
       };
       this._ws.onclose = () => setTimeout(() => this.connectWs(), 2000);
+    },
+
+    // ----- live memory capture feed -----
+    onMemoryEvent(ev) {
+      if (!ev || ev.id == null) return;
+      ev.key = `${ev.id}-${this._nextMemorySeq++}`;   // same fact can re-fire (dedupe refresh)
+      ev.ts = ev.ts || Date.now() / 1000;
+      this.memoryFeed.unshift(ev);
+      if (this.memoryFeed.length > 50) this.memoryFeed.splice(50);
+    },
+
+    async undoMemory(ev) {
+      try {
+        const r = await fetch(`/api/longterm/${ev.id}`, { method: "DELETE" });
+        // 404 = already gone (deleted from the list) → still counts as undone.
+        if (r.ok || r.status === 404) {
+          this.memoryUndone[ev.id] = true;
+          await this.loadLtm();
+        }
+      } catch (e) { console.warn("undoMemory:", e); }
     },
 
     // ----- test strip -----

@@ -41,6 +41,47 @@ class Secrets(BaseModel):
 
     kick_channel: str = Field(default_factory=lambda: os.getenv("KICK_CHANNEL", ""))
 
+    # Generic OpenAI-compatible endpoint (any provider exposing the chat/completions API).
+    openai_compatible_base_url: str = Field(
+        default_factory=lambda: os.getenv("OPENAI_COMPATIBLE_BASE_URL", "")
+    )
+    openai_compatible_api_key: str = Field(
+        default_factory=lambda: os.getenv("OPENAI_COMPATIBLE_API_KEY", "")
+    )
+
+    # Dedicated OpenAI-compatible endpoints per subsystem. Each can point at a
+    # different provider (e.g. qwen-vl for vision, an OpenAI-compatible speech
+    # gateway for TTS/STT) — the generic LLM block stays untouched.
+    openai_compatible_vision_api_key: str = Field(
+        default_factory=lambda: os.getenv("OPENAI_COMPATIBLE_VISION_API_KEY", "")
+    )
+    openai_compatible_tts_api_key: str = Field(
+        default_factory=lambda: os.getenv("OPENAI_COMPATIBLE_TTS_API_KEY", "")
+    )
+    openai_compatible_stt_api_key: str = Field(
+        default_factory=lambda: os.getenv("OPENAI_COMPATIBLE_STT_API_KEY", "")
+    )
+    # Dedicated memory-analysis model (small/fast LLM that decides what to
+    # remember; e.g. a cheap llama-3.1-8b while the brain runs on Claude).
+    openai_compatible_memory_api_key: str = Field(
+        default_factory=lambda: os.getenv("OPENAI_COMPATIBLE_MEMORY_API_KEY", "")
+    )
+    # Dedicated thought-generator model (spontaneous topics/questions).
+    openai_compatible_thoughts_api_key: str = Field(
+        default_factory=lambda: os.getenv("OPENAI_COMPATIBLE_THOUGHTS_API_KEY", "")
+    )
+
+    # LivePix donations (OAuth2 client_credentials + webhooks)
+    livepix_client_id: str = Field(default_factory=lambda: os.getenv("LIVEPIX_CLIENT_ID", ""))
+    livepix_client_secret: str = Field(default_factory=lambda: os.getenv("LIVEPIX_CLIENT_SECRET", ""))
+    livepix_access_token: str = Field(default_factory=lambda: os.getenv("LIVEPIX_ACCESS_TOKEN", ""))
+    # LivePix account id — when set, webhook payloads whose `userId` differs are rejected.
+    livepix_user_id: str = Field(default_factory=lambda: os.getenv("LIVEPIX_USER_ID", ""))
+
+    # Streamlabs donations (Socket API; token from /socket/token or the dashboard socket token)
+    streamlabs_access_token: str = Field(default_factory=lambda: os.getenv("STREAMLABS_ACCESS_TOKEN", ""))
+    streamlabs_socket_token: str = Field(default_factory=lambda: os.getenv("STREAMLABS_SOCKET_TOKEN", ""))
+
 
 # -------------------------------------------------------------------
 # Persona
@@ -128,7 +169,10 @@ class PersonaConfig(BaseModel):
 # Other subsystems
 # -------------------------------------------------------------------
 class LLMConfig(BaseModel):
-    provider: Literal["openai", "groq", "openrouter", "anthropic", "gemini", "ollama"] = "groq"
+    provider: Literal[
+        "openai", "groq", "openrouter", "anthropic", "gemini", "ollama",
+        "openai_compatible",
+    ] = "groq"
     model: str = "llama-3.3-70b-versatile"
     temperature: float = 0.85
     top_p: float = 0.95
@@ -139,10 +183,24 @@ class LLMConfig(BaseModel):
     allow_vision_skip: bool = True
     ollama_base_url: str = "http://localhost:11434"
     ollama_keep_alive: str = "5m"
+    # Generic OpenAI-compatible endpoint (base URL must include the version path,
+    # e.g. https://example.com/v1). API key lives in Secrets (.env).
+    openai_compatible_base_url: str = ""
+    openai_compatible_timeout: float = 25.0
+    # --- Dedicated VISION block ---
+    # When `vision_provider` is set, vision turns use this separate
+    # OpenAI-compatible endpoint instead of the main LLM (e.g. qwen-vl on a
+    # vision-only gateway while the brain stays on Claude). Empty = reuse the
+    # main LLM for vision (previous behavior).
+    vision_provider: Literal["main", "openai_compatible"] = "main"
+    vision_model: str = ""
+    vision_openai_compatible_base_url: str = ""
+    vision_openai_compatible_timeout: float = 30.0
+    vision_max_tokens: int = 200
 
 
 class TTSConfig(BaseModel):
-    provider: Literal["fish", "elevenlabs", "piper", "kokoro"] = "fish"
+    provider: Literal["fish", "elevenlabs", "piper", "kokoro", "openai_compatible"] = "fish"
     voice_id: str = ""
     sample_rate: int = 24000
     # Output device for Wallie's voice. "" = system default. Accepts a device index
@@ -163,6 +221,15 @@ class TTSConfig(BaseModel):
     kokoro_voice: str = "af_heart"
     kokoro_lang_code: str = "a"
     kokoro_speed: float = 1.0
+    # OpenAI-compatible speech endpoint (POST {base}/audio/speech, PCM output).
+    # Works with OpenAI itself, self-hosted gateways (e.g. faster-whisper servers
+    # exposing the same API), and most aggregators. Key lives in Secrets (.env).
+    openai_compatible_base_url: str = ""
+    openai_compatible_model: str = ""
+    openai_compatible_timeout: float = 30.0
+    openai_compatible_voice: str = "alloy"
+    openai_compatible_speed: float = 1.0
+    openai_compatible_pcm_sample_rate: int = 24000
 
 
 class VisionConfig(BaseModel):
@@ -232,6 +299,14 @@ class HearingConfig(BaseModel):
     speech_only: bool = False            # dialogue only — never react to music / non-speech sound
     beam_size: int = 5                   # Whisper beam width (higher = more accurate on accents/noise)
     denoise: bool = False                # spectral noise reduction before STT (needs `noisereduce`)
+    # --- Remote STT via an OpenAI-compatible endpoint (POST {base}/audio/transcriptions).
+    # Empty engine = local faster-whisper (previous behavior). Remote STT avoids the
+    # local Whisper VRAM/CPU cost entirely — useful when the same GPU runs the game.
+    engine: Literal["", "openai_compatible"] = ""
+    openai_compatible_base_url: str = ""
+    openai_compatible_model: str = "whisper-1"
+    openai_compatible_timeout: float = 20.0
+    openai_compatible_prompt: str = ""   # optional vocabulary/term hint for the transcription API
 
 
 class ChatConfig(BaseModel):
@@ -241,6 +316,20 @@ class ChatConfig(BaseModel):
     reply_probability: float = 0.35
     min_reply_interval_sec: float = 8.0
     max_message_age_sec: float = 45.0
+
+
+class DonationsConfig(BaseModel):
+    """Donation platforms (LivePix / Streamlabs). Events fan into the SAME
+    orchestrator queue as chat highlights — no separate pipeline."""
+    livepix_enabled: bool = False
+    livepix_webhook_path: str = "/webhooks/livepix"
+    livepix_enrich: bool = True       # fetch full message details from the LivePix API
+    livepix_verify_user_id: bool = True  # reject payloads whose userId != LIVEPIX_USER_ID
+    streamlabs_enabled: bool = False
+    streamlabs_url: str = "https://sockets.streamlabs.com"
+    streamlabs_reconnect_max_sec: float = 60.0
+    donation_reply_probability: float = 1.0
+    donation_cooldown_sec: float = 0.0
 
 
 class TopicConfig(BaseModel):
@@ -381,6 +470,81 @@ class PlayConfig(BaseModel):
     avoid_water: bool = True          # keep Baritone out of water (open-ground play)
 
 
+class MemoryConfig(BaseModel):
+    """AI memory — durable facts the character keeps across sessions, plus a
+    short-term tier with TTL. An optional dedicated extraction model (any
+    OpenAI-compatible endpoint) decides WHAT to remember after each segment;
+    without it a cheap heuristic extractor fills the gap."""
+    enabled: bool = False
+    # Extraction engine: "main" reuses the brain LLM; "openai_compatible" uses
+    # the dedicated memory block below (cheaper/faster); "off" disables capture.
+    extractor: Literal["main", "openai_compatible", "off"] = "openai_compatible"
+    openai_compatible_base_url: str = ""      # e.g. http://localhost:11434/v1
+    model: str = ""                           # e.g. llama-3.1-8b-instant
+    timeout: float = 12.0
+    max_memories: int = 500                   # cap on the store (entries kept per tier)
+    short_term_ttl_sec: float = 24 * 3600.0   # default TTL for short-term entries
+    promote_hits: int = 3                     # short-term seen N times -> promoted
+    prompt_max_chars: int = 1200              # prompt budget for the memory block
+    janitor_interval_sec: float = 300.0
+    # AUTO-CONSOLIDATION: when long-term memories pass this count, the memory
+    # model merges groups of related old entries into single general ones.
+    # 0 disables. Runs before the hard max_memories cap so nothing is lost.
+    consolidate_threshold: int = 300
+    consolidate_batch: int = 40               # how many old entries per pass
+
+
+class RandomThoughtsConfig(BaseModel):
+    """Spontaneous thoughts: on a customizable timer (or full random mode) the
+    character brings up a topic/question on its own — adds life to quiet stretches."""
+    enabled: bool = False
+    # "fixed" = every interval_sec (± jitter); "random" = draws the next thought
+    # from a range so the timing itself feels organic.
+    schedule: Literal["fixed", "random"] = "fixed"
+    interval_sec: float = 180.0               # fixed: thought every N sec
+    min_interval_sec: float = 90.0            # random: earliest next thought
+    max_interval_sec: float = 420.0           # random: latest next thought
+    jitter: float = 0.35                      # fixed: ±35% on the interval
+    # "context" = themed on the current topic/what just happened; "random" =
+    # unprompted curiosities/questions; "mix" alternates.
+    style: Literal["context", "random", "mix"] = "mix"
+    # Which LLM turns the chosen style into an actual seed line: "main" reuses
+    # the brain, "openai_compatible" a cheap dedicated block, "off" = use only
+    # the seed_topics pool / plain topic nudges.
+    generator: Literal["main", "openai_compatible", "off"] = "main"
+    openai_compatible_base_url: str = ""      # e.g. http://localhost:11434/v1
+    model: str = ""                           # e.g. llama-3.1-8b-instant
+    timeout: float = 12.0
+    # Optional manual seed pool — e.g. interview questions the character asks,
+    # recurring bits, or topics you want surfaced periodically. Empty = AI pick.
+    seed_topics: list[str] = Field(default_factory=list)
+    only_when_quiet_sec: float = 20.0         # skip if Wallie spoke more recently than this
+    max_per_hour: int = 0                     # rate limit; 0 = unlimited
+    min_segments_between: int = 3             # at least N spoken segments between thoughts
+    # MEMORY CALLBACKS: when a thought fires, instead of inventing a new topic
+    # it may surface an OLD memory from the durable store — e.g. "you know what
+    # just reminded me of…". Fully organic recall.
+    memory_callback_chance: float = 0.35      # 0 = never; 1 = every thought is a callback
+    memory_callback_kinds: list[str] = Field(
+        default_factory=lambda: ["long_term", "short_term"]
+    )
+
+
+class CaptionsConfig(BaseModel):
+    """Caption overlay — Wallie's TTS output rendered as a browser-source page
+    (OBS/Streamlabs). The caption box auto-clears when a segment ends so a
+    stale message never lingers on stream."""
+    enabled: bool = False
+    path: str = "/captions"            # overlay page served by the dashboard
+    language: str = ""                  # optional lang hint for the overlay (css/font choice)
+    max_lines: int = 3                  # lines kept on screen before oldest drops
+    clear_delay_sec: float = 0.0        # extra hold after speech before clearing
+    font_size: int = 40
+    background_opacity: float = 0.55    # 0 = transparent box, 1 = solid
+    lowercase: bool = False             # karaoke-style lowercase captions
+    show_avatar_name: bool = False      # prefix lines with the persona name
+
+
 class AppConfig(BaseModel):
     profile_name: str = "default"
     persona: PersonaConfig = Field(default_factory=PersonaConfig)
@@ -389,10 +553,14 @@ class AppConfig(BaseModel):
     vision: VisionConfig = Field(default_factory=VisionConfig)
     hearing: HearingConfig = Field(default_factory=HearingConfig)
     chat: ChatConfig = Field(default_factory=ChatConfig)
+    donations: DonationsConfig = Field(default_factory=DonationsConfig)
     topics: TopicConfig = Field(default_factory=TopicConfig)
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
     avatar: AvatarConfig = Field(default_factory=AvatarConfig)
     play: PlayConfig = Field(default_factory=PlayConfig)
+    captions: CaptionsConfig = Field(default_factory=CaptionsConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    random_thoughts: RandomThoughtsConfig = Field(default_factory=RandomThoughtsConfig)
 
 
 # -------------------------------------------------------------------

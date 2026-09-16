@@ -126,6 +126,8 @@ class Persona:
         vision_enabled: bool = False,
         session_notes: Optional[str] = None,
         persistent_notes: Optional[str] = None,
+        long_term_memory: Optional[str] = None,
+        thought_seed: Optional[str] = None,
         topic_drift_style: str = "natural",
         allow_vision_skip: bool = True,
         current_goal: Optional[str] = None,
@@ -363,6 +365,22 @@ class Persona:
                 session_notes.strip(),
             ]
 
+        memory_block: list[str] = []
+        if long_term_memory and long_term_memory.strip():
+            memory_block = [
+                "",
+                "YOUR MEMORY (durable facts about yourself, people, and past streams — reference them naturally when relevant, NEVER recite them like a list):",
+                long_term_memory.strip(),
+            ]
+
+        seed_block: list[str] = []
+        if thought_seed and thought_seed.strip():
+            seed_block = [
+                "",
+                "SPONTANEOUS THOUGHT (weave it into this segment naturally, in your own voice — do NOT announce it as a task or mention being told to think about it):",
+                thought_seed.strip(),
+            ]
+
         topic_block: list[str] = []
         if topic:
             if topic_drift_style == "freeform":
@@ -424,7 +442,8 @@ class Persona:
 
         parts: list[str] = (
             who + delivery + humor + speech_rules + flavor + chat_block
-            + vision_block + plug_block + spine_block + persistent_block + notes_block + topic_block
+            + vision_block + plug_block + spine_block + persistent_block
+            + memory_block + notes_block + seed_block + topic_block
         )
         return "\n".join(line for line in parts if line is not None)
 
@@ -591,15 +610,58 @@ class Persona:
         parts.append(f"{sentences_min}-{sentences_max} sentences. Your monologue only.")
         return "\n".join(parts)
 
-    def chat_turn(self, *, username: str, platform: str, text: str, is_highlight: bool) -> str:
+    def chat_turn(
+        self,
+        *,
+        username: str,
+        platform: str,
+        text: str,
+        is_highlight: bool,
+        is_streamer: bool = False,
+        streamer_name: str = "",
+    ) -> str:
+        if is_streamer:
+            who = streamer_name or username
+            return (
+                f"[STREAMER — {who}] (this is the broadcaster speaking on the stream — not a viewer in chat, not you):\n\""
+                f"{text}"
+                "\"\n\nThe BROADCASTER said this. It is NOT you — do not voice it or re-narrate it. You may pick up on it or riff on it like co-hosts would."
+            )
         tag = " [HIGHLIGHT / super chat / donation / bits]" if is_highlight else ""
         return (
-            f"New chat message from {username} on {platform}{tag}:\n"
-            f'"{text}"\n\n'
-            "Respond to it IN CHARACTER. Not as support, as the streamer. "
+            f"[VIEWER — {username} on {platform}]{tag}"
+            '\n"'
+            f"{text}"
+            '"\n\nRespond to it IN CHARACTER. Not as support, as the streamer. '
             "React first, then answer if there's actually a question. "
             "Keep it tight, keep it yours. Do not break the flow of the stream."
         )
+
+    def donation_turn(self, *, event) -> str:
+        """Build the turn for a normalized donation. The LLM must be able to tell
+        donations apart from ordinary chat: source, donor, amount and message are
+        stated explicitly, never buried in plain text."""
+        from donations.base import DonationEvent  # noqa: F401 — type reference
+
+        ev: DonationEvent = event
+        lines = [
+            f"[DONATION — {ev.donor_name} — {ev.formatted_amount or ev.amount}]",
+            f"Source: {ev.source}",
+        ]
+        if ev.currency:
+            lines.append(f"Currency: {ev.currency}")
+        if ev.message:
+            lines.append(f'Message: "{ev.message}"')
+        else:
+            lines.append("Message: (no message attached)")
+        lines += [
+            "",
+            "A viewer just sent this donation. Thank them by name ONCE, hype it like a "
+            "streamer would (match the size of the gift), and RESPOND to the message if "
+            "they wrote one — that's what they paid for. Keep it in your voice, then move "
+            "the stream forward. Never announce the technical details (platform, IDs).",
+        ]
+        return "\n".join(lines)
 
     def vision_turn(
         self,

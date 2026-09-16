@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Wallie Captions</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+  }
+  #wrap {
+    position: fixed;
+    left: 50%;
+    bottom: 4vh;
+    transform: translateX(-50%);
+    width: 80%;
+    max-width: 1100px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+  .line {
+    font-family: "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-weight: 700;
+    color: #fff;
+    text-shadow: 0 2px 6px rgba(0,0,0,.9), 0 0 2px rgba(0,0,0,.9);
+    padding: 6px 16px;
+    border-radius: 10px;
+    text-align: center;
+    line-height: 1.35;
+  }
+  .speaker {
+    font-size: 60%;
+    opacity: .85;
+    margin-right: 8px;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+  }
+  #box {
+    transition: opacity .35s ease;
+    opacity: 0;
+  }
+  #box.visible { opacity: 1; }
+</style>
+</head>
+<body>
+<div id="wrap"><div id="box"></div></div>
+<script>
+(function () {
+  const qs = new URLSearchParams(location.search);
+  const MAX_LINES = parseInt(qs.get("lines") || "3", 10) || 3;
+  const FONT = parseInt(qs.get("font") || "40", 10) || 40;
+  const BG = Math.min(1, Math.max(0, parseFloat(qs.get("bg") || "0.55")));
+  const LOWER = qs.get("lower") === "1";
+  const NAME = qs.get("name") === "1" ? (qs.get("who") || "Wallie") : "";
+  const CLEAR_DELAY = Math.max(0, (parseFloat(qs.get("hold") || "0") || 0) * 1000);
+
+  const box = document.getElementById("box");
+  box.style.fontSize = FONT + "px";
+  if (BG > 0) {
+    box.style.background = "rgba(0,0,0," + BG + ")";
+  }
+  let lines = [];
+  let hideTimer = null;
+
+  function render() {
+    box.innerHTML = "";
+    if (!lines.length) {
+      box.classList.remove("visible");
+      return;
+    }
+    for (const text of lines) {
+      const div = document.createElement("div");
+      div.className = "line";
+      div.style.background = BG > 0 ? "rgba(0,0,0," + BG + ")" : "transparent";
+      if (NAME) {
+        const sp = document.createElement("span");
+        sp.className = "speaker";
+        sp.textContent = NAME;
+        div.appendChild(sp);
+      }
+      div.appendChild(document.createTextNode(text));
+      box.appendChild(div);
+    }
+    box.classList.add("visible");
+  }
+
+  function clearNow() {
+    lines = [];
+    render();
+  }
+
+  function scheduleClear() {
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    hideTimer = setTimeout(clearNow, CLEAR_DELAY);
+  }
+
+  const es = new EventSource("/captions/events");
+  es.onmessage = (ev) => {
+    let data;
+    try { data = JSON.parse(ev.data); } catch { return; }
+    switch (data.event) {
+      case "update": {
+        if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+        let t = (data.text || "").trim();
+        if (!t) return;
+        if (LOWER) t = t.toLowerCase();
+        // Keep only the tail of a long sentence on one line.
+        for (const piece of t.split(/\n+/)) {
+          lines.push(piece);
+        }
+        while (lines.length > MAX_LINES) lines.shift();
+        render();
+        break;
+      }
+      case "clear":
+        // THE important bit: after speech ends the box goes empty —
+        // no stale caption from an old message lingering on stream.
+        clearNow();
+        break;
+      case "speech_start":
+        clearNow();
+        break;
+      default:
+        break;
+    }
+  };
+  es.onerror = () => { /* EventSource auto-reconnects; keep last state meanwhile */ };
+})();
+</script>
+</body>
+</html>

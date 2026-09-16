@@ -13,7 +13,7 @@ from typing import Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from pydantic import BaseModel
@@ -97,6 +97,14 @@ class DashboardState:
         self.clients: set[WebSocket] = set()
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1000)
 
+    def emit_memory_event(self, payload: dict[str, Any]) -> None:
+        """Sink for MemoryCapture.on_captured — pushes each AI-captured fact
+        to every connected dashboard client over the events WebSocket."""
+        try:
+            self._queue.put_nowait({"type": "memory", "data": payload})
+        except asyncio.QueueFull:
+            pass
+
     def attach_logger(self) -> None:
         def sink(message) -> None:
             record = message.record
@@ -128,6 +136,24 @@ class DashboardState:
 class ProfileCreateBody(BaseModel):
     name: str
     clone_from: Optional[str] = None
+
+
+class LongTermCreateBody(BaseModel):
+    text: str
+    kind: str = "long_term"       # long_term | short_term
+    tag: str = ""
+    ttl_hours: float = 24.0       # short_term only
+
+
+class LongTermUpdateBody(BaseModel):
+    text: Optional[str] = None
+    tag: Optional[str] = None
+    kind: Optional[str] = None
+    ttl_hours: Optional[float] = None
+
+
+class LongTermClearBody(BaseModel):
+    kind: Optional[str] = None    # long_term | short_term | None = both
 
 
 class TestPersonaBody(BaseModel):
@@ -169,6 +195,19 @@ class PinBody(BaseModel):
     pin: str
 
 
+class TestDonationBody(BaseModel):
+    source: str  # "livepix" | "streamlabs"
+    donor: str = "TestDonor"
+    amount: float = 10.0
+    currency: str = "BRL"
+    message: str = "test donation — ignore"
+
+
+class TestCaptionBody(BaseModel):
+    text: str = "this is how the caption overlay looks on stream"
+    clear_after: bool = True
+
+
 def _build_app(
     state: DashboardState,
     initial: Optional[Orchestrator],
@@ -177,6 +216,22 @@ def _build_app(
 ) -> FastAPI:
     state.orchestrator = initial
     app = FastAPI(title="Wallie Dashboard")
+
+    def _wire_memory_feed() -> None:
+        """Hook the live memory feed onto the CURRENT orchestrator's capture
+        pipeline (re-run after every /api/start rebuild)."""
+        orch = state.orchestrator
+        cap = getattr(orch, "_memory_capture", None) if orch else None
+        if cap is not None:
+            cap.on_captured = state.emit_memory_event
+
+    _wire_memory_feed()
+
+    def _caption_hub():
+        """The caption bridge lives on the running orchestrator (built in
+        wallie.build_orchestrator when captions.enabled). None = overlay off."""
+        orch = state.orchestrator
+        return getattr(orch, "_captions", None) if orch else None
 
     _pin = pin
     _sessions: set[str] = set()
@@ -201,6 +256,11 @@ def _build_app(
     async def _on_start() -> None:
         state.attach_logger()
         asyncio.create_task(state.broadcaster(), name="dash-broadcast")
+        try:
+            from wallie import attach_donations_to_app
+            attach_donations_to_app(app, state.orchestrator) if state.orchestrator else None
+        except Exception as e:
+            logger.warning(f"dashboard: donation webhook mount deferred: {e}")
 
     # ---------- auth ----------
     @app.get("/login")
@@ -282,10 +342,15 @@ def _build_app(
 
     @app.post("/api/start")
     async def api_start() -> dict[str, Any]:
-        from wallie import build_orchestrator
+        from wallie import attach_donations_to_app, build_orchestrator
         if state.orchestrator and state.orchestrator.status().get("running"):
             return {"ok": True, "already": True}
         state.orchestrator = build_orchestrator()
+        _wire_memory_feed()
+        try:
+            attach_donations_to_app(app, state.orchestrator)
+        except Exception as e:
+            logger.warning(f"dashboard: LivePix webhook mount failed: {e}")
         await state.orchestrator.start()
         return {"ok": True}
 
@@ -294,6 +359,28 @@ def _build_app(
         if state.orchestrator:
             await state.orchestrator.stop()
         return {"ok": True}
+
+    @app.post("/api/test/streamlabs-connect")
+    async def test_streamlabs_connect() -> dict[str, Any]:
+        """Verify Streamlabs credentials reach a live socket (no donation needed)."""
+        from config import Secrets as _S
+        from donations.streamlabs import StreamlabsMonitor
+
+        s = _S()
+        cfg = load_profile().donations
+        monitor = StreamlabsMonitor(
+            cfg=cfg,
+            on_donations=lambda evs: None,
+            access_token=s.streamlabs_access_token,
+            socket_token=s.streamlabs_socket_token,
+        )
+        try:
+            token = await asyncio.wait_for(monitor._resolve_socket_token(), timeout=10.0)
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "timeout fetching socket token"}
+        except Exception as e:
+            return {"ok": False, "error": _scrub_error(str(e))}
+        return {"ok": bool(token), "token_preview": (token[:6] + "…") if token else ""}
 
     @app.post("/api/break")
     async def api_break() -> dict[str, Any]:
@@ -369,6 +456,155 @@ def _build_app(
         if path.exists():
             path.unlink()
         return {"ok": True, "cleared": profile_name}
+
+    # ---------- long-term fact memory (durable, AI + manual) ----------
+    def _ltm_store():
+        from config import PROFILES_DIR
+        from core.long_term_memory import LongTermMemory
+        cfg = load_profile()
+        store = LongTermMemory(
+            PROFILES_DIR / f"{cfg.profile_name or 'default'}.longterm.json"
+        )
+        store.load()
+        return store
+
+    @app.get("/api/longterm")
+    def api_longterm_get() -> dict[str, Any]:
+        return _ltm_store().to_dashboard()
+
+    @app.post("/api/longterm")
+    def api_longterm_add(body: LongTermCreateBody) -> dict[str, Any]:
+        from core.long_term_memory import MemoryError
+        store = _ltm_store()
+        try:
+            entry = store.add(
+                body.text,
+                kind=body.kind if body.kind in ("long_term", "short_term") else "long_term",
+                tag=body.tag,
+                ttl_sec=max(0.1, body.ttl_hours) * 3600.0,
+                source="manual",
+            )
+            store.save()
+        except MemoryError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        _sync_ltm_to_orchestrator()
+        return {"ok": True, "entry": entry, "stats": store.stats()}
+
+    @app.put("/api/longterm/{entry_id}")
+    def api_longterm_update(entry_id: int, body: LongTermUpdateBody) -> dict[str, Any]:
+        from core.long_term_memory import MemoryError
+        store = _ltm_store()
+        try:
+            store.update(
+                entry_id,
+                text=body.text,
+                tag=body.tag,
+                kind=body.kind if body.kind in ("long_term", "short_term") else None,
+                ttl_sec=(body.ttl_hours * 3600.0) if body.ttl_hours else None,
+            )
+            store.save()
+        except MemoryError as e:
+            raise HTTPException(status_code=404 if "no memory" in str(e) else 400, detail=str(e))
+        _sync_ltm_to_orchestrator()
+        return {"ok": True, "entry": store.get(entry_id), "stats": store.stats()}
+
+    @app.delete("/api/longterm/{entry_id}")
+    def api_longterm_remove(entry_id: int) -> dict[str, Any]:
+        store = _ltm_store()
+        ok = store.remove(entry_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"no memory with id {entry_id}")
+        store.save()
+        _sync_ltm_to_orchestrator()
+        return {"ok": True, "stats": store.stats()}
+
+    @app.post("/api/longterm/clear")
+    def api_longterm_clear(body: LongTermClearBody) -> dict[str, Any]:
+        kind = body.kind
+        store = _ltm_store()
+        removed = store.clear(kind if kind in ("long_term", "short_term", None) else None)
+        store.save()
+        _sync_ltm_to_orchestrator()
+        return {"ok": True, "removed": removed, "stats": store.stats()}
+
+    @app.post("/api/memory/capture-now")
+    async def api_memory_capture_now() -> dict[str, Any]:
+        """Run the extractor on the recent stream context immediately (test)."""
+        orch = state.orchestrator
+        cap = getattr(orch, "_memory_capture", None) if orch else None
+        if cap is None or not cap.enabled:
+            raise HTTPException(status_code=409, detail="memory capture disabled or not running")
+        facts = await cap.extract_now()
+        return {"ok": True, "captured": facts}
+
+    @app.post("/api/memory/consolidate-now")
+    async def api_memory_consolidate_now() -> dict[str, Any]:
+        """Force a consolidation pass now (test). Falls back to a standalone
+        store when no session is running, so the button works any time."""
+        orch = state.orchestrator
+        cons = getattr(orch, "_memory_consolidator", None) if orch else None
+        if cons is None or not cons.enabled:
+            cfg = load_profile()
+            from config import Secrets
+            from core.long_term_memory import LongTermMemory
+            from core.memory_capture import MemoryConsolidator
+            store = LongTermMemory(
+                PROFILES_DIR / f"{cfg.profile_name or 'default'}.longterm.json"
+            )
+            store.load()
+            mcfg = cfg.memory
+            cons = MemoryConsolidator(mcfg, store, None)
+            # enabled requires an extractor LLM; reuse the capture extractor's
+            # configuration by building a one-off provider.
+            if mcfg.extractor == "openai_compatible":
+                from llm.openai_compat import OpenAICompatProvider
+                base_url = (mcfg.openai_compatible_base_url or "").strip()
+                if not base_url:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Memory extractor base URL is not configured",
+                    )
+                cons = MemoryConsolidator(
+                    mcfg, store,
+                    OpenAICompatProvider(
+                        name="openai_compatible_memory",
+                        model=mcfg.model or "gpt-4o-mini",
+                        api_key=Secrets().openai_compatible_memory_api_key or "",
+                        base_url=base_url,
+                        supports_vision=False,
+                        timeout=mcfg.timeout,
+                    ),
+                )
+            elif mcfg.extractor == "main":
+                cons = MemoryConsolidator(
+                    mcfg, store, build_provider(cfg.llm, Secrets())
+                )
+            else:
+                raise HTTPException(status_code=409, detail="memory capture disabled or extractor=off")
+        try:
+            result = await cons.consolidate_now()
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"consolidation failed: {e}")
+        return {
+            "ok": True,
+            "removed": result.get("removed", 0),
+            "added": result.get("added", 0),
+            "skipped": result.get("skipped", 0),
+        }
+
+    def _sync_ltm_to_orchestrator() -> None:
+        """Keep the running orchestrator's store handle in sync with edits made
+        while stopped OR running: rebuild it from disk so prompt + janitor see
+        the same data the dashboard saved."""
+        orch = state.orchestrator
+        if orch is None or getattr(orch, "_ltm", None) is None:
+            return
+        try:
+            path = getattr(orch._ltm, "_path", None)
+            if path is not None:
+                orch._ltm.load()
+        except Exception as e:
+            logger.warning(f"longterm: resync failed: {e}")
 
     # ---------- test endpoints ----------
     @app.post("/api/test/persona")
@@ -622,6 +858,61 @@ def _build_app(
             "text": text,
         }
 
+    # ---------- donations (test endpoints) ----------
+    @app.post("/api/test/donation")
+    async def test_donation(body: TestDonationBody) -> dict[str, Any]:
+        """Inject a fake donation through the SAME queue path as real ones —
+        no external API call, no money moved. Requires the orchestrator running."""
+        from wallie import _queue_single_donation
+        from donations.base import DonationEvent
+
+        orch = state.orchestrator
+        if not orch or not orch.status().get("running"):
+            raise HTTPException(400, "Orchestrator not running")
+        source = (body.source or "").strip().lower()
+        if source not in ("livepix", "streamlabs"):
+            raise HTTPException(400, "source must be 'livepix' or 'streamlabs'")
+        import time as _time
+        ev = DonationEvent(
+            source=source,
+            event_id=f"test-{source}-{_time.time()}",
+            donor_name=body.donor or "TestDonor",
+            amount=float(body.amount),
+            currency=body.currency or "BRL",
+            message=body.message or "",
+            metadata={"test": True},
+        )
+        await _queue_single_donation(orch)(ev)
+        return {"ok": True, "queued": source, "event_id": ev.event_id}
+
+    @app.post("/api/donations/webhook-test")
+    async def donations_webhook_test() -> JSONResponse:
+        """Emulates a real LivePix webhook POST (shape per docs.livepix.gg) so the
+        full validation → normalize → queue path can be exercised without payment."""
+        import time as _time
+        orch = state.orchestrator
+        if not orch or not orch.status().get("running"):
+            raise HTTPException(400, "Orchestrator not running")
+        secrets = Secrets()
+        payload = {
+            "userId": secrets.livepix_user_id or "61021c7bdabe5e001225b65b",
+            "clientId": secrets.livepix_client_id or "test-client",
+            "event": "new",
+            "resource": {
+                "id": f"test{int(_time.time())}",
+                "reference": "webhook-test",
+                "type": "message",
+            },
+        }
+        import httpx
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            resp = await client.post(
+                getattr(orch, "_livepix_webhook_path", "/webhooks/livepix"), json=payload
+            )
+        return JSONResponse({"status": resp.status_code, "body": resp.json()})
+
     @app.post("/api/test/voice")
     async def test_voice(body: TestVoiceBody) -> dict[str, Any]:
         cfg = load_profile()
@@ -667,6 +958,77 @@ def _build_app(
             pass
         finally:
             state.clients.discard(ws)
+
+    # ---------- captions (browser-source overlay) ----------
+    def _captions_page(path: str) -> FileResponse:
+        cfg = load_profile()
+        ccfg = getattr(cfg, "captions", None)
+        if ccfg is None or not ccfg.enabled:
+            return FileResponse(str(STATIC_DIR / "captions-off.html"))
+        if not _caption_hub():
+            return FileResponse(str(STATIC_DIR / "captions-off.html"))
+        return FileResponse(str(STATIC_DIR / "captions.html"))
+
+    @app.get("/captions")
+    def captions_page() -> FileResponse:
+        return _captions_page(getattr(load_profile().captions, "path", "/captions") or "/captions")
+
+    @app.get("/captions/events")
+    async def captions_events() -> StreamingResponse:
+        """SSE stream of caption events for the overlay page (OBS browser source)."""
+        hub = _caption_hub()
+        if hub is None:
+            async def _closed():
+                yield "data: {\"event\": \"closed\"}\n\n"
+            return StreamingResponse(_closed(), media_type="text/event-stream", status_code=503)
+
+        async def _gen():
+            async for frame in hub.subscribe():
+                yield frame
+
+        return StreamingResponse(
+            _gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",   # don't buffer behind reverse proxies
+                "Connection": "keep-alive",
+            },
+        )
+
+    @app.get("/api/captions/status")
+    def captions_status() -> dict[str, Any]:
+        hub = _caption_hub()
+        cfg = load_profile().captions
+        base = {
+            "enabled": bool(cfg.enabled),
+            "path": cfg.path,
+            "url": None,
+            "clients": 0,
+            "text": "",
+        }
+        if hub is not None:
+            st = hub.status()
+            base.update(st)
+            host = os.getenv("DASHBOARD_HOST", "127.0.0.1")
+            port = os.getenv("DASHBOARD_PORT", "8765")
+            shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+            base["url"] = f"http://{shown}:{port}{cfg.path}"
+        return base
+
+    @app.post("/api/test/caption")
+    async def test_caption(body: TestCaptionBody) -> dict[str, Any]:
+        """Push a caption line through the real hub — verifies the SSE bridge,
+        including the auto-clear, without running the full pipeline."""
+        hub = _caption_hub()
+        if hub is None:
+            raise HTTPException(400, "Captions not enabled — toggle it on and start the orchestrator")
+        hub.note_sentence(body.text, final=True)
+        if body.clear_after:
+            delay = max(0.0, float(load_profile().captions.clear_delay_sec))
+            await asyncio.sleep(delay + 2.5)   # let the browser show it, then clear
+            hub.clear()
+        return {"ok": True}
 
     # ---------- static UI ----------
     if STATIC_DIR.exists():

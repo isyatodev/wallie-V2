@@ -413,6 +413,44 @@
             <input type="range" min="0.5" max="2.0" step="0.05" x-model.number="cfg.tts.kokoro_speed" />
           </div>
         </template>
+        <template x-if="cfg.tts.provider==='openai_compatible'">
+          <div class="field wide">
+            <label>Base URL</label>
+            <input x-model="cfg.tts.openai_compatible_base_url" placeholder="https://api.openai.com/v1" />
+            <small class="hint">Any endpoint implementing <code>POST {base}/audio/speech</code> (OpenAI, Kokoro-FastAPI, openedai-speech, speaches…). Version path included. The API key goes under <b>API Keys → OpenAI-Compatible (TTS)</b>.</small>
+          </div>
+        </template>
+        <template x-if="cfg.tts.provider==='openai_compatible'">
+          <div class="field">
+            <label>Model</label>
+            <input x-model="cfg.tts.openai_compatible_model" placeholder="e.g. tts-1 / kokoro / speech-1.5" />
+            <small class="hint">Model name your speech endpoint exposes.</small>
+          </div>
+        </template>
+        <template x-if="cfg.tts.provider==='openai_compatible'">
+          <div class="field">
+            <label>Voice</label>
+            <input x-model="cfg.tts.openai_compatible_voice" placeholder="alloy / af_heart / …" />
+            <small class="hint">Voice name as the endpoint expects it.</small>
+          </div>
+        </template>
+        <template x-if="cfg.tts.provider==='openai_compatible'">
+          <div class="field">
+            <label>Speed <span class="slider-val" x-text="cfg.tts.openai_compatible_speed.toFixed(2)"></span></label>
+            <input type="range" min="0.5" max="2.0" step="0.05" x-model.number="cfg.tts.openai_compatible_speed" />
+          </div>
+        </template>
+        <template x-if="cfg.tts.provider==='openai_compatible'">
+          <div class="field">
+            <label>PCM sample rate</label>
+            <div class="segmented">
+              <template x-for="sr in [16000,22050,24000,44100]" :key="sr">
+                <button :class="{on: cfg.tts.openai_compatible_pcm_sample_rate===sr}" @click="cfg.tts.openai_compatible_pcm_sample_rate=sr" x-text="sr"></button>
+              </template>
+            </div>
+            <small class="hint">Rate the endpoint returns raw PCM at — mismatched rates sound pitch-shifted. Kokoro-FastAPI: 24000. OpenAI: 24000.</small>
+          </div>
+        </template>
       </div>
 
       <div class="test-strip">
@@ -668,6 +706,59 @@
             <button :class="{on: cfg.persona.vision_commentary_density==='dense'}" @click="cfg.persona.vision_commentary_density='dense'">dense</button>
           </div>
         </div>
+
+        <h3 class="subhead">OpenAI-compatible blocks (one per subsystem)</h3>
+        <div class="grid two">
+          <div class="field">
+            <label>Memory extractor</label>
+            <div class="segmented">
+              <button :class="{on: cfg.memory.extractor==='openai_compatible'}" @click="cfg.memory.extractor='openai_compatible'">OpenAI-Compatible</button>
+              <button :class="{on: cfg.memory.extractor==='main'}" @click="cfg.memory.extractor='main'">Same as Engine</button>
+              <button :class="{on: cfg.memory.extractor==='off'}" @click="cfg.memory.extractor='off'">Off</button>
+            </div>
+            <small class="hint">Dedicated model that decides what to remember after each segment. Base URL + model in the <b>Memory</b> section. Key: <b>API Keys → OpenAI-Compatible (memory)</b>.</small>
+          </div>
+          <div class="field">
+            <label>Thought generator</label>
+            <div class="segmented">
+              <button :class="{on: cfg.random_thoughts.generator==='main'}" @click="cfg.random_thoughts.generator='main'">Same as Engine</button>
+              <button :class="{on: cfg.random_thoughts.generator==='openai_compatible'}" @click="cfg.random_thoughts.generator='openai_compatible'">OpenAI-Compatible</button>
+              <button :class="{on: cfg.random_thoughts.generator==='off'}" @click="cfg.random_thoughts.generator='off'">Off (pool only)</button>
+            </div>
+            <small class="hint">Model that invents spontaneous topics/questions. Base URL + model in the <b>Memory</b> section. Key: <b>API Keys → OpenAI-Compatible (thoughts)</b>.</small>
+          </div>
+        </div>
+
+        <h3 class="subhead">Vision model</h3>
+        <div class="field">
+          <label>Provider</label>
+          <div class="segmented">
+            <button :class="{on: cfg.llm.vision_provider==='main'}" @click="cfg.llm.vision_provider='main'">Same as Engine</button>
+            <button :class="{on: cfg.llm.vision_provider==='openai_compatible'}" @click="cfg.llm.vision_provider='openai_compatible'">OpenAI-Compatible (separate)</button>
+          </div>
+          <small class="hint">Run vision on a different model than the brain — e.g. a Qwen-VL endpoint while the Engine stays on Claude. Requires the engine model to be vision-capable OR this dedicated block.</small>
+        </div>
+        <template x-if="cfg.llm.vision_provider==='openai_compatible'">
+          <div class="grid two">
+            <div class="field">
+              <label>Vision model</label>
+              <input x-model="cfg.llm.vision_model" placeholder="e.g. qwen-vl-max / qwen2.5-vl-72b-instruct" />
+            </div>
+            <div class="field">
+              <label>Vision base URL</label>
+              <input x-model="cfg.llm.vision_openai_compatible_base_url" placeholder="https://your-vision-gateway/v1" />
+              <small class="hint">Blank = reuse the Engine's OpenAI-compatible base URL. API key: <b>API Keys → OpenAI-Compatible (vision)</b>.</small>
+            </div>
+            <div class="field">
+              <label>Vision max tokens <span class="slider-val" x-text="cfg.llm.vision_max_tokens"></span></label>
+              <input type="range" min="60" max="600" step="20" x-model.number="cfg.llm.vision_max_tokens" />
+            </div>
+            <div class="field">
+              <label>Timeout (s)</label>
+              <input type="number" min="5" max="120" step="5" x-model.number="cfg.llm.vision_openai_compatible_timeout" />
+            </div>
+          </div>
+        </template>
       </div>
 
       <div class="test-strip" x-show="cfg.vision.enabled">
@@ -740,15 +831,44 @@
       </label>
       <div class="grid two" x-show="cfg.hearing.enabled">
         <div class="field">
+          <label>STT engine</label>
+          <div class="segmented">
+            <button :class="{on: cfg.hearing.engine===''}" @click="cfg.hearing.engine=''">Local Whisper</button>
+            <button :class="{on: cfg.hearing.engine==='openai_compatible'}" @click="cfg.hearing.engine='openai_compatible'">OpenAI-Compatible (remote)</button>
+          </div>
+          <small class="hint">Remote STT skips the local Whisper VRAM/CPU cost — handy when the same GPU runs the game.</small>
+        </div>
+        <template x-if="cfg.hearing.engine==='openai_compatible'">
+          <div class="field">
+            <label>Base URL</label>
+            <input x-model="cfg.hearing.openai_compatible_base_url" placeholder="https://api.groq.com/openai/v1" />
+            <small class="hint">Any endpoint implementing <code>POST {base}/audio/transcriptions</code>. API key: <b>API Keys → OpenAI-Compatible (STT)</b>.</small>
+          </div>
+        </template>
+        <template x-if="cfg.hearing.engine==='openai_compatible'">
+          <div class="field">
+            <label>Transcription model</label>
+            <input x-model="cfg.hearing.openai_compatible_model" placeholder="whisper-1 / whisper-large-v3" />
+          </div>
+        </template>
+        <template x-if="cfg.hearing.engine==='openai_compatible'">
+          <div class="field">
+            <label>Vocabulary hint (prompt)</label>
+            <input x-model="cfg.hearing.openai_compatible_prompt" placeholder="game names, jargon…" />
+            <small class="hint">Optional — biases the transcription toward these terms.</small>
+          </div>
+        </template>
+        <div class="field">
           <label>Whisper model</label>
-          <select x-model="cfg.hearing.model_size">
+          <select x-model="cfg.hearing.model_size" :disabled="cfg.hearing.engine==='openai_compatible'">
             <option value="tiny">tiny (fastest)</option>
             <option value="base">base</option>
             <option value="small">small</option>
             <option value="medium">medium (recommended w/ GPU)</option>
             <option value="large-v3">large-v3 (best lyrics, GPU)</option>
           </select>
-          <small class="hint">Local speech-to-text. Bigger = more accurate, esp. for song lyrics. Runs on GPU automatically if you have CUDA (so medium stays fast); else CPU. For lyrics, medium + setting the language below helps a lot.</small>
+          <small class="hint" x-show="cfg.hearing.engine!=='openai_compatible'">Local speech-to-text. Bigger = more accurate, esp. for song lyrics. Runs on GPU automatically if you have CUDA (so medium stays fast); else CPU. For lyrics, medium + setting the language below helps a lot.</small>
+          <small class="hint" x-show="cfg.hearing.engine==='openai_compatible'">Ignored while the remote engine is selected.</small>
         </div>
         <div class="field">
           <label>Language</label>
@@ -906,6 +1026,376 @@
       </div>
     </section>
 
+    <!-- ============ DONATIONS ============ -->
+    <section x-show="section==='donations'" class="section">
+      <header class="section-head">
+        <h2>Donations</h2>
+        <p>LivePix and Streamlabs donations fan into the SAME pipeline as chat — the orchestrator replies once per donation, in your voice, with the existing TTS.</p>
+      </header>
+
+      <div class="grid two">
+        <div class="field">
+          <label>LivePix</label>
+          <label class="toggle-row">
+            <span>Enabled (webhook)</span>
+            <input type="checkbox" class="switch" x-model="cfg.donations.livepix_enabled" />
+          </label>
+          <small class="hint">Needs LIVEPIX_CLIENT_ID / LIVEPIX_CLIENT_SECRET in API Keys, and the webhook must be reachable from the internet (run the dashboard with DASHBOARD_HOST=0.0.0.0 behind a tunnel/proxy).</small>
+        </div>
+        <div class="field">
+          <label>Streamlabs</label>
+          <label class="toggle-row">
+            <span>Enabled (Socket API)</span>
+            <input type="checkbox" class="switch" x-model="cfg.donations.streamlabs_enabled" />
+          </label>
+          <small class="hint">Paste a Socket API Token (Streamlabs → Settings → API Settings → API Tokens) in API Keys — no OAuth flow needed. Or set STREAMLABS_ACCESS_TOKEN with donations.read + socket.token scopes.</small>
+        </div>
+        <div class="field">
+          <label>Webhook path (LivePix)</label>
+          <input x-model="cfg.donations.livepix_webhook_path" placeholder="/webhooks/livepix" />
+          <small class="hint">Route registered on the dashboard app. Register <code>http://&lt;your-host&gt;:&lt;port&gt;&lt;path&gt;</code> as a LivePix webhook.</small>
+        </div>
+        <div class="field">
+          <label>Reply probability <span class="slider-val" x-text="cfg.donations.donation_reply_probability.toFixed(2)"></span></label>
+          <input type="range" min="0" max="1" step="0.05" x-model.number="cfg.donations.donation_reply_probability" />
+          <small class="hint">Chance the AI answers a donation out loud. 1.0 = always.</small>
+        </div>
+        <div class="field">
+          <label>Cooldown (s)</label>
+          <input type="number" min="0" max="600" step="5" x-model.number="cfg.donations.donation_cooldown_sec" />
+          <small class="hint">Minimum seconds between AI donation replies. 0 = every donation gets a reply.</small>
+        </div>
+        <div class="field">
+          <label>LivePix details fetch</label>
+          <label class="toggle-row">
+            <span>Enrich via LivePix API</span>
+            <input type="checkbox" class="switch" x-model="cfg.donations.livepix_enrich" />
+          </label>
+          <small class="hint">Fetch donor/message/amount from GET /v2/messages/{id} right after the webhook — required to know WHO paid and WHAT they wrote.</small>
+        </div>
+      </div>
+
+      <h3 class="subhead">Test (no real money)</h3>
+      <div class="test-strip">
+        <input class="test-input" x-model="donationTest.donor" placeholder="Donor name" />
+        <input class="test-input" style="max-width:110px" type="number" step="0.01" x-model.number="donationTest.amount" placeholder="10" />
+        <input class="test-input" style="max-width:220px" x-model="donationTest.message" placeholder="Message (optional)" />
+        <button class="btn" @click="testDonation('livepix')" :disabled="testing">▶ LivePix</button>
+        <button class="btn" @click="testDonation('streamlabs')" :disabled="testing">▶ Streamlabs</button>
+        <button class="btn" @click="testWebhookPath()" :disabled="testing">▶ Full webhook path</button>
+        <button class="btn" @click="testStreamlabsToken()" :disabled="testing">▶ Check Streamlabs token</button>
+        <span class="hint muted" x-show="donationTest.msg" x-text="donationTest.msg"></span>
+      </div>
+      <p class="hint-block">
+        The first two buttons inject a normalized donation directly into the queue (orchestrator must be running). “Full webhook path” POSTs a LivePix-shaped payload to the real webhook route. Never donate real money to test.
+      </p>
+    </section>
+
+    <!-- ============ CAPTIONS ============ -->
+    <section x-show="section==='captions'" class="section">
+      <header class="section-head">
+        <h2>Captions</h2>
+        <p>Render Wallie's speech as a browser-source caption overlay for OBS / Streamlabs. The caption box <b>clears itself when the TTS message ends</b> — no stale line lingers on screen.</p>
+      </header>
+
+      <label class="toggle-row big">
+        <span>Enable caption overlay</span>
+        <input type="checkbox" class="switch" x-model="cfg.captions.enabled" />
+      </label>
+
+      <div x-show="cfg.captions.enabled">
+        <div class="vts-status" :class="captionsStatus.clients > 0 ? 'on' : 'off'" style="margin-bottom:16px">
+          <span class="dot"></span>
+          <div class="vts-status-text">
+            <strong x-text="captionsStatus.clients > 0 ? (captionsStatus.clients + ' viewer(s) connected') : 'WAITING FOR A BROWSER SOURCE…'"></strong>
+            <small class="mono" x-text="captionsStatus.url || ''"></small>
+          </div>
+          <div class="vts-status-meta">
+            <button class="btn tiny" @click="copyCaptionsUrl()">copy URL</button>
+            <a class="btn tiny" :href="captionsStatus.url" target="_blank">open ↗</a>
+          </div>
+        </div>
+
+        <div class="grid two">
+          <div class="field">
+            <label>Overlay path</label>
+            <input x-model="cfg.captions.path" placeholder="/captions" />
+            <small class="hint">URL served by the dashboard — add <code>http://127.0.0.1:8765/captions</code> as a Browser Source in OBS.</small>
+          </div>
+          <div class="field">
+            <label>Max lines on screen <span class="slider-val" x-text="cfg.captions.max_lines"></span></label>
+            <input type="range" min="1" max="6" step="1" x-model.number="cfg.captions.max_lines" />
+            <small class="hint">Older lines drop off as new sentences arrive.</small>
+          </div>
+          <div class="field">
+            <label>Font size <span class="slider-val" x-text="cfg.captions.font_size"></span></label>
+            <input type="range" min="20" max="120" step="2" x-model.number="cfg.captions.font_size" />
+          </div>
+          <div class="field">
+            <label>Box opacity <span class="slider-val" x-text="cfg.captions.background_opacity.toFixed(2)"></span></label>
+            <input type="range" min="0" max="1" step="0.05" x-model.number="cfg.captions.background_opacity" />
+            <small class="hint">0 = plain text, 1 = solid box.</small>
+          </div>
+          <div class="field">
+            <label>Clear delay <span class="slider-val" x-text="cfg.captions.clear_delay_sec.toFixed(1)+'s'"></span></label>
+            <input type="range" min="0" max="10" step="0.5" x-model.number="cfg.captions.clear_delay_sec" />
+            <small class="hint">Hold time after Wallie STOPS talking before the box empties. 0 = clear immediately at end of speech.</small>
+          </div>
+        </div>
+        <label class="toggle-row">
+          <span>Lowercase captions <small class="hint">(karaoke style)</small></span>
+          <input type="checkbox" class="switch" x-model="cfg.captions.lowercase" />
+        </label>
+        <label class="toggle-row">
+          <span>Show persona name</span>
+          <input type="checkbox" class="switch" x-model="cfg.captions.show_avatar_name" />
+        </label>
+
+        <div class="test-strip" style="margin-top:14px">
+          <input class="test-input" x-model="captionsTestText" placeholder="Type a caption to test the overlay…" />
+          <button class="btn primary" @click="testCaption()" :disabled="testing">▶ Push to overlay</button>
+          <span class="hint muted" x-show="captionsTestMsg" x-text="captionsTestMsg"></span>
+        </div>
+        <p class="hint-block">
+          OBS setup: Sources → <b>+</b> → Browser → paste the URL above → width 1280, height 200, place at the bottom. The page is transparent, so it composites cleanly over your scene. The overlay listens over SSE — it updates sentence-by-sentence while Wallie speaks and goes <b>blank the moment the TTS segment ends</b> (after the clear delay).
+        </p>
+      </div>
+    </section>
+
+    <!-- ============ MEMORY (durable facts + spontaneous thoughts) ============ -->
+    <section x-show="section==='memory'" class="section">
+      <header class="section-head">
+        <h2>Memory</h2>
+        <p>Durable facts the AI keeps <b>on this device</b> (short + long term), plus spontaneous thoughts so it brings up topics on its own. Memories are stored per profile in <code>profiles/&lt;name&gt;.longterm.json</code>.</p>
+      </header>
+
+      <label class="toggle-row big">
+        <span>Enable durable memory</span>
+        <input type="checkbox" class="switch" x-model="cfg.memory.enabled" />
+      </label>
+
+      <div class="grid two" x-show="cfg.memory.enabled">
+        <div class="field">
+          <label>Extraction model</label>
+          <div class="segmented">
+            <button :class="{on: cfg.memory.extractor==='openai_compatible'}" @click="cfg.memory.extractor='openai_compatible'">OpenAI-Compatible</button>
+            <button :class="{on: cfg.memory.extractor==='main'}" @click="cfg.memory.extractor='main'">Same as Engine</button>
+            <button :class="{on: cfg.memory.extractor==='off'}" @click="cfg.memory.extractor='off'">Off</button>
+          </div>
+          <small class="hint">"Off" disables automatic capture — you can still add memories by hand below.</small>
+        </div>
+        <template x-if="cfg.memory.extractor==='openai_compatible'">
+          <div class="field">
+            <label>Memory base URL</label>
+            <input x-model="cfg.memory.openai_compatible_base_url" placeholder="http://localhost:11434/v1" />
+            <small class="hint">Any OpenAI-compatible chat endpoint (Ollama, LM Studio, Groq…), version path included. Key: <b>API Keys → OpenAI-Compatible (memory)</b>.</small>
+          </div>
+        </template>
+        <template x-if="cfg.memory.extractor==='openai_compatible'">
+          <div class="field">
+            <label>Memory model</label>
+            <input x-model="cfg.memory.model" placeholder="e.g. llama-3.1-8b-instant / qwen2.5:7b" />
+            <small class="hint">A small, fast model is enough — it only classifies + writes facts.</small>
+          </div>
+        </template>
+        <div class="field">
+          <label>Short-term TTL <span class="slider-val" x-text="(cfg.memory.short_term_ttl_sec/3600).toFixed(0)+'h'"></span></label>
+          <input type="range" min="1" max="168" step="1" x-model.number="cfg.memory.short_term_ttl_sec" @change="cfg.memory.short_term_ttl_sec = Math.round(cfg.memory.short_term_ttl_sec/3600)*3600" />
+          <small class="hint">How long session-scoped (short-term) memories survive before expiring. Recurring ones get promoted to long-term.</small>
+        </div>
+        <div class="field">
+          <label>Max memories <span class="slider-val" x-text="cfg.memory.max_memories"></span></label>
+          <input type="range" min="50" max="1000" step="50" x-model.number="cfg.memory.max_memories" />
+          <small class="hint">Store cap per tier. Oldest low-value entries drop first.</small>
+        </div>
+        <template x-if="cfg.memory.extractor!=='off'">
+          <div class="field">
+            <label>Consolidate at <span class="slider-val" x-text="cfg.memory.consolidate_threshold || 'off'"></span></label>
+            <input type="range" min="0" max="600" step="20" x-model.number="cfg.memory.consolidate_threshold" />
+            <small class="hint">When long-term memories pass this count, the memory model merges related old entries into single general summaries (freeing space while keeping the history). 0 = off.</small>
+          </div>
+          <div class="field">
+            <label>Entries per consolidation <span class="slider-val" x-text="cfg.memory.consolidate_batch"></span></label>
+ <input type="range" min="10" max="80" step="5" x-model.number="cfg.memory.consolidate_batch" />
+            <small class="hint">How many old, low-traffic entries the model looks at per pass. Newest and most-relearned entries are never touched.</small>
+          </div>
+        </template>
+        <div class="field" style="grid-column: 1 / -1;">
+          <div class="test-strip">
+            <button class="btn" @click="captureMemoryNow()" :disabled="memoryBusy">🧠 Extract memories now (test)</button>
+            <button class="btn" @click="consolidateMemoryNow()" :disabled="memoryBusy" x-show="cfg.memory.extractor!=='off'">🗂 Consolidate now (test)</button>
+            <span class="hint muted" x-text="memoryMsg"></span>
+          </div>
+          <small class="hint">Runs the extractor on the recent stream context immediately and shows what it filed. Requires a running session.</small>
+        </div>
+      </div>
+
+      <h3 class="subhead" x-show="cfg.memory.enabled">Captured this session <span class="muted" x-text="'(' + memoryFeed.length + ')'"></span></h3>
+      <div class="memory-feed" x-show="cfg.memory.enabled">
+        <p class="hint" x-show="memoryFeed.length === 0">Nothing captured yet this session. As Wallie talks and chat interacts, facts worth remembering appear here in real time.</p>
+        <template x-for="ev in memoryFeed" :key="ev.key">
+          <div class="memory-row" :class="{ undone: memoryUndone[ev.id] }">
+            <div class="memory-main">
+              <span class="memory-kind" :class="ev.kind==='short_term' ? 'short' : 'long'" x-text="ev.kind==='short_term' ? 'S' : 'L'"></span>
+              <div class="memory-text">
+                <span x-text="ev.text"></span>
+                <small class="hint mono">
+                  <span x-show="ev.tag" x-text="'#'+ev.tag"></span>
+                  <span x-text="'· ' + new Date(ev.ts*1000).toLocaleTimeString()"></span>
+                </small>
+              </div>
+              <div class="memory-actions">
+                <button class="btn tiny" @click="undoMemory(ev)" :disabled="memoryUndone[ev.id]" x-text="memoryUndone[ev.id] ? 'undone' : 'undo'"></button>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <h3 class="subhead">Memories (<span x-text="(ltm.stats.long_term||0) + ' long · ' + (ltm.stats.short_term||0) + ' short'"></span>)</h3>
+      <div class="memory-crud">
+        <div class="test-strip">
+          <input class="test-input" style="flex:2" x-model="ltmDraft.text" placeholder="New memory — e.g. \"yato's cat is called Misa\"" />
+          <input class="test-input" style="flex:0 0 130px" x-model="ltmDraft.tag" placeholder="tag (optional)" />
+          <div class="segmented">
+            <button :class="{on: ltmDraft.kind==='long_term'}" @click="ltmDraft.kind='long_term'">long</button>
+            <button :class="{on: ltmDraft.kind==='short_term'}" @click="ltmDraft.kind='short_term'">short</button>
+          </div>
+          <button class="btn primary" @click="ltmAdd()" :disabled="!ltmDraft.text.trim() || memoryBusy">+ Add</button>
+        </div>
+        <div class="test-strip">
+          <input class="test-input" x-model="ltmQuery" placeholder="Search memories…" />
+          <div class="segmented">
+            <button :class="{on: ltmFilter==='all'}" @click="ltmFilter='all'">all</button>
+            <button :class="{on: ltmFilter==='long_term'}" @click="ltmFilter='long_term'">long</button>
+            <button :class="{on: ltmFilter==='short_term'}" @click="ltmFilter='short_term'">short</button>
+          </div>
+          <button class="btn tiny" @click="ltmClearAll()" :disabled="memoryBusy">wipe</button>
+        </div>
+        <div class="memory-list">
+          <template x-for="m in ltmVisible()" :key="m.id">
+            <div class="memory-row">
+              <template x-if="ltmEditId !== m.id">
+                <div class="memory-main">
+                  <span class="memory-kind" :class="m.kind==='short_term' ? 'short' : 'long'" x-text="m.kind==='short_term' ? 'S' : 'L'"></span>
+                  <div class="memory-text">
+                    <span x-text="m.text"></span>
+                    <small class="hint mono" x-show="m.tag || m.hits > 1">
+                      <span x-show="m.tag" x-text="'#'+m.tag"></span>
+                      <span x-show="m.hits > 1" x-text="'· seen '+m.hits+'×'"></span>
+                      <span x-show="m.kind==='short_term' && m.expires_in_sec != null" x-text="'· expires in '+Math.round(m.expires_in_sec/60)+'min'"></span>
+                    </small>
+                  </div>
+                  <div class="memory-actions">
+                    <button class="btn tiny" @click="ltmStartEdit(m)">edit</button>
+                    <button class="btn tiny" @click="ltmRemove(m.id)">✕</button>
+                  </div>
+                </div>
+              </template>
+              <template x-if="ltmEditId === m.id">
+                <div class="memory-main editing">
+                  <input class="test-input" style="flex:2" x-model="ltmEdit.text" @keydown.enter="ltmSave()" />
+                  <input class="test-input" style="flex:0 0 110px" x-model="ltmEdit.tag" placeholder="tag" />
+                  <div class="segmented">
+                    <button :class="{on: ltmEdit.kind==='long_term'}" @click="ltmEdit.kind='long_term'">long</button>
+                    <button :class="{on: ltmEdit.kind==='short_term'}" @click="ltmEdit.kind='short_term'">short</button>
+                  </div>
+                  <button class="btn tiny primary" @click="ltmSave()">save</button>
+                  <button class="btn tiny" @click="ltmEditId=null">cancel</button>
+                </div>
+              </template>
+            </div>
+          </template>
+          <p class="hint" x-show="ltmVisible().length === 0">No memories yet. They appear here automatically as the AI learns things — or add the first one above.</p>
+        </div>
+      </div>
+
+      <h3 class="subhead">Spontaneous thoughts</h3>
+      <label class="toggle-row">
+        <span>Let the AI bring up its own topics / questions</span>
+        <input type="checkbox" class="switch" x-model="cfg.random_thoughts.enabled" />
+      </label>
+      <div class="grid two" x-show="cfg.random_thoughts.enabled">
+        <div class="field">
+          <label>Schedule</label>
+          <div class="segmented">
+            <button :class="{on: cfg.random_thoughts.schedule==='fixed'}" @click="cfg.random_thoughts.schedule='fixed'">fixed interval</button>
+            <button :class="{on: cfg.random_thoughts.schedule==='random'}" @click="cfg.random_thoughts.schedule='random'">random</button>
+          </div>
+          <small class="hint">Fixed = every N sec (± jitter). Random = draws each gap from a range, so the timing itself feels organic.</small>
+        </div>
+        <div class="field">
+          <label>Style</label>
+          <div class="segmented">
+            <button :class="{on: cfg.random_thoughts.style==='context'}" @click="cfg.random_thoughts.style='context'">in context</button>
+            <button :class="{on: cfg.random_thoughts.style==='random'}" @click="cfg.random_thoughts.style='random'">random subject</button>
+            <button :class="{on: cfg.random_thoughts.style==='mix'}" @click="cfg.random_thoughts.style='mix'">mix</button>
+          </div>
+          <small class="hint">In context = riff on the current topic; random = unprompted curiosity/question; mix alternates.</small>
+        </div>
+        <div class="field" x-show="cfg.random_thoughts.schedule==='fixed'">
+          <label>Interval <span class="slider-val" x-text="cfg.random_thoughts.interval_sec.toFixed(0)+'s'"></span></label>
+          <input type="range" min="60" max="900" step="15" x-model.number="cfg.random_thoughts.interval_sec" />
+        </div>
+        <template x-if="cfg.random_thoughts.schedule==='random'">
+          <div class="field">
+            <label>Min gap <span class="slider-val" x-text="cfg.random_thoughts.min_interval_sec.toFixed(0)+'s'"></span></label>
+            <input type="range" min="30" max="600" step="15" x-model.number="cfg.random_thoughts.min_interval_sec" />
+          </div>
+        </template>
+        <template x-if="cfg.random_thoughts.schedule==='random'">
+          <div class="field">
+            <label>Max gap <span class="slider-val" x-text="cfg.random_thoughts.max_interval_sec.toFixed(0)+'s'"></span></label>
+            <input type="range" min="60" max="1800" step="30" x-model.number="cfg.random_thoughts.max_interval_sec" />
+          </div>
+        </template>
+        <div class="field">
+          <label>Quiet window <span class="slider-val" x-text="cfg.random_thoughts.only_when_quiet_sec.toFixed(0)+'s'"></span></label>
+          <input type="range" min="5" max="120" step="5" x-model.number="cfg.random_thoughts.only_when_quiet_sec" />
+          <small class="hint">Only fires after this much silence — thoughts never talk over the stream.</small>
+        </div>
+        <div class="field" x-show="cfg.memory.enabled">
+          <label>Memory callbacks <span class="slider-val" x-text="(cfg.random_thoughts.memory_callback_chance*100).toFixed(0)+'%'"></span></label>
+          <input type="range" min="0" max="1" step="0.05" x-model.number="cfg.random_thoughts.memory_callback_chance" />
+          <small class="hint">Chance that a spontaneous thought surfaces an OLD memory from the store instead of a new topic (“you know what this reminds me of…”). 0% = never. Requires durable memory enabled above.</small>
+        </div>
+        <div class="field" x-show="cfg.memory.enabled && cfg.random_thoughts.memory_callback_chance > 0">
+          <label>Callback memory pool</label>
+          <div class="segmented">
+            <button :class="{on: cfg.random_thoughts.memory_callback_kinds.includes('long_term')}" @click="toggleCallbackKind('long_term')">long-term</button>
+            <button :class="{on: cfg.random_thoughts.memory_callback_kinds.includes('short_term')}" @click="toggleCallbackKind('short_term')">short-term</button>
+          </div>
+          <small class="hint">Which tiers the AI may pull memories from.</small>
+        </div>
+        <div class="field">
+          <label>Thought generator</label>
+          <div class="segmented">
+            <button :class="{on: cfg.random_thoughts.generator==='main'}" @click="cfg.random_thoughts.generator='main'">Same as Engine</button>
+            <button :class="{on: cfg.random_thoughts.generator==='openai_compatible'}" @click="cfg.random_thoughts.generator='openai_compatible'">OpenAI-Compatible</button>
+            <button :class="{on: cfg.random_thoughts.generator==='off'}" @click="cfg.random_thoughts.generator='off'">Off (pool only)</button>
+          </div>
+        </div>
+        <template x-if="cfg.random_thoughts.generator==='openai_compatible'">
+          <div class="field">
+            <label>Thoughts base URL</label>
+            <input x-model="cfg.random_thoughts.openai_compatible_base_url" placeholder="http://localhost:11434/v1" />
+            <small class="hint">Key: <b>API Keys → OpenAI-Compatible (thoughts)</b>.</small>
+          </div>
+        </template>
+        <template x-if="cfg.random_thoughts.generator==='openai_compatible'">
+          <div class="field">
+            <label>Thoughts model</label>
+            <input x-model="cfg.random_thoughts.model" placeholder="e.g. llama-3.1-8b-instant" />
+          </div>
+        </template>
+        <div class="field" style="grid-column: 1 / -1;">
+          <label>Seed topics (one per line — the AI picks from this pool when present)</label>
+          <textarea class="mono" rows="3" x-model="cfg.random_thoughts.seed_topics_text"></textarea>
+          <small class="hint">Customizable: interview questions, recurring bits, topics you want surfaced periodically. Leave empty and the AI invents its own.</small>
+        </div>
+      </div>
+    </section>
+
     <!-- ============ ENGINE (LLM) ============ -->
     <section x-show="section==='engine'" class="section">
       <header class="section-head">
@@ -916,12 +1406,12 @@
         <div class="field">
           <label>Provider</label>
           <div class="segmented wide-seg">
-            <template x-for="p in ['groq','openai','openrouter','anthropic','gemini','ollama']" :key="p">
-              <button :class="{on: cfg.llm.provider===p}" @click="cfg.llm.provider=p; onProviderChange()" x-text="p"></button>
+            <template x-for="p in ['groq','openai','openrouter','anthropic','gemini','ollama','openai_compatible']" :key="p">
+              <button :class="{on: cfg.llm.provider===p}" @click="cfg.llm.provider=p; onProviderChange()" x-text="p === 'openai_compatible' ? 'OpenAI-Compatible' : p"></button>
             </template>
           </div>
         </div>
-        <template x-if="cfg.llm.provider !== 'ollama'">
+        <template x-if="cfg.llm.provider !== 'ollama' && cfg.llm.provider !== 'openai_compatible'">
           <div class="field">
             <label>Model</label>
             <select x-model="cfg.llm.model" @change="onModelSelect()">
@@ -930,6 +1420,13 @@
                 <option :value="m.id" x-text="m.label + (m.vision ? ' \u00b7 vision' : '') + (m.custom ? ' (custom)' : '')"></option>
               </template>
             </select>
+          </div>
+        </template>
+        <template x-if="cfg.llm.provider === 'openai_compatible'">
+          <div class="field">
+            <label>Model</label>
+            <input x-model="cfg.llm.model" placeholder="e.g. qwen2.5-72b-instruct" />
+            <small class="hint">Exact model name as your provider exposes it (via /v1/models or their docs).</small>
           </div>
         </template>
         <template x-if="cfg.llm.provider === 'ollama'">
@@ -963,11 +1460,33 @@
           <span>Model supports vision</span>
           <input type="checkbox" class="switch" x-model="cfg.llm.vision_capable" />
         </label>
+        <div class="field" style="grid-column: 1 / -1;">
+          <label>Vision model source</label>
+          <div class="segmented">
+            <button :class="{on: cfg.llm.vision_provider==='main'}" @click="cfg.llm.vision_provider='main'">This model</button>
+            <button :class="{on: cfg.llm.vision_provider==='openai_compatible'}" @click="cfg.llm.vision_provider='openai_compatible'">Separate OpenAI-compatible block</button>
+          </div>
+          <small class="hint">Use a different vision model than the brain (e.g. Qwen-VL). Configure it in the <b>Vision</b> section → Vision model.</small>
+        </div>
         <template x-if="cfg.llm.provider === 'ollama'">
           <div class="field" style="grid-column: 1 / -1;">
             <label>Ollama base URL</label>
             <input x-model="cfg.llm.ollama_base_url" placeholder="http://localhost:11434" />
             <small class="hint">URL where <code>ollama serve</code> is running. Leave default for local installs.</small>
+          </div>
+        </template>
+        <template x-if="cfg.llm.provider === 'openai_compatible'">
+          <div class="field" style="grid-column: 1 / -1;">
+            <label>Base URL</label>
+            <input x-model="cfg.llm.openai_compatible_base_url" placeholder="https://example.com/v1" />
+            <small class="hint">Any OpenAI-compatible endpoint, version path included: e.g. <code>https://api.openai.com/v1</code>, <code>https://openrouter.ai/api/v1</code>, <code>https://api.groq.com/openai/v1</code>, or your own gateway. The API key goes under <b>API Keys → OpenAI-Compatible (generic)</b>.</small>
+          </div>
+        </template>
+        <template x-if="cfg.llm.provider === 'openai_compatible'">
+          <div class="field">
+            <label>Timeout (s)</label>
+            <input type="number" min="5" max="120" step="1" x-model.number="cfg.llm.openai_compatible_timeout" />
+            <small class="hint">Per-request timeout for the generic endpoint.</small>
           </div>
         </template>
         <template x-if="cfg.llm.provider === 'ollama'">

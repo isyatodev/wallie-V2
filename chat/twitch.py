@@ -61,13 +61,14 @@ class TwitchChatMonitor(ChatMonitor):
                                 continue
                             parsed = _parse_privmsg(line)
                             if parsed:
-                                user, text, is_bits = parsed
+                                user, text, is_bits, is_broadcaster = parsed
                                 try:
                                     out.put_nowait(ChatMessage(
                                         platform="twitch",
                                         username=user,
                                         text=text,
                                         is_highlight=is_bits,
+                                        is_streamer=is_broadcaster,
                                     ))
                                 except asyncio.QueueFull:
                                     pass
@@ -97,7 +98,11 @@ def _parse_tags(raw: str) -> dict[str, str]:
     return out
 
 
-def _parse_privmsg(line: str) -> Optional[tuple[str, str, bool]]:
+def _parse_privmsg(line: str) -> Optional[tuple[str, str, bool, bool]]:
+    """Returns (nick, text, is_bits, is_broadcaster).
+
+    Broadcaster detection uses the documented IRC tags: `badges` containing
+    broadcaster/1 marks the channel owner (the STREAMER)."""
     tags = ""
     rest = line
     if line.startswith("@"):
@@ -109,11 +114,14 @@ def _parse_privmsg(line: str) -> Optional[tuple[str, str, bool]]:
         nick = prefix.lstrip(":").split("!", 1)[0]
         _, _, text = payload.partition(" :")
         is_bits = False
+        is_broadcaster = False
         if tags:
             for kv in tags.lstrip("@").split(";"):
                 if kv.startswith("bits=") and kv[5:] not in {"", "0"}:
                     is_bits = True
-        return nick, text.strip(), is_bits
+                elif kv.startswith("badges=") and "broadcaster/1" in kv[7:]:
+                    is_broadcaster = True
+        return nick, text.strip(), is_bits, is_broadcaster
     except Exception:
         return None
 

@@ -63,4 +63,19 @@ def build_tts(cfg: TTSConfig, secrets: Secrets) -> TTSProvider:
             speed=cfg.kokoro_speed,
         )
 
+    if cfg.provider == "openai_compatible":
+        try:
+            from .openai_tts import OpenAICompatibleTTS
+        except ModuleNotFoundError as e:
+            raise _missing_pkg("openai_compatible", "httpx") from e
+        return OpenAICompatibleTTS(
+            api_key=secrets.openai_compatible_tts_api_key,
+            base_url=cfg.openai_compatible_base_url,
+            model=cfg.openai_compatible_model,
+            voice=cfg.openai_compatible_voice,
+            speed=cfg.openai_compatible_speed,
+            sample_rate=cfg.openai_compatible_pcm_sample_rate or cfg.sample_rate,
+            timeout=cfg.openai_compatible_timeout,
+        )
+
     raise TTSError(f"Unknown TTS provider: {cfg.provider}")

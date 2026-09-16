@@ -76,6 +76,61 @@ SECRET_FIELDS: dict[str, dict[str, str]] = {
         "url": "",
         "hint": "channel slug",
     },
+    "OPENAI_COMPATIBLE_API_KEY": {
+        "label": "OpenAI-Compatible (generic)", "kind": "llm",
+        "url": "",
+        "hint": "any OpenAI-compatible endpoint; set base URL + model in Engine",
+    },
+    "OPENAI_COMPATIBLE_VISION_API_KEY": {
+        "label": "OpenAI-Compatible (vision)", "kind": "llm",
+        "url": "",
+        "hint": "dedicated vision model (e.g. qwen-vl); base URL + model in Engine → Vision block",
+    },
+    "OPENAI_COMPATIBLE_TTS_API_KEY": {
+        "label": "OpenAI-Compatible (TTS)", "kind": "tts",
+        "url": "",
+        "hint": "speech gateway ({base}/audio/speech); base URL + voice in Voice",
+    },
+    "OPENAI_COMPATIBLE_STT_API_KEY": {
+        "label": "OpenAI-Compatible (STT)", "kind": "llm",
+        "url": "",
+        "hint": "transcription gateway ({base}/audio/transcriptions); configure in Hearing",
+    },
+    "OPENAI_COMPATIBLE_MEMORY_API_KEY": {
+        "label": "OpenAI-Compatible (memory)", "kind": "llm",
+        "url": "",
+        "hint": "memory-extraction model; base URL + model in the Memory section",
+    },
+    "OPENAI_COMPATIBLE_THOUGHTS_API_KEY": {
+        "label": "OpenAI-Compatible (thoughts)", "kind": "llm",
+        "url": "",
+        "hint": "spontaneous-thought generator; base URL + model in the Memory section",
+    },
+    "LIVEPIX_CLIENT_ID": {
+        "label": "LivePix Client ID", "kind": "stream",
+        "url": "https://docs.livepix.gg",
+        "hint": "from your LivePix account settings → apps",
+    },
+    "LIVEPIX_CLIENT_SECRET": {
+        "label": "LivePix Client Secret", "kind": "stream",
+        "url": "https://docs.livepix.gg",
+        "hint": "OAuth2 client_credentials",
+    },
+    "LIVEPIX_USER_ID": {
+        "label": "LivePix User ID", "kind": "stream",
+        "url": "https://docs.livepix.gg",
+        "hint": "optional; rejects webhooks for other accounts",
+    },
+    "STREAMLABS_ACCESS_TOKEN": {
+        "label": "Streamlabs Access Token", "kind": "stream",
+        "url": "https://streamlabs.com/dashboard#/settings/api-settings",
+        "hint": "OAuth token with donations.read + socket.token scopes",
+    },
+    "STREAMLABS_SOCKET_TOKEN": {
+        "label": "Streamlabs Socket Token", "kind": "stream",
+        "url": "https://streamlabs.com/dashboard#/settings/api-settings",
+        "hint": "API Settings → API Tokens → Socket API Token (simplest)",
+    },
 }
 
 
