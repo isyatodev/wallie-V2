@@ -1,4 +1,10 @@
 profile_name: default
+providers: []
+speaker_id:
+  enabled: false
+  threshold: 0.68
+  unknown_threshold: 0.45
+  collect_other_voices: false
 persona:
   name: Wallie
   handle: '@wallie'
@@ -65,6 +71,13 @@ llm:
   ollama_keep_alive: 5m
   openai_compatible_base_url: ''
   openai_compatible_timeout: 25.0
+  provider_ref: ''
+  vision_provider: main
+  vision_provider_ref: ''
+  vision_model: ''
+  vision_openai_compatible_base_url: ''
+  vision_openai_compatible_timeout: 30.0
+  vision_max_tokens: 200
 tts:
   provider: piper
   voice_id: ''
@@ -81,6 +94,13 @@ tts:
   kokoro_voice: af_heart
   kokoro_lang_code: a
   kokoro_speed: 1.0
+  openai_compatible_base_url: ''
+  openai_compatible_model: ''
+  openai_compatible_timeout: 30.0
+  provider_ref: ''
+  openai_compatible_voice: alloy
+  openai_compatible_speed: 1.0
+  openai_compatible_pcm_sample_rate: 24000
 vision:
   enabled: false
   source: monitor
@@ -128,6 +148,17 @@ hearing:
   speech_only: false
   beam_size: 5
   denoise: false
+  speaker_id:
+    enabled: false
+    threshold: 0.68
+    unknown_threshold: 0.45
+    collect_other_voices: false
+  engine: ''
+  openai_compatible_base_url: ''
+  openai_compatible_model: whisper-1
+  openai_compatible_timeout: 20.0
+  provider_ref: ''
+  openai_compatible_prompt: ''
 chat:
   youtube_enabled: false
   twitch_enabled: false
@@ -250,3 +281,48 @@ play:
   talk_from_agent: true
   hide_chat: true
   avoid_water: true
+captions:
+  enabled: false
+  path: /captions
+  language: ''
+  max_lines: 3
+  clear_delay_sec: 0.0
+  font_size: 40
+  background_opacity: 0.55
+  lowercase: false
+  show_avatar_name: false
+memory:
+  enabled: false
+  extractor: openai_compatible
+  provider_ref: ''
+  openai_compatible_base_url: ''
+  model: ''
+  timeout: 12.0
+  max_memories: 500
+  short_term_ttl_sec: 86400.0
+  promote_hits: 3
+  prompt_max_chars: 1200
+  janitor_interval_sec: 300.0
+  consolidate_threshold: 300
+  consolidate_batch: 40
+random_thoughts:
+  enabled: false
+  schedule: fixed
+  interval_sec: 180.0
+  min_interval_sec: 90.0
+  max_interval_sec: 420.0
+  jitter: 0.35
+  style: mix
+  generator: main
+  provider_ref: ''
+  openai_compatible_base_url: ''
+  model: ''
+  timeout: 12.0
+  seed_topics: []
+  only_when_quiet_sec: 20.0
+  max_per_hour: 0
+  min_segments_between: 3
+  memory_callback_chance: 0.35
+  memory_callback_kinds:
+  - long_term
+  - short_term

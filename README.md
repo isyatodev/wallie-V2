@@ -139,6 +139,7 @@ Wallie's approach:
 - **Rolling summarizer** — every ~14 segments, a background LLM call compresses older history into tight bullet notes
 - **Session notes** — that compressed memory is injected into every system prompt, so the streamer knows what it already said
 - **Cross-session memory** — key facts and viewer interactions persist across streams
+- **Per-person memories** — with Speaker ID on, facts learned from an enrolled voice (e.g. the owner) are bound to that person ("about") and resurface naturally in the prompt the next time they talk — remembered history, not recited notes. Works for manually added memories too (optional "about person" field in the Memory section); auto-consolidation never merges memories of different people.
 - **Auto-consolidation** — when the long-term store passes the configured threshold (default 300), the memory model merges groups of related old entries into single general summaries, so the store keeps growing in *depth* instead of only in *size*. Summaries inherit the group's importance (sum of hits) and original age, are excluded from future merge passes, and never replace high-traffic facts the AI keeps re-learning.
 - **Dedupe engine** — paraphrase-aware similarity check (bigram + trigram Jaccard) catches the model repeating itself in different words
 

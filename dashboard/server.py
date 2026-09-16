@@ -23,6 +23,7 @@ from starlette.responses import Response
 from audio.player import list_output_devices
 from config import (
     AppConfig,
+    ProviderBlock,
     Secrets,
     activate_profile,
     clone_profile,
@@ -68,6 +69,12 @@ _DEFAULT_TEST_MODELS = {
 
 def _default_model_for(provider: str) -> str:
     return _DEFAULT_TEST_MODELS.get(provider, "")
+
+
+def _provider_env_slug(pid: str) -> str:
+    """Env-safe slug for a provider id (matches wallie/secrets_store)."""
+    s = _re.sub(r"[^a-z0-9_]+", "_", (pid or "").lower()).strip("_")
+    return s[:40] or "provider"
 
 
 import re as _re
@@ -142,12 +149,14 @@ class LongTermCreateBody(BaseModel):
     text: str
     kind: str = "long_term"       # long_term | short_term
     tag: str = ""
+    about: str = ""               # optional: bind to a voice-print speaker name
     ttl_hours: float = 24.0       # short_term only
 
 
 class LongTermUpdateBody(BaseModel):
     text: Optional[str] = None
     tag: Optional[str] = None
+    about: Optional[str] = None   # speaker name, or "" to clear
     kind: Optional[str] = None
     ttl_hours: Optional[float] = None
 
@@ -340,18 +349,38 @@ def _build_app(
     def audio_devices() -> list[dict[str, Any]]:
         return list_output_devices()
 
+    @app.get("/api/preflight")
+    async def api_preflight() -> list[dict[str, str]]:
+        """Pre-start checklist: static config problems the session would hit.
+        No side effects, no network calls — the Start button runs this first."""
+        from wallie import preflight
+        try:
+            return preflight()
+        except Exception as e:
+            logger.exception("dashboard: preflight failed")
+            raise HTTPException(status_code=500, detail=str(e) or e.__class__.__name__)
+
     @app.post("/api/start")
     async def api_start() -> dict[str, Any]:
         from wallie import attach_donations_to_app, build_orchestrator
         if state.orchestrator and state.orchestrator.status().get("running"):
             return {"ok": True, "already": True}
-        state.orchestrator = build_orchestrator()
+        try:
+            state.orchestrator = build_orchestrator()
+        except Exception as e:
+            logger.exception("dashboard: build_orchestrator failed")
+            raise HTTPException(status_code=500, detail=str(e) or e.__class__.__name__)
         _wire_memory_feed()
         try:
             attach_donations_to_app(app, state.orchestrator)
         except Exception as e:
             logger.warning(f"dashboard: LivePix webhook mount failed: {e}")
-        await state.orchestrator.start()
+        try:
+            await state.orchestrator.start()
+        except Exception as e:
+            logger.exception("dashboard: orchestrator.start failed")
+            state.orchestrator = None
+            raise HTTPException(status_code=500, detail=str(e) or e.__class__.__name__)
         return {"ok": True}
 
     @app.post("/api/stop")
@@ -457,6 +486,123 @@ def _build_app(
             path.unlink()
         return {"ok": True, "cleared": profile_name}
 
+    # ---------- voice-print speaker ID (owner vs others) ----------
+    def _speaker_store():
+        from config import PROFILES_DIR
+        from hearing.speaker_id import SpeakerPrintStore
+        cfg = load_profile()
+        store = SpeakerPrintStore(
+            PROFILES_DIR / f"{cfg.profile_name or 'default'}.speakers.json"
+        )
+        return store
+
+    @app.get("/api/speakers")
+    def api_speakers_get() -> dict[str, Any]:
+        store = _speaker_store()
+        orch = state.orchestrator
+        return {
+            "speakers": [
+                {
+                    "name": n,
+                    "prints": len(store.speakers.get(n, {}).get("prints", [])),
+                    "note": store.get_note(n),
+                }
+                for n in store.names()
+            ],
+            "clips": [
+                {k: c.get(k) for k in ("id", "created_at", "suggestion")}
+                for c in store.clips
+            ],
+            "enrolling": (
+                orch._enrollment_buffer.pending
+                if orch is not None and getattr(orch, "_enrolling", False)
+                   and orch._enrollment_buffer is not None else 0
+            ),
+            "active": bool(orch is not None and getattr(orch, "speaker_id_active", False)),
+        }
+
+    @app.get("/api/speakers/clips/{clip_id}/audio")
+    def api_speaker_clip_audio(clip_id: str) -> Response:
+        """Play back a collected unknown-voice clip (on-device only)."""
+        import base64 as _b64
+        for c in _speaker_store().clips:
+            if c.get("id") == clip_id:
+                return Response(
+                    content=_b64.b64decode(c["wav_b64"]),
+                    media_type="audio/wav",
+                )
+        raise HTTPException(status_code=404, detail="clip not found")
+
+    @app.post("/api/speakers/enroll/start")
+    async def api_speaker_enroll_start() -> dict[str, Any]:
+        orch = state.orchestrator
+        if orch is None or not orch.status().get("running"):
+            raise HTTPException(status_code=409, detail="start the session first — enrollment captures your live voice")
+        if getattr(orch, "_enrollment_buffer", None) is None:
+            raise HTTPException(status_code=409, detail="Speaker ID is disabled in Voice settings")
+        orch._enrolling = True
+        n = orch.start_voice_enrollment()
+        return {"ok": True, "capturing": True, "pending": max(0, n)}
+
+    @app.post("/api/speakers/enroll/finish")
+    async def api_speaker_enroll_finish(body: dict[str, Any]) -> dict[str, Any]:
+        orch = state.orchestrator
+        name = str((body or {}).get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="name is required")
+        if orch is None or getattr(orch, "_enrollment_buffer", None) is None:
+            raise HTTPException(status_code=409, detail="no enrollment in progress")
+        replace = bool((body or {}).get("replace"))
+        pending = orch._enrollment_buffer.pending
+        ok = orch.finish_voice_enrollment(name, replace=replace)
+        orch._enrolling = False
+        if not ok:
+            raise HTTPException(status_code=400, detail="no voice captured yet — talk for a few seconds first")
+        return {"ok": True, "name": name, "utterances": pending}
+
+    @app.post("/api/speakers/enroll/cancel")
+    async def api_speaker_enroll_cancel() -> dict[str, Any]:
+        orch = state.orchestrator
+        if orch is not None and getattr(orch, "_enrollment_buffer", None) is not None:
+            orch.cancel_voice_enrollment()
+        if orch is not None:
+            orch._enrolling = False
+        return {"ok": True}
+
+    @app.put("/api/speakers/{name}/note")
+    def api_speaker_note(name: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Per-voice prompt instruction (e.g. "this is my mom — treat her warmly").
+        Injected into the hearing prompt whenever this voice is recognized."""
+        note = str((body or {}).get("note") or "")
+        store = _speaker_store()
+        # Resolve case-insensitively so labels like "owner" hit "Owner".
+        resolved = store.find_name(name) or name
+        if not store.set_note(resolved, note):
+            raise HTTPException(status_code=404, detail=f"unknown speaker: {name}")
+        return {"ok": True, "name": resolved, "note": store.get_note(resolved)}
+
+    @app.delete("/api/speakers/{name}")
+    def api_speaker_delete(name: str) -> dict[str, Any]:
+        if not _speaker_store().remove(name):
+            raise HTTPException(status_code=404, detail=f"unknown speaker: {name}")
+        return {"ok": True}
+
+    @app.post("/api/speakers/clips/{clip_id}/enroll")
+    def api_speaker_clip_enroll(clip_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        name = str((body or {}).get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="name is required")
+        store = _speaker_store()
+        if not store.enroll_clip(clip_id, name):
+            raise HTTPException(status_code=404, detail="clip not found")
+        return {"ok": True, "name": name}
+
+    @app.delete("/api/speakers/clips/{clip_id}")
+    def api_speaker_clip_delete(clip_id: str) -> dict[str, Any]:
+        if not _speaker_store().drop_clip(clip_id):
+            raise HTTPException(status_code=404, detail="clip not found")
+        return {"ok": True}
+
     # ---------- long-term fact memory (durable, AI + manual) ----------
     def _ltm_store():
         from config import PROFILES_DIR
@@ -481,6 +627,7 @@ def _build_app(
                 body.text,
                 kind=body.kind if body.kind in ("long_term", "short_term") else "long_term",
                 tag=body.tag,
+                about=body.about.strip()[:40],
                 ttl_sec=max(0.1, body.ttl_hours) * 3600.0,
                 source="manual",
             )
@@ -499,6 +646,7 @@ def _build_app(
                 entry_id,
                 text=body.text,
                 tag=body.tag,
+                about=body.about,
                 kind=body.kind if body.kind in ("long_term", "short_term") else None,
                 ttl_sec=(body.ttl_hours * 3600.0) if body.ttl_hours else None,
             )
@@ -702,7 +850,10 @@ def _build_app(
     # ---------- secrets (API keys) ----------
     @app.get("/api/secrets")
     def api_secrets_list() -> dict[str, Any]:
-        from secrets_store import list_secrets
+        from secrets_store import list_secrets, set_provider_context
+        # Dynamic provider blocks register their metadata so the keys page can
+        # show each block's name/category next to its PROVIDER_*_API_KEY entry.
+        set_provider_context(load_profile().providers)
         return {"secrets": list_secrets()}
 
     @app.put("/api/secrets")
@@ -721,6 +872,107 @@ def _build_app(
         from secrets_store import update_many
         accepted = update_many(body.values)
         return {"ok": True, "updated": accepted}
+
+    # ---------- dynamic provider blocks (API Keys page) ----------
+    def _sync_provider_context() -> None:
+        from secrets_store import set_provider_context
+        set_provider_context(load_profile().providers)
+
+    def _save_providers(blocks: list[ProviderBlock]) -> list[dict[str, Any]]:
+        cfg = load_profile()
+        try:
+            cfg = cfg.model_copy(update={"providers": blocks})
+            save_profile(cfg, cfg.profile_name)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"invalid provider block: {e}")
+        _sync_provider_context()
+        return [p.model_dump() for p in blocks]
+
+    @app.get("/api/providers")
+    def api_providers_list() -> dict[str, Any]:
+        cfg = load_profile()
+        return {
+            "providers": [p.model_dump() for p in cfg.providers],
+            "categories": ["llm", "vision", "tts", "stt", "memory", "thoughts"],
+        }
+
+    @app.put("/api/providers")
+    def api_providers_replace(body: list[dict[str, Any]]) -> dict[str, Any]:
+        """Full-list replace: the page edits blocks locally and saves them all
+        at once. New blocks get an id; existing ids are preserved."""
+        try:
+            blocks = [ProviderBlock(**b) for b in body]
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"invalid provider block: {e}")
+        existing_ids = {p.id for p in load_profile().providers}
+        seen: set[str] = set()
+        for b in blocks:
+            if not b.id or b.id not in existing_ids or b.id in seen:
+                # Derive the slug from id, then name, so new blocks get
+                # meaningful env names (PROVIDER_MAIN_LLM_API_KEY…).
+                base = _provider_env_slug(b.id or b.name or "provider")
+                cand, n = base, 2
+                while cand in seen:
+                    cand = f"{base}_{n}"
+                    n += 1
+                b.id = cand
+            seen.add(b.id)
+        saved = _save_providers(blocks)
+        return {"ok": True, "providers": saved}
+
+    @app.delete("/api/providers/{provider_id}")
+    def api_providers_delete(provider_id: str) -> dict[str, Any]:
+        cfg = load_profile()
+        blocks = [p for p in cfg.providers if p.id != provider_id]
+        if len(blocks) == len(cfg.providers):
+            raise HTTPException(status_code=404, detail=f"unknown provider: {provider_id}")
+        _save_providers(blocks)
+        return {"ok": True}
+
+    @app.post("/api/providers/{provider_id}/test")
+    async def api_providers_test(provider_id: str) -> dict[str, Any]:
+        """Live probe of a provider block. Chat categories get a tiny
+        chat/completions call; tts/stt get a reachability check (models list)."""
+        cfg = load_profile()
+        block = next((p for p in cfg.providers if p.id == provider_id), None)
+        if block is None:
+            raise HTTPException(status_code=404, detail=f"unknown provider: {provider_id}")
+        base_url = (block.base_url or "").strip()
+        if not base_url:
+            return {"ok": False, "error": "no endpoint URL set on this block"}
+        from secrets_store import mask
+        import httpx
+        key_env = "PROVIDER_" + _provider_env_slug(provider_id) + "_API_KEY"
+        api_key = os.getenv(key_env, "")
+        host = base_url.split("://", 1)[-1].split("/", 1)[0].lower()
+        local = host.startswith(("localhost", "127.0.0.1", "[::1]", "0.0.0.0", "::1"))
+        if not api_key and not local:
+            return {"ok": False, "error": "no API key set for this block (add it in the key field above)"}
+        headers = {"Authorization": f"Bearer {api_key or 'local-no-key'}"}
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                if block.category in ("tts", "stt"):
+                    r = await client.get(f"{base_url.rstrip('/')}/models", headers=headers)
+                    if r.status_code < 400:
+                        return {"ok": True, "note": f"endpoint reachable ({r.status_code})"}
+                    return {"ok": False, "error": f"HTTP {r.status_code} from {base_url}"}
+                r = await client.post(
+                    f"{base_url.rstrip('/')}/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": block.model or "gpt-4o-mini",
+                        "max_tokens": 4,
+                        "messages": [{"role": "user", "content": "Say ok."}],
+                    },
+                )
+                if r.status_code >= 400:
+                    detail = r.text[:160]
+                    return {"ok": False, "error": f"HTTP {r.status_code}: {detail}"}
+                data = r.json()
+                text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+                return {"ok": True, "preview": (text or "").strip()[:40]}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
 
     @app.post("/api/secrets/test")
     async def api_secrets_test(body: TestProviderBody) -> dict[str, Any]:

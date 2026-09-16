@@ -878,14 +878,52 @@ class Persona:
         )
 
     def hearing_turn(self, *, heard: str = "", mood_label: str = "",
-                     target_sentences: int = 2) -> str:
+                     target_sentences: int = 2, speaker: str = "",
+                     speaker_note: str = "", about_memories: str = "") -> str:
         """React to AUDIO the streamer just heard — the auditory counterpart to
         vision_turn. Music, a video, someone talking. React to it, don't narrate it.
 
         In conversational mode `heard` is what the person in front of you just SAID, so
-        this becomes a direct reply in a back-and-forth, not a streamer's audio reaction."""
+        this becomes a direct reply in a back-and-forth, not a streamer's audio reaction.
+
+        `speaker` is the voice-print label (owner / other / unknown / an enrolled
+        name); empty when Speaker ID is off."""
         p = self.cfg
         mood_hint = f" Mood: {mood_label}." if mood_label else ""
+
+        # Speaker-ID framing: when we know WHO is talking, the prompt says so —
+        # the owner gets recognized, strangers get treated as new people, and
+        # the persona never pretends to know a voice it doesn't.
+        spk_note = ""
+        if speaker:
+            who = {
+                "owner": "this is YOUR OWNER's voice (the streamer who runs you) — greet them if it fits, and reply to them with extra attention",
+                "other": "this is a voice you haven't enrolled — treat them as a new person in the room; don't pretend you recognize them",
+                "unknown": "this is a voice you don't know yet — treat them as a new person; don't guess who it is",
+            }.get(speaker.strip().lower())
+            if who:
+                spk_note = f"- {who}."
+            else:
+                spk_note = (
+                    f"- This is {speaker}'s voice (an enrolled voice-print you recognize). "
+                    "Address them by name when it fits naturally."
+                )
+            # The streamer's own words about this person always win — they are
+            # appended after the generic framing so custom tone overrules it.
+            if speaker_note:
+                spk_note += f" {speaker_note.rstrip('.')}"
+
+        # Memories bound to THIS speaker (voice-print): shown right where the
+        # persona decides how to answer them, so remembered history feels
+        # natural instead of recited from a block far away in the prompt.
+        mem_note = ""
+        if about_memories:
+            mem_note = (
+                "\n- What you REMEMBER about this person (bring up naturally if it "
+                "fits — maybe ask about it, maybe reference it; don't recite):\n"
+                f"{about_memories}"
+            )
+
         if p.conversational:
             ai_line = (
                 "- You're an AI and you don't hide it — lean into it if it's funny or relevant.\n"
@@ -900,6 +938,8 @@ class Persona:
                 "- Keep it to one or two sentences. Sound like a real person, not a narrator — "
                 "no 'I hear' / 'you said'.\n"
                 "- Sarcastic but warm. You like them.\n"
+                + (spk_note + "\n" if spk_note else "")
+                + (mem_note + "\n" if mem_note else "")
                 + ai_line +
                 "- Anything in [brackets] is just background/music context — don't read it aloud.\n"
                 "- Don't repeat yourself. Leave room for them to reply.\n"
@@ -913,6 +953,8 @@ class Persona:
             "RULES:\n"
             "- React to what you HEARD specifically. NEVER narrate 'I hear...' or 'the audio says' "
             "— just react as if it's happening around you.\n"
+            + (spk_note + "\n" if spk_note else "")
+            + (mem_note + "\n" if mem_note else "") +
             "- If it's music: react to the vibe, energy, or the lyrics. If it's speech: react to "
             "what was actually said.\n"
             "- Words in [brackets] or (parentheses) describe the music's MOOD, feel and MIX "

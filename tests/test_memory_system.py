@@ -532,3 +532,83 @@ def test_apply_consolidation_skips_partial_groups(store: LongTermMemory):
     result = store.apply_consolidation(merges)
     assert result == {"removed": 0, "added": 0}
     assert len(store.list("long_term")) == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-person memories (about = voice-print speaker)
+# ---------------------------------------------------------------------------
+
+
+def test_about_field_roundtrip_and_filtering(store: LongTermMemory):
+    store.add("yato loves stardew", about="Owner")
+    store.add("misa is the cat of yato", about="Owner")
+    store.add("generic stream fact")
+    short = store.add("misa said hi", kind="short_term", about="Owner", ttl_sec=3600)
+
+    assert store.about_speakers() == ["Owner"]
+    hits = store.search("stardew", about="Owner")
+    assert [h["text"] for h in hits] == ["yato loves stardew"]
+    assert store.search("stardew", about="Stranger") == []
+    # Persisted through save/load.
+    store.save()
+    reloaded = LongTermMemory(store._path)
+    reloaded.load()
+    assert all(e.get("about") == "Owner" for e in reloaded.list() if e["text"].startswith(("yato", "misa is")))
+    # Short-term about survives too, and expiry removes the speaker binding.
+    short_entry = [e for e in reloaded.list("short_term") if e["id"] == short["id"]][0]
+    assert short_entry["about"] == "Owner"
+    short_entry["expires_at"] = 0.0
+    assert "Owner" in reloaded.about_speakers()  # still bound via long-term
+
+
+def test_about_survives_expiry(store: LongTermMemory):
+    s1 = store.add("only short", kind="short_term", about="Owner", ttl_sec=3600)
+    assert store.about_speakers() == ["Owner"]
+    # Force-expire for real (update ttl to ~0), then run the janitor.
+    store.update(s1["id"], ttl_sec=0.00001)
+    time.sleep(0.01)
+    store.janitor_pass()
+    assert store.list("short_term") == []
+    # The speaker binding disappears with the expired memory.
+    assert store.about_speakers() == []
+
+
+def test_update_sets_and_clears_about(store: LongTermMemory):
+    e = store.add("neutral fact")
+    assert e.get("about", "") == ""
+    store.update(e["id"], about="Misa")
+    assert store.get(e["id"])["about"] == "Misa"
+    store.update(e["id"], about="")
+    assert store.get(e["id"])["about"] == ""
+    assert store.about_speakers() == []
+
+
+def test_consolidation_never_merges_different_speakers(store: LongTermMemory):
+    a = store.add("yato likes stardew", about="Owner", source="ai")
+    b = store.add("misa likes taiko", about="Misa", source="ai")
+    merges = [{"ids": [a["id"], b["id"]], "text": "they both like games"}]
+    result = store.apply_consolidation(merges)
+    assert result == {"removed": 0, "added": 0}  # refused
+    assert len(store.list()) == 2
+    # Same-speaker groups still merge, and the summary inherits the binding.
+    c = store.add("yato plays at night", about="Owner", source="ai")
+    result2 = store.apply_consolidation([{"ids": [a["id"], c["id"]], "text": "yato is a gamer"}])
+    assert result2 == {"removed": 2, "added": 1}
+    summary = [e for e in store.list() if e["source"] == "summary"][0]
+    assert summary["about"] == "Owner"
+
+
+def test_capture_binds_about_from_model(store: LongTermMemory):
+    reply = (
+        '[{"text": "yato asked me to play stardew", "kind": "long", "tag": "yato", '
+        '"about": "Owner"}, '
+        '{"text": "chat spammed poggers", "kind": "short", "tag": "chat"}]'
+    )
+    cap = _capture(store, reply)
+    cap.observe_event("[Owner] hey you should play stardew again")
+    facts = run(cap.extract_now())
+    assert len(facts) == 2
+    entries = store.list()
+    bound = [e for e in entries if e["about"] == "Owner"]
+    assert len(bound) == 1 and "stardew" in bound[0]["text"]
+    assert all(e.get("about", "") == "" for e in entries if e["tag"] == "chat")

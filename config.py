@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 load_dotenv()
 
@@ -94,6 +94,42 @@ HumorStyle = Literal[
     "self_deprecating", "roast", "wholesome", "chaotic",
 ]
 Energy = Literal["chill", "warm", "hyped", "unhinged"]
+
+
+# -------------------------------------------------------------------
+# Dynamic provider blocks (API Keys page)
+# -------------------------------------------------------------------
+ProviderCategory = Literal["llm", "vision", "tts", "stt", "memory", "thoughts"]
+
+
+class ProviderBlock(BaseModel):
+    """A user-defined OpenAI-compatible endpoint block. Blocks are created and
+    named on the API Keys page; each declares which task (category) it serves
+    plus its endpoint URL and model. API keys live in .env as
+    PROVIDER_<id>_API_KEY — never in the profile."""
+    id: str = ""                                # stable slug; names the PROVIDER_<id>_API_KEY env entry
+    name: str = "New provider"                  # display name (editable)
+    category: ProviderCategory = "llm"          # which subsystem this block serves
+    base_url: str = ""                          # endpoint incl. version path, e.g. https://host/v1
+    model: str = ""
+
+
+class SpeakerIDConfig(BaseModel):
+    """Voice-print speaker identification for the hearing loop. Distinguishes the
+    OWNER's voice from other people in a voice chat: enrolled prints live on
+    device (profiles/<name>.speakers.json) and heard speech is labeled OWNER /
+    OTHER before it reaches the prompt."""
+    enabled: bool = False
+    # Cosine similarity above this = same voice. Raise for fewer false OWNER
+    # labels in noisy rooms (typical range 0.55-0.85).
+    threshold: float = 0.68
+    # If heard speech matches no enrolled print (max similarity below this),
+    # the line is labeled UNK(OWN) instead of OTHER — keeps the persona from
+    # confidently misattributing strangers.
+    unknown_threshold: float = 0.45
+    # While enabled, non-owner voices are saved (audio only, on device) so the
+    # owner can enroll additional people later from the Voice page.
+    collect_other_voices: bool = False
 
 
 class PersonaConfig(BaseModel):
@@ -187,12 +223,17 @@ class LLMConfig(BaseModel):
     # e.g. https://example.com/v1). API key lives in Secrets (.env).
     openai_compatible_base_url: str = ""
     openai_compatible_timeout: float = 25.0
+    # Optional: name a specific provider block (API Keys page) for the brain.
+    # Empty = first block with category "llm" wins, else the fields above.
+    provider_ref: str = ""
     # --- Dedicated VISION block ---
     # When `vision_provider` is set, vision turns use this separate
     # OpenAI-compatible endpoint instead of the main LLM (e.g. qwen-vl on a
     # vision-only gateway while the brain stays on Claude). Empty = reuse the
     # main LLM for vision (previous behavior).
     vision_provider: Literal["main", "openai_compatible"] = "main"
+    # Optional: name a specific provider block (category "vision") for vision turns.
+    vision_provider_ref: str = ""
     vision_model: str = ""
     vision_openai_compatible_base_url: str = ""
     vision_openai_compatible_timeout: float = 30.0
@@ -227,6 +268,8 @@ class TTSConfig(BaseModel):
     openai_compatible_base_url: str = ""
     openai_compatible_model: str = ""
     openai_compatible_timeout: float = 30.0
+    # Optional: name a specific provider block (category "tts").
+    provider_ref: str = ""
     openai_compatible_voice: str = "alloy"
     openai_compatible_speed: float = 1.0
     openai_compatible_pcm_sample_rate: int = 24000
@@ -299,6 +342,11 @@ class HearingConfig(BaseModel):
     speech_only: bool = False            # dialogue only — never react to music / non-speech sound
     beam_size: int = 5                   # Whisper beam width (higher = more accurate on accents/noise)
     denoise: bool = False                # spectral noise reduction before STT (needs `noisereduce`)
+    # --- Speaker ID (voice prints, owner vs others) ---
+    # Same field can be fed from the dynamic provider system later; today the
+    # embedding runs 100% locally (numpy), no endpoint involved.
+    speaker_id: SpeakerIDConfig = Field(default_factory=SpeakerIDConfig)
+
     # --- Remote STT via an OpenAI-compatible endpoint (POST {base}/audio/transcriptions).
     # Empty engine = local faster-whisper (previous behavior). Remote STT avoids the
     # local Whisper VRAM/CPU cost entirely — useful when the same GPU runs the game.
@@ -306,6 +354,8 @@ class HearingConfig(BaseModel):
     openai_compatible_base_url: str = ""
     openai_compatible_model: str = "whisper-1"
     openai_compatible_timeout: float = 20.0
+    # Optional: name a specific provider block (category "stt").
+    provider_ref: str = ""
     openai_compatible_prompt: str = ""   # optional vocabulary/term hint for the transcription API
 
 
@@ -479,6 +529,8 @@ class MemoryConfig(BaseModel):
     # Extraction engine: "main" reuses the brain LLM; "openai_compatible" uses
     # the dedicated memory block below (cheaper/faster); "off" disables capture.
     extractor: Literal["main", "openai_compatible", "off"] = "openai_compatible"
+    # Optional: name a specific provider block (category "memory").
+    provider_ref: str = ""
     openai_compatible_base_url: str = ""      # e.g. http://localhost:11434/v1
     model: str = ""                           # e.g. llama-3.1-8b-instant
     timeout: float = 12.0
@@ -512,6 +564,8 @@ class RandomThoughtsConfig(BaseModel):
     # the brain, "openai_compatible" a cheap dedicated block, "off" = use only
     # the seed_topics pool / plain topic nudges.
     generator: Literal["main", "openai_compatible", "off"] = "main"
+    # Optional: name a specific provider block (category "thoughts").
+    provider_ref: str = ""
     openai_compatible_base_url: str = ""      # e.g. http://localhost:11434/v1
     model: str = ""                           # e.g. llama-3.1-8b-instant
     timeout: float = 12.0
@@ -547,7 +601,31 @@ class CaptionsConfig(BaseModel):
 
 class AppConfig(BaseModel):
     profile_name: str = "default"
+    # --- Dynamic provider blocks (managed on the API Keys page) ---
+    # Named OpenAI-compatible endpoints; subsystems point at one by name.
+    providers: list[ProviderBlock] = Field(default_factory=list[ProviderBlock])
+    # Speaker identification (owner vs others in voice chat).
+    speaker_id: SpeakerIDConfig = Field(default_factory=SpeakerIDConfig)
+
     persona: PersonaConfig = Field(default_factory=PersonaConfig)
+
+    @model_validator(mode="after")
+    def _ensure_provider_ids(self) -> "AppConfig":
+        """Every provider block needs a stable unique id (it names the .env
+        key). Assign slugs from id/name when missing or duplicated so saves
+        from any client (dashboard, plain PUT /api/config) just work."""
+        seen: set[str] = set()
+        for i, p in enumerate(self.providers):
+            base = (p.id or p.name or f"provider-{i + 1}").strip()
+            base = "".join(c if c.isalnum() else "_" for c in base.lower()).strip("_")[:40] \
+                or f"provider-{i + 1}"
+            cand, n = base, 2
+            while cand in seen:
+                cand = f"{base}_{n}"   # underscore survives re-slugging (ids stay stable)
+                n += 1
+            p.id = cand
+            seen.add(cand)
+        return self
     llm: LLMConfig = Field(default_factory=LLMConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)

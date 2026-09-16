@@ -18,6 +18,22 @@
   .wz-dot.done{background:rgba(95,208,255,.18);color:#5fd0ff}
   .wz-x{background:none;border:none;color:#8a8caa;font-size:1.4rem;cursor:pointer;line-height:1;padding:.2rem .4rem;border-radius:8px}
   .wz-x:hover{color:#fff;background:rgba(255,255,255,.06)}
+  /* ---- pre-start checklist ---- */
+  .pf-card{max-width:560px;border-color:rgba(255,130,110,.25)}
+  .pf-kicker{font-size:.72rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#ff9b85}
+  .pf-item{display:flex;gap:.7rem;align-items:flex-start;padding:.6rem .75rem;border-radius:12px;margin-bottom:.45rem;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.07)}
+  .pf-item.err{border-color:rgba(255,110,90,.35);background:rgba(255,90,70,.07)}
+  .pf-item.warn{border-color:rgba(255,190,90,.3);background:rgba(255,190,90,.06)}
+  .pf-icon{font-weight:800;font-size:.85rem;line-height:1.5}
+  .pf-item.err .pf-icon{color:#ff7a63}
+  .pf-item.warn .pf-icon{color:#ffc46b}
+  .pf-sec{font-weight:700;font-size:.86rem}
+  .pf-txt{font-size:.83rem;color:#b9bdd4;margin-top:.1rem}
+  .pf-msg{font-size:.85rem;color:#b9bdd4}
+  .pf-msg.ok{color:#7be3a3}
+  .pf-actions{display:flex;gap:.5rem;justify-content:flex-end;margin-top:1rem;flex-wrap:wrap}
+  .pf-badge{display:inline-flex;align-items:center;gap:.3rem;background:rgba(255,110,90,.14);border:1px solid rgba(255,110,90,.4);color:#ff8f7a;border-radius:999px;padding:.3rem .7rem;font-size:.8rem;font-weight:700;cursor:pointer}
+  .pf-badge:hover{background:rgba(255,110,90,.24)}
   .wz-body{padding:.5rem 1.75rem 1.5rem}
   .wz-title{font-size:1.5rem;font-weight:800;letter-spacing:-.02em;margin:.4rem 0 .35rem}
   .wz-sub{color:#a8aac4;font-size:.95rem;line-height:1.55;margin-bottom:1.4rem}
@@ -85,8 +101,13 @@
       <span class="dot"></span>
       <span x-text="running ? 'LIVE' : 'IDLE'"></span>
     </div>
-    <button class="btn primary" x-show="!running" @click="start">Start</button>
+    <button class="btn primary" x-show="!running" @click="start" :disabled="startBusy"
+      x-text="startBusy ? 'starting…' : 'Start'">Start</button>
     <button class="btn warn" x-show="running" @click="stop">Stop</button>
+    <span class="start-error" x-show="startError" :title="startError" x-text="startError"></span>
+    <button class="pf-badge" x-show="!running && !preflightDismissed && preflight.length && preflightErrors().length"
+      @click="runPreflight(); preflightOpen = true" title="Configuration problems found — click to review">
+      ⚠ <span x-text="preflightErrors().length"></span></button>
     <button class="btn ghost panic" x-show="running" @click="resetAudio()" title="Flush audio buffer (kills static / stuck playback)">⚠ reset audio</button>
     <button class="btn ghost wz-setup-btn" @click="openWizard()" title="Setup wizard">✨ Setup</button>
     <button class="btn ghost" @click="drawerOpen = !drawerOpen" title="Toggle live panel">
@@ -415,9 +436,21 @@
         </template>
         <template x-if="cfg.tts.provider==='openai_compatible'">
           <div class="field wide">
-            <label>Base URL</label>
+            <label>Provider block</label>
+            <select x-model="cfg.tts.provider_ref">
+              <option value="">— auto (first TTS block) —</option>
+              <template x-for="p in providers.filter(x => x.category==='tts')" :key="p.id || p.name">
+                <option :value="p.id" x-text="p.name + (p.base_url ? ` (${p.base_url})` : '')" :selected="cfg.tts.provider_ref===p.id"></option>
+              </template>
+            </select>
+            <small class="hint">Blocks are managed on the <b>API Keys</b> page. Without a block, the legacy base URL below is used.</small>
+          </div>
+        </template>
+        <template x-if="cfg.tts.provider==='openai_compatible'">
+          <div class="field wide">
+            <label>Base URL (legacy, when no block matches)</label>
             <input x-model="cfg.tts.openai_compatible_base_url" placeholder="https://api.openai.com/v1" />
-            <small class="hint">Any endpoint implementing <code>POST {base}/audio/speech</code> (OpenAI, Kokoro-FastAPI, openedai-speech, speaches…). Version path included. The API key goes under <b>API Keys → OpenAI-Compatible (TTS)</b>.</small>
+            <small class="hint">Any endpoint implementing <code>POST {base}/audio/speech</code> (OpenAI, Kokoro-FastAPI, openedai-speech, speaches…). Version path included. The API key goes under <b>API Keys</b>.</small>
           </div>
         </template>
         <template x-if="cfg.tts.provider==='openai_compatible'">
@@ -456,6 +489,87 @@
       <div class="test-strip">
         <input class="test-input" x-model="voiceTestText" placeholder="Type a line to test the voice..." />
         <button class="btn primary" @click="testVoice()" :disabled="!voiceTestText || testing">▶ Play</button>
+      </div>
+
+      <!-- ============ Speaker ID (voice prints) ============ -->
+      <h3 class="subhead" style="margin-top:22px;">Speaker ID — recognize who's talking</h3>
+      <p class="hint" style="margin:4px 0 10px;">
+        Voice prints run 100% locally (no cloud, no extra cost): after a short enrollment your streamer
+        knows it's <b>you</b> talking in voice chat — and treats strangers as new people. Works with the
+        Hearing feature on any STT engine.
+      </p>
+      <label class="toggle-row big">
+        <span>Enable speaker identification</span>
+        <input type="checkbox" class="switch" x-model="cfg.hearing.speaker_id.enabled" />
+      </label>
+      <div class="grid two" x-show="cfg.hearing.speaker_id.enabled">
+        <div class="field">
+          <label>Match threshold <span class="slider-val" x-text="cfg.hearing.speaker_id.threshold.toFixed(2)"></span></label>
+          <input type="range" min="0.4" max="0.9" step="0.01" x-model.number="cfg.hearing.speaker_id.threshold" />
+          <small class="hint">How strict a voice must match to be recognized. Raise it if strangers get labeled as you; lower it if you aren't recognized.</small>
+        </div>
+        <div class="field">
+          <label>Unknown threshold <span class="slider-val" x-text="cfg.hearing.speaker_id.unknown_threshold.toFixed(2)"></span></label>
+          <input type="range" min="0.1" max="0.8" step="0.01" x-model.number="cfg.hearing.speaker_id.unknown_threshold" />
+          <small class="hint">Below this, a voice is “unknown” rather than “someone else you know”.</small>
+        </div>
+        <div class="field">
+          <label>Enrolled voices</label>
+          <div class="speakers-list">
+            <template x-for="s in speakersInfo.speakers" :key="s.name">
+              <div class="speaker-row">
+                <span x-text="s.name"></span>
+                <small class="hint" x-text="s.prints + ' print(s)'"></small>
+                <template x-if="noteEditing !== s.name">
+                  <div class="note-view">
+                    <small class="hint" x-show="s.note" style="color:#c4b5fd;" x-text="'💬 ' + s.note"></small>
+                    <button class="btn tiny" @click="noteEdit(s)" x-text="s.note ? 'edit note' : '+ note'"></button>
+                  </div>
+                </template>
+                <template x-if="noteEditing === s.name">
+                  <div class="note-edit">
+                    <input x-model="noteDraft" placeholder='e.g. "this is my mom — treat her warmly"' @keydown.enter="noteSave(s)" />
+                    <button class="btn tiny primary" @click="noteSave(s)">save</button>
+                    <button class="btn tiny ghost" @click="noteCancel()">cancel</button>
+                  </div>
+                </template>
+                <button class="btn tiny danger" @click="speakerRemove(s.name)">remove</button>
+              </div>
+            </template>
+            <p class="hint" x-show="!speakersInfo.speakers.length">No voices enrolled yet.</p>
+          </div>
+        </div>
+        <div class="field">
+          <label>Enroll a voice (live)</label>
+          <div class="enroll-strip">
+            <input x-model="enrollName" placeholder="name (e.g. You / a friend)" />
+            <button class="btn tiny" @click="enrollStart()" :disabled="voiceBusy">start</button>
+            <button class="btn tiny primary" @click="enrollFinish()" :disabled="voiceBusy">save</button>
+            <button class="btn tiny ghost" @click="enrollCancel()" :disabled="voiceBusy">cancel</button>
+          </div>
+          <small class="hint" x-show="speakersInfo.enrolling > 0" style="color:#a7f3d0;">
+            Listening… <span x-text="speakersInfo.enrolling"></span> utterance(s) captured — talk normally for a few sentences, then hit save.
+          </small>
+          <small class="hint" x-show="!speakersInfo.active">Needs the session running (Start) so the audio loop can capture.</small>
+        </div>
+        <div class="field wide">
+          <label>Collected unknown voices</label>
+          <label class="toggle-row">
+            <span>Keep short clips of unknown voices (for enrolling them later)</span>
+            <input type="checkbox" class="switch" x-model="cfg.hearing.speaker_id.collect_other_voices" />
+          </label>
+          <div class="speakers-list" x-show="speakersInfo.clips.length">
+            <template x-for="c in speakersInfo.clips" :key="c.id">
+              <div class="speaker-row">
+                <audio controls preload="none" :src="'/api/speakers/clips/' + c.id + '/audio'" style="height:26px;"></audio>
+                <input x-model="clipNames[c.id]" placeholder="name" style="width:110px;" />
+                <button class="btn tiny" @click="clipEnroll(c.id)" :disabled="voiceBusy">enroll</button>
+                <button class="btn tiny danger" @click="clipDelete(c.id)">✕</button>
+              </div>
+            </template>
+          </div>
+          <p class="hint" x-show="!speakersInfo.clips.length">No collected clips. Clips appear here automatically when an unknown voice talks and collection is on.</p>
+        </div>
       </div>
     </section>
 
@@ -745,9 +859,19 @@
               <input x-model="cfg.llm.vision_model" placeholder="e.g. qwen-vl-max / qwen2.5-vl-72b-instruct" />
             </div>
             <div class="field">
-              <label>Vision base URL</label>
+              <label>Vision provider block</label>
+              <select x-model="cfg.llm.vision_provider_ref">
+                <option value="">— auto (first VISION block) —</option>
+                <template x-for="p in providers.filter(x => x.category==='vision')" :key="p.id || p.name">
+                  <option :value="p.id" x-text="p.name + (p.base_url ? ` (${p.base_url})` : '')" :selected="cfg.llm.vision_provider_ref===p.id"></option>
+                </template>
+              </select>
+              <small class="hint">Blocks are managed on the <b>API Keys</b> page. Without a block, the base URL below is used.</small>
+            </div>
+            <div class="field">
+              <label>Vision base URL (legacy)</label>
               <input x-model="cfg.llm.vision_openai_compatible_base_url" placeholder="https://your-vision-gateway/v1" />
-              <small class="hint">Blank = reuse the Engine's OpenAI-compatible base URL. API key: <b>API Keys → OpenAI-Compatible (vision)</b>.</small>
+              <small class="hint">Blank = reuse the Engine's OpenAI-compatible base URL. API key: <b>API Keys</b> page.</small>
             </div>
             <div class="field">
               <label>Vision max tokens <span class="slider-val" x-text="cfg.llm.vision_max_tokens"></span></label>
@@ -840,9 +964,21 @@
         </div>
         <template x-if="cfg.hearing.engine==='openai_compatible'">
           <div class="field">
-            <label>Base URL</label>
+            <label>Provider block</label>
+            <select x-model="cfg.hearing.provider_ref">
+              <option value="">— auto (first STT block) —</option>
+              <template x-for="p in providers.filter(x => x.category==='stt')" :key="p.id || p.name">
+                <option :value="p.id" x-text="p.name + (p.base_url ? ` (${p.base_url})` : '')" :selected="cfg.hearing.provider_ref===p.id"></option>
+              </template>
+            </select>
+            <small class="hint">Blocks are managed on the <b>API Keys</b> page. Without a block, the legacy base URL below is used.</small>
+          </div>
+        </template>
+        <template x-if="cfg.hearing.engine==='openai_compatible'">
+          <div class="field">
+            <label>Base URL (legacy, when no block matches)</label>
             <input x-model="cfg.hearing.openai_compatible_base_url" placeholder="https://api.groq.com/openai/v1" />
-            <small class="hint">Any endpoint implementing <code>POST {base}/audio/transcriptions</code>. API key: <b>API Keys → OpenAI-Compatible (STT)</b>.</small>
+            <small class="hint">Any endpoint implementing <code>POST {base}/audio/transcriptions</code>. API key: <b>API Keys</b> page.</small>
           </div>
         </template>
         <template x-if="cfg.hearing.engine==='openai_compatible'">
@@ -1237,6 +1373,7 @@
           <div class="memory-row" :class="{ undone: memoryUndone[ev.id] }">
             <div class="memory-main">
               <span class="memory-kind" :class="ev.kind==='short_term' ? 'short' : 'long'" x-text="ev.kind==='short_term' ? 'S' : 'L'"></span>
+              <span class="about-chip" x-show="ev.about" x-text="'👤 ' + ev.about"></span>
               <div class="memory-text">
                 <span x-text="ev.text"></span>
                 <small class="hint mono">
@@ -1257,12 +1394,16 @@
         <div class="test-strip">
           <input class="test-input" style="flex:2" x-model="ltmDraft.text" placeholder="New memory — e.g. \"yato's cat is called Misa\"" />
           <input class="test-input" style="flex:0 0 130px" x-model="ltmDraft.tag" placeholder="tag (optional)" />
+          <input class="test-input" style="flex:0 0 150px" x-model="ltmDraft.about" list="aboutSpeakerOptions" placeholder="about person (optional)" />
           <div class="segmented">
             <button :class="{on: ltmDraft.kind==='long_term'}" @click="ltmDraft.kind='long_term'">long</button>
             <button :class="{on: ltmDraft.kind==='short_term'}" @click="ltmDraft.kind='short_term'">short</button>
           </div>
           <button class="btn primary" @click="ltmAdd()" :disabled="!ltmDraft.text.trim() || memoryBusy">+ Add</button>
         </div>
+        <datalist id="aboutSpeakerOptions">
+          <template x-for="n in (ltm.about_speakers || [])" :key="n"><option :value="n"></option></template>
+        </datalist>
         <div class="test-strip">
           <input class="test-input" x-model="ltmQuery" placeholder="Search memories…" />
           <div class="segmented">
@@ -1280,7 +1421,8 @@
                   <span class="memory-kind" :class="m.kind==='short_term' ? 'short' : 'long'" x-text="m.kind==='short_term' ? 'S' : 'L'"></span>
                   <div class="memory-text">
                     <span x-text="m.text"></span>
-                    <small class="hint mono" x-show="m.tag || m.hits > 1">
+                    <small class="hint mono" x-show="m.tag || m.about || m.hits > 1">
+                      <span x-show="m.about" class="about-chip" x-text="'👤 ' + m.about"></span>
                       <span x-show="m.tag" x-text="'#'+m.tag"></span>
                       <span x-show="m.hits > 1" x-text="'· seen '+m.hits+'×'"></span>
                       <span x-show="m.kind==='short_term' && m.expires_in_sec != null" x-text="'· expires in '+Math.round(m.expires_in_sec/60)+'min'"></span>
@@ -1296,6 +1438,7 @@
                 <div class="memory-main editing">
                   <input class="test-input" style="flex:2" x-model="ltmEdit.text" @keydown.enter="ltmSave()" />
                   <input class="test-input" style="flex:0 0 110px" x-model="ltmEdit.tag" placeholder="tag" />
+                  <input class="test-input" style="flex:0 0 140px" x-model="ltmEdit.about" list="aboutSpeakerOptions" placeholder="about person" />
                   <div class="segmented">
                     <button :class="{on: ltmEdit.kind==='long_term'}" @click="ltmEdit.kind='long_term'">long</button>
                     <button :class="{on: ltmEdit.kind==='short_term'}" @click="ltmEdit.kind='short_term'">short</button>
@@ -1477,7 +1620,19 @@
         </template>
         <template x-if="cfg.llm.provider === 'openai_compatible'">
           <div class="field" style="grid-column: 1 / -1;">
-            <label>Base URL</label>
+            <label>Provider block</label>
+            <select x-model="cfg.llm.provider_ref">
+              <option value="">— auto (first LLM block) —</option>
+              <template x-for="p in providers.filter(x => x.category==='llm')" :key="p.id || p.name">
+                <option :value="p.id" x-text="p.name + (p.base_url ? ` (${p.base_url})` : '')" :selected="cfg.llm.provider_ref===p.id"></option>
+              </template>
+            </select>
+            <small class="hint">Blocks are managed on the <b>API Keys</b> page — endpoint, model and key live there. Without a block, the legacy base URL below is used.</small>
+          </div>
+        </template>
+        <template x-if="cfg.llm.provider === 'openai_compatible'">
+          <div class="field" style="grid-column: 1 / -1;">
+            <label>Base URL (legacy, when no block matches)</label>
             <input x-model="cfg.llm.openai_compatible_base_url" placeholder="https://example.com/v1" />
             <small class="hint">Any OpenAI-compatible endpoint, version path included: e.g. <code>https://api.openai.com/v1</code>, <code>https://openrouter.ai/api/v1</code>, <code>https://api.groq.com/openai/v1</code>, or your own gateway. The API key goes under <b>API Keys → OpenAI-Compatible (generic)</b>.</small>
           </div>
@@ -1556,9 +1711,48 @@
         overwrite your keys. Use a reverse proxy with auth in that case.
       </div>
 
-      <template x-for="kind in ['llm','tts','stream']" :key="kind">
+      <!-- ============ dynamic provider blocks ============ -->
+      <div class="subhead" style="display:flex; align-items:center; gap:10px; margin-top:18px;">
+        <span>Provider blocks</span>
+        <button class="btn tiny" @click="providerAdd()" :disabled="providerBusy">+ add block</button>
+        <button class="btn tiny ghost" @click="providerSaveAll()" :disabled="providerBusy"
+          x-text="providerBusy ? '…' : 'save blocks'"></button>
+        <span class="hint" x-show="providerMsg" x-text="providerMsg"></span>
+      </div>
+      <p class="hint" style="margin:4px 0 10px;">
+        Each block is a named OpenAI-compatible endpoint. The <b>category</b> decides which task it serves
+        (LLM / Vision / TTS / STT / Memory / Thoughts) — subsystems automatically use the block for their
+        category, no per-file editing. Keys live in the list below; endpoints on localhost (Ollama, LM Studio)
+        don't need a key.
+      </p>
+      <div class="secrets-list">
+        <template x-for="(p, i) in providers" :key="p._localKey || (p.id || 'new') + '-' + i">
+          <div class="secret-row" style="align-items:center;">
+            <div class="secret-label" style="min-width:180px;">
+              <input x-model="p.name" placeholder="name (e.g. Main LLM)" style="width:100%;" />
+              <small class="hint" x-text="p.id ? 'key: ' + providerKeyEnv(p) : 'key assigned on save'"></small>
+            </div>
+            <div class="secret-value" style="display:grid; grid-template-columns: 130px 1fr 1fr auto; gap:8px; width:100%;">
+              <select x-model="p.category" title="which task this block serves">
+                <template x-for="c in providerCategories" :key="c">
+                  <option :value="c" x-text="c.toUpperCase()" :selected="p.category===c"></option>
+                </template>
+              </select>
+              <input x-model="p.base_url" placeholder="https://host/v1  (endpoint, version path included)" />
+              <input x-model="p.model" placeholder="model (e.g. llama3.1 / qwen-vl / tts-1)" />
+              <div style="display:flex; gap:6px;">
+                <button class="btn tiny" @click="providerTest(p)" :disabled="providerBusy">test</button>
+                <button class="btn tiny danger" @click="providerRemove(i)">✕</button>
+              </div>
+            </div>
+          </div>
+        </template>
+        <p class="hint" x-show="!providers.length">No blocks yet — add one and point your LLM/TTS/STT/Vision/Memory at it.</p>
+      </div>
+
+      <template x-for="kind in ['llm','tts','stt','stream']" :key="kind">
         <div>
-          <h3 class="subhead" x-text="kind === 'llm' ? 'LLM providers' : kind === 'tts' ? 'TTS providers' : 'Stream platforms'"></h3>
+          <h3 class="subhead" x-text="kind === 'llm' ? 'LLM providers' : kind === 'tts' ? 'TTS providers' : kind === 'stt' ? 'STT providers' : 'Stream platforms'"></h3>
           <div class="secrets-list">
             <template x-for="s in secretsByKind(kind)" :key="s.env">
               <div class="secret-row">
@@ -1577,7 +1771,7 @@
                       <button class="btn tiny" @click="startEditSecret(s.env)">
                         <span x-text="s.is_set ? 'edit' : 'add'"></span>
                       </button>
-                      <button class="btn tiny" x-show="s.is_set && (kind==='llm' || kind==='tts')"
+                      <button class="btn tiny" x-show="s.is_set && (kind==='llm' || kind==='tts' || s.dynamic)"
                         @click="testProviderKey(envToProvider(s.env), s.env)"
                         :disabled="secretBusy[s.env]">
                         <span x-show="!secretBusy[s.env]">test</span>
@@ -1646,6 +1840,22 @@
       </div>
     </div>
 
+    <div class="panel-sub" x-show="status.speaker_id?.enabled">
+      <div class="panel-title">Who's talking <span class="muted">(voice ID)</span></div>
+      <div class="who-talking" :class="nowSpeakerClass()">
+        <span class="behavior-dot"></span>
+        <span class="who-name" x-text="nowSpeakerLabel()"></span>
+        <span class="behavior-value" x-show="status.speaker_id?.since_sec != null"
+          x-text="Math.round(status.speaker_id?.since_sec || 0) + 's'"></span>
+      </div>
+      <div class="hint" x-show="status.speaker_id?.note" style="color:#c4b5fd;"
+        x-text="'💬 ' + (status.speaker_id?.note || '')"></div>
+      <div class="hint" x-show="!status.speaker_id?.now">—</div>
+      <div class="hint" x-show="(status.speaker_id?.enrolled || 0) > 0" style="opacity:.7;">
+        <span x-text="status.speaker_id?.enrolled || 0"></span> voice(s) enrolled
+      </div>
+    </div>
+
     <div class="panel-sub">
       <div class="panel-title">Now saying</div>
       <div class="now-saying" x-text="status.last_spoken || 'silent.'"></div>
@@ -1686,6 +1896,38 @@
       </div>
     </div>
   </aside>
+</div>
+
+<!-- ============ PRE-START CHECKLIST ============ -->
+<div class="wz-overlay" x-show="preflightOpen" x-cloak @keydown.escape.window="preflightOpen = false">
+  <div class="wz-card pf-card" @click.outside="preflightOpen = false">
+    <div class="wz-head">
+      <div>
+        <span class="pf-kicker">Before you start</span>
+        <div class="wz-title">Almost there</div>
+      </div>
+      <button class="wz-x" @click="preflightOpen = false">×</button>
+    </div>
+    <div class="wz-body">
+      <p class="pf-msg" style="margin:0 0 .8rem">These settings would stop or degrade the session. Fix them and click <b>Check again</b> — or start anyway if you know what you're doing.</p>
+      <template x-for="(p, idx) in preflight" :key="idx">
+        <div class="pf-item" :class="p.level === 'error' ? 'err' : 'warn'">
+          <span class="pf-icon" x-text="p.level === 'error' ? '✕' : '⚠'"></span>
+          <div>
+            <div class="pf-sec" x-text="p.section"></div>
+            <div class="pf-txt" x-text="p.message"></div>
+          </div>
+        </div>
+      </template>
+      <div class="pf-actions">
+        <button class="btn ghost" @click="runPreflight()" :disabled="preflightLoading"
+          x-text="preflightLoading ? 'checking…' : '↻ Check again'"></button>
+        <button class="btn ghost" @click="preflightOpen = false">Close</button>
+        <button class="btn warn" @click="dismissPreflight(); start()" :disabled="startBusy"
+          x-text="startBusy ? 'starting…' : 'Start anyway'"></button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- ============ FIRST-RUN SETUP WIZARD ============ -->

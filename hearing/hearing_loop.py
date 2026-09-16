@@ -13,7 +13,7 @@ import os
 import site
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 from loguru import logger
@@ -82,13 +82,19 @@ class HearingEvent:
     music_valence: float = 0.0
     music_arousal: float = 0.0
     music_energy: float = 0.0
+    # Voice-print speaker label when Speaker ID is enabled:
+    # speaker name (enrolled), "other" / "unknown" for strangers, "" = off.
+    speaker: str = ""
+    speaker_similarity: float = -1.0
     captured_at: float = field(default_factory=time.time)
 
 
 class HearingLoop:
     def __init__(self, cfg, out_queue: "asyncio.Queue[HearingEvent]",
                  is_self_speaking: Optional[Callable[[], bool]] = None,
-                 is_self_echo: Optional[Callable[[str], bool]] = None) -> None:
+                 is_self_echo: Optional[Callable[[str], bool]] = None,
+                 speaker_identifier: Optional[Any] = None,
+                 enrollment_buffer: Optional[Any] = None) -> None:
         self._cfg = cfg
         self._queue = out_queue
         self._capture = SystemAudioCapture(samplerate=16000)
@@ -103,6 +109,13 @@ class HearingLoop:
         # Returns True if a transcript matches something Wallie recently SAID — the
         # definitive self-echo guard, immune to capture lag (content, not timing).
         self._is_self_echo = is_self_echo
+        # Optional voice-print speaker ID (hearing.speaker_id.SpeakerIdentifier).
+        # When present, every speech event is labeled OWNER (enrolled name) /
+        # OTHER / UNKNOWN so the persona can tell who is talking.
+        self._speaker_id = speaker_identifier
+        # Optional live-enrollment sink (hearing.speaker_id.EnrollmentBuffer):
+        # while the owner is enrolling, utterances feed it before anything else.
+        self._enrollment_buffer = enrollment_buffer
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -169,11 +182,24 @@ class HearingLoop:
                 # Pull the numeric musical mood for anything musical — a song with
                 # lyrics (→ speech) OR an instrumental (→ music). This is what lets the
                 # MoodEngine FEEL the track, not just read a word in the prompt.
+                # Live enrollment capture takes priority over reacting.
+                if self._enrollment_buffer is not None:
+                    self._enrollment_buffer.add(audio)
+                    logger.info("hear> (enrollment capture)")
+                    await asyncio.sleep(window)
+                    continue
                 feats = None
                 if sound_type in ("speech", "music"):
                     feats = analyze_music(music_audio, 16000)
                 vibe = feats.descriptor if (sound_type == "speech" and feats) else ""
                 is_music_ev = feats is not None and (sound_type == "music" or bool(vibe))
+                # Voice-print labeling for speech events (who is talking).
+                speaker_label = ""
+                if self._speaker_id is not None and has_speech:
+                    label, sim = self._speaker_id.handle_utterance(audio)
+                    speaker_label = label or ""
+                    if label:
+                        logger.info(f"hear> speaker → {label} ({sim:.2f})")
                 ev = HearingEvent(
                     transcript=text if has_speech else "",
                     loudness=rms, has_speech=has_speech,
@@ -183,6 +209,7 @@ class HearingLoop:
                     music_valence=(feats.valence if feats else 0.0),
                     music_arousal=(feats.arousal if feats else 0.0),
                     music_energy=(feats.energy if feats else 0.0),
+                    speaker=speaker_label,
                 )
                 self._enqueue(ev)
                 if sound_type == "speech":
@@ -250,6 +277,14 @@ class HearingLoop:
             audio = self._capture.latest(grab)
             speech_active = False
 
+            # Live voice-print enrollment: while the owner is enrolling, every
+            # utterance feeds the buffer INSTEAD of producing a reaction.
+            if self._enrollment_buffer is not None:
+                self._enrollment_buffer.add(audio)
+                logger.info("hear> (enrollment capture)")
+                await asyncio.sleep(poll)
+                continue
+
             text = await loop.run_in_executor(None, self._transcribe, audio)
             has_speech = bool(text) and len(text.split()) >= 2
             if not has_speech:
@@ -260,9 +295,19 @@ class HearingLoop:
                 await asyncio.sleep(poll)
                 continue
 
+            # Voice-print labeling BEFORE the event goes out — the label rides
+            # on the event itself so the prompt knows WHO said it.
+            speaker_label = ""
+            if self._speaker_id is not None:
+                label, sim = self._speaker_id.handle_utterance(audio)
+                speaker_label = label or ""
+                if label:
+                    logger.info(f"hear> speaker → {label} ({sim:.2f})")
+
             self._enqueue(HearingEvent(
                 transcript=text, loudness=rms, has_speech=True,
                 sound_type="speech", descriptor="",
+                speaker=speaker_label,
             ))
             logger.info(f"hear> [{rms:.2f}] {text[:90]}")
             await asyncio.sleep(poll)

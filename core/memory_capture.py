@@ -44,9 +44,13 @@ _EXTRACT_SYSTEM = (
     "anything about being an AI or following instructions.\n"
     "- Classify each fact: kind='long' (durable, keep forever) or kind='short' "
     "(session-scoped, expires) and a very short tag (1-3 words, e.g. 'viewer', 'game').\n"
+    "- If a fact is clearly about ONE specific person from a line labeled [NAME] "
+    "(e.g. [Owner] said something), add an optional field \"about\": \"NAME\" — the "
+    "exact label as written, no translation. Omit \"about\" for general facts.\n"
     "- Write each memory as a first-person note from the character's perspective, "
     "max 15 words, e.g. \"yato asked me to play stardew next stream\".\n"
-    '- Reply with ONLY a JSON array like: [{"text": "...", "kind": "long", "tag": "..."}]\n'
+    '- Reply with ONLY a JSON array like: [{"text": "...", "kind": "long", "tag": "...", '
+    '"about": "..."}]\n'
     "- Empty array [] when nothing is worth remembering."
 )
 
@@ -168,12 +172,16 @@ class MemoryCapture:
                     else "short_term"
                 )
                 try:
+                    # "about" binds the fact to a voice-print speaker label
+                    # (e.g. the [Owner] heard line) when the model set one.
+                    about = str(fact.get("about") or "").strip()[:40]
                     entry = self._store.add(
                         str(fact.get("text") or "")[:400],
                         kind=kind,
                         tag=str(fact.get("tag") or "")[:40],
                         ttl_sec=self._cfg.short_term_ttl_sec,
                         source="ai",
+                        about=about,
                     )
                     if self.on_captured:
                         try:
@@ -182,6 +190,7 @@ class MemoryCapture:
                                 "text": entry["text"],
                                 "kind": kind,
                                 "tag": entry.get("tag", ""),
+                                "about": entry.get("about", ""),
                                 "ts": time.time(),
                             })
                         except Exception:

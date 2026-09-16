@@ -1,11 +1,49 @@
 """Secrets management — UI-editable API keys, written to .env safely."""
 from __future__ import annotations
 
+import re
+
 import os
 from pathlib import Path
 from typing import Iterable
 
-from config import BASE_DIR
+from config import BASE_DIR, ProviderCategory
+
+ENV_FILE = BASE_DIR / ".env"
+
+# Dynamic provider blocks (API Keys page) store their keys as
+# PROVIDER_<id>_API_KEY. The <id> part is validated so a malicious block name
+# can never smuggle arbitrary env writes.
+_PROVIDER_KEY_RE = re.compile(r"^PROVIDER_[A-Z0-9_]{1,64}_API_KEY$")
+
+# Metadata for dynamic provider keys. `envelope` is a callback so labels stay
+# in sync with the live provider list from the profile.
+_dynamic_provider_meta: dict[str, dict[str, str]] = {}
+
+
+def set_provider_context(providers: list) -> None:
+    """Give the secrets page metadata for the profile's provider blocks.
+
+    Called before rendering the secrets list (dashboard) with the active
+    profile's provider blocks; purely cosmetic — validation is regex-based and
+    never depends on this registry."""
+    _dynamic_provider_meta.clear()
+    for p in providers or []:
+        pid = str(getattr(p, "id", "") or "")
+        if not pid:
+            continue
+        # Normalize exactly like config._provider_slug so lookups always match.
+        pid = "".join(c if c.isalnum() else "_" for c in pid.lower())[:40].strip("_") or "provider"
+        _dynamic_provider_meta["PROVIDER_" + pid.upper() + "_API_KEY"] = {
+            "label": f"{getattr(p, 'name', pid)} ({getattr(p, 'category', 'llm')})",
+            "kind": str(getattr(p, "category", "llm")),
+            "url": "",
+            "hint": "endpoint + model for this block are set on the API Keys page",
+        }
+
+
+def provider_meta_for(env_name: str) -> dict[str, str] | None:
+    return _dynamic_provider_meta.get(env_name)
 
 ENV_FILE = BASE_DIR / ".env"
 
@@ -143,26 +181,54 @@ def mask(value: str) -> str:
     return f"{v[:3]}{'•' * 6}{v[-3:]}"
 
 
+def _resolve_field(env_name: str) -> dict[str, str] | None:
+    """Static SECRET_FIELDS entry, else dynamic PROVIDER_* metadata."""
+    if env_name in SECRET_FIELDS:
+        return SECRET_FIELDS[env_name]
+    if _PROVIDER_KEY_RE.match(env_name):
+        return _dynamic_provider_meta.get(env_name) or {
+            "label": env_name.removeprefix("PROVIDER_").removesuffix("_API_KEY").title() + " (provider)",
+            "kind": "llm",
+            "url": "",
+            "hint": "dynamic provider block — endpoint + model on the API Keys page",
+        }
+    return None
+
+
 def list_secrets() -> list[dict[str, object]]:
     out: list[dict[str, object]] = []
+    seen: set[str] = set()
     for env_name, meta in SECRET_FIELDS.items():
-        raw = os.getenv(env_name, "") or ""
-        out.append(
-            {
-                "env": env_name,
-                "label": meta["label"],
-                "kind": meta["kind"],
-                "url": meta["url"],
-                "hint": meta["hint"],
-                "is_set": bool(raw.strip()),
-                "masked": mask(raw),
-            }
-        )
+        out.append(_secret_row(env_name, meta))
+        seen.add(env_name)
+    # Dynamic provider blocks: metadata registered via set_provider_context()
+    # first, then anything already written to the env (so keys for blocks that
+    # were deleted from the profile still show up and can be cleared).
+    for env_name in list(_dynamic_provider_meta) + sorted(
+        e for e in os.environ
+        if _PROVIDER_KEY_RE.match(e) and e not in seen and e not in _dynamic_provider_meta
+    ):
+        out.append(_secret_row(env_name, _resolve_field(env_name) or {}))
+        seen.add(env_name)
     return out
 
 
+def _secret_row(env_name: str, meta: dict[str, str]) -> dict[str, object]:
+    raw = os.getenv(env_name, "") or ""
+    return {
+        "env": env_name,
+        "label": meta.get("label", env_name),
+        "kind": meta.get("kind", "llm"),
+        "url": meta.get("url", ""),
+        "hint": meta.get("hint", ""),
+        "is_set": bool(raw.strip()),
+        "masked": mask(raw),
+        "dynamic": env_name not in SECRET_FIELDS,
+    }
+
+
 def set_secret(env_name: str, value: str) -> None:
-    if env_name not in SECRET_FIELDS:
+    if _resolve_field(env_name) is None:
         raise ValueError(f"refused write to unknown env name: {env_name!r}")
 
     value = (value or "").strip()
@@ -186,7 +252,7 @@ def set_secret(env_name: str, value: str) -> None:
 def update_many(values: dict[str, str]) -> list[str]:
     accepted: list[str] = []
     for env, val in values.items():
-        if env not in SECRET_FIELDS:
+        if _resolve_field(env) is None:
             continue
         set_secret(env, val)
         accepted.append(env)

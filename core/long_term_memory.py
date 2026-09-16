@@ -70,6 +70,7 @@ class LongTermMemory:
                         "id": int(raw.get("id") or 0),
                         "text": _clip(str(raw.get("text") or ""), 400),
                         "tag": _clip(str(raw.get("tag") or ""), 40),
+                        "about": _clip(str(raw.get("about") or ""), 40),
                         "created_at": float(raw.get("created_at") or 0.0),
                         "updated_at": float(raw.get("updated_at") or 0.0),
                         "hits": max(0, int(raw.get("hits") or 0)),
@@ -120,8 +121,13 @@ class LongTermMemory:
         tag: str = "",
         ttl_sec: Optional[float] = None,
         source: str = "manual",
+        about: str = "",
     ) -> dict[str, Any]:
-        """Create a memory. ``ttl_sec`` only applies to short-term entries."""
+        """Create a memory. ``ttl_sec`` only applies to short-term entries.
+
+        ``about`` optionally binds the memory to a voice-print speaker (the
+        enrolled name); those memories are surfaced in the prompt when that
+        person talks again."""
         text = _clip(text)
         if not text:
             raise MemoryError("memory text is empty")
@@ -129,6 +135,7 @@ class LongTermMemory:
             raise MemoryError("kind must be 'long_term' or 'short_term'")
         if kind == "short_term" and ttl_sec is None:
             ttl_sec = 24 * 3600.0  # one day by default
+        about = _clip(about, 40)
         with self._lock:
             bucket = self.long_term if kind == "long_term" else self.short_term
             # Dedupe: same (kind, text) → refresh instead of piling up.
@@ -138,12 +145,15 @@ class LongTermMemory:
                     entry["last_hit_at"] = _now()
                     if kind == "short_term" and ttl_sec is not None:
                         entry["expires_at"] = _now() + ttl_sec
+                    if about and not entry.get("about"):
+                        entry["about"] = about
                     return entry
             now = _now()
             entry: dict[str, Any] = {
                 "id": self._next_id,
                 "text": text,
                 "tag": _clip(tag, 40),
+                "about": about,
                 "created_at": now,
                 "updated_at": now,
                 "hits": 1,
@@ -162,7 +172,8 @@ class LongTermMemory:
 
     def update(self, entry_id: int, *, text: Optional[str] = None,
                tag: Optional[str] = None, kind: Optional[str] = None,
-               ttl_sec: Optional[float] = None) -> dict[str, Any]:
+               ttl_sec: Optional[float] = None,
+               about: Optional[str] = None) -> dict[str, Any]:
         """Edit an entry; ``kind`` change moves it between tiers."""
         with self._lock:
             entry = self._find_locked(entry_id)
@@ -175,6 +186,8 @@ class LongTermMemory:
                 entry["text"] = text
             if tag is not None:
                 entry["tag"] = _clip(tag, 40)
+            if about is not None:
+                entry["about"] = _clip(about, 40)
             if kind is not None:
                 if kind not in ("long_term", "short_term"):
                     raise MemoryError("kind must be 'long_term' or 'short_term'")
@@ -253,6 +266,11 @@ class LongTermMemory:
                 group = [e for e in group if e is not None]
                 if len(group) < 2:
                     continue
+                # Never merge memories bound to different speakers — a summary
+                # like "yato and Misa both like X" would blur per-person recall.
+                abouts = {e.get("about", "") for e in group}
+                if len(abouts) > 1:
+                    continue
                 now = _now()
                 total_hits = sum(e["hits"] for e in group)
                 oldest = min(e["created_at"] for e in group)
@@ -261,6 +279,7 @@ class LongTermMemory:
                     "id": self._next_id,
                     "text": text,
                     "tag": tag,
+                    "about": next(iter(abouts)),
                     "created_at": oldest,          # keeps the original age
                     "updated_at": now,
                     "hits": total_hits,
@@ -314,10 +333,12 @@ class LongTermMemory:
             return [dict(e) for e in self.long_term + self.short_term]
 
     def search(
-        self, query: str, limit: int = 8, kind: Optional[str] = None
+        self, query: str, limit: int = 8, kind: Optional[str] = None,
+        about: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """Naive relevance: whole-word-ish token overlap on text + tag.
-        ``kind`` restricts the pool ('long_term' | 'short_term')."""
+        ``kind`` restricts the pool ('long_term' | 'short_term').
+        ``about`` restricts to memories bound to that speaker (None = everyone's)."""
         tokens = [t for t in (query or "").lower().split() if len(t) > 2]
         if not tokens:
             return []
@@ -329,6 +350,8 @@ class LongTermMemory:
                         if e.get("expires_at") is None or e["expires_at"] > _now()]
             else:
                 pool = self.long_term + self.short_term
+            if about is not None:
+                pool = [e for e in pool if e.get("about", "").lower() == about.strip().lower()]
             scored: list[tuple[float, dict[str, Any]]] = []
             for e in pool:
                 hay = f"{e['text']} {e['tag']}".lower()
@@ -394,6 +417,21 @@ class LongTermMemory:
         tag = f" [{entry['tag']}]" if entry["tag"] else ""
         return f"- {entry['text']}{tag}"
 
+    def about_speakers(self) -> list[str]:
+        """Enrolled speakers that have at least one memory bound to them
+        (live short-term entries only; expired ones don't count)."""
+        with self._lock:
+            now = _now()
+            names: set[str] = set()
+            for e in self.long_term:
+                if e.get("about"):
+                    names.add(e["about"])
+            for e in self.short_term:
+                exp = e.get("expires_at")
+                if e.get("about") and (exp is None or exp > now):
+                    names.add(e["about"])
+            return sorted(names)
+
     def prompt_block(self, max_chars: int = 1200) -> str:
         """Compact bullet block for the persona system prompt (newest first)."""
         with self._lock:
@@ -437,6 +475,7 @@ class LongTermMemory:
                     "kind": kind,
                     "text": e["text"],
                     "tag": e["tag"],
+                    "about": e.get("about", ""),
                     "hits": e["hits"],
                     "created_at": e["created_at"],
                     "updated_at": e["updated_at"],
@@ -445,12 +484,13 @@ class LongTermMemory:
                         max(0.0, round(e["expires_at"] - now, 1))
                         if e.get("expires_at") is not None else None
                     ),
-                }
+                    }
 
             return {
                 "long_term": [shape(e) for e in sorted(self.long_term, key=lambda x: -x["id"])],
                 "short_term": [shape(e) for e in sorted(self.short_term, key=lambda x: -x["id"])],
                 "tags": self.all_tags_locked(),
+                "about_speakers": self.about_speakers(),
                 "stats": self.stats(),
             }
 

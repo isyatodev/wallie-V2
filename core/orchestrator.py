@@ -98,6 +98,16 @@ class Orchestrator:
         self._hearing_queue = hearing_queue
         self._latest_heard: str = ""       # most recent transcript Wallie "hears"
         self._latest_heard_ts: float = 0.0
+        # Voice-print label of whoever spoke the latest heard line ('', 'owner',
+        # 'other', 'unknown' or an enrolled name). Lets per-person memories be
+        # injected into the prompt when that specific person talks again.
+        self._latest_speaker: str = ""
+        self._latest_speaker_ts: float = 0.0
+        # Voice-print speaker ID collaborators, attached by wallie.build_orchestrator
+        # when hearing.speaker_id.enabled. Optional — everything degrades to "".
+        self._speaker_id: Any = None
+        self._speaker_store: Any = None
+        self._enrollment_buffer: Any = None
         # Broadcaster identity (e.g. detected from Twitch badges). Never hardcoded —
         # it comes from the authenticated/configured channel, and is only used so
         # the LLM can tell the STREAMER apart from viewers and donations.
@@ -305,6 +315,25 @@ class Orchestrator:
                 self._ltm.stats()
                 if (self._ltm is not None and self._cfg.memory.enabled) else None
             ),
+            "speaker_id": {
+                "enabled": self._speaker_id is not None,
+                "enrolled": (len(self._speaker_store.names()) if self._speaker_store else 0),
+                "enrolling": (
+                    (self._enrollment_buffer.pending if self._enrollment_buffer else 0)
+                    if getattr(self, "_enrolling", False) else 0
+                ),
+                # Live "who is talking right now" indicator for the dashboard.
+                "now": self._speaker_now(),
+                "since_sec": (
+                    round(time.time() - self._latest_speaker_ts, 1)
+                    if self._speaker_now() else None
+                ),
+                "note": (
+                    (self._speaker_store.get_note(resolved) or "")
+                    if self._speaker_store and (resolved := self._speaker_store.find_name(self._speaker_now()))
+                    else ""
+                ),
+            },
             "memory_consolidation": (
                 {
                     "enabled": self._memory_consolidator.enabled,
@@ -893,6 +922,8 @@ class Orchestrator:
         heard = ""
         if latest.sound_type == "speech" and latest.transcript:
             if self._is_self_echo(latest.transcript):
+                # Nobody else is talking — drop any stale who's-talking label.
+                self._latest_speaker = ""
                 return  # our own voice came back through the loopback — ignore
             heard = latest.transcript
             # If the speech rode on top of music, tag the vibe so Wallie knows
@@ -901,11 +932,32 @@ class Orchestrator:
                 heard = f'{latest.transcript} [{latest.descriptor} music]'
         elif latest.sound_type == "music":
             heard = f"({latest.descriptor or 'music'} music playing)"
+            self._latest_speaker = ""   # music isn't a person talking
         elif latest.sound_type == "sound":
             heard = f"({latest.descriptor or 'a sound'})"
+            self._latest_speaker = ""   # a noise isn't a person either
         if heard:
+            # Voice-print label rides along so the prompt knows WHO said it.
+            if getattr(latest, "speaker", ""):
+                heard = f"[{latest.speaker}] {heard}"
+                self._latest_speaker = latest.speaker
+                self._latest_speaker_ts = time.time()
             self._latest_heard = heard
             self._latest_heard_ts = time.time()
+            # Speech from the room feeds the memory extractor too — the
+            # [speaker] label is what lets facts be bound to that person.
+            if latest.sound_type == "speech" and self._memory_capture is not None:
+                self._memory_capture.observe_event(heard)
+
+    def _speaker_now(self) -> str:
+        """The voice-print label of the person talking RIGHT NOW — same freshness
+        window as the heard line. Empty when the label expired."""
+        if not self._latest_speaker:
+            return ""
+        age = time.time() - self._latest_speaker_ts
+        if age > self._cfg.hearing.max_context_age_sec:
+            return ""
+        return self._latest_speaker
 
     def _fresh_heard(self) -> str:
         """The recent heard transcript, only if still timely; else ''."""
@@ -915,6 +967,42 @@ class Orchestrator:
         if age > self._cfg.hearing.max_context_age_sec:
             return ""
         return self._latest_heard
+
+    def _fresh_speaker(self) -> str:
+        """The voice-print label of the current speaker, if still timely.
+        Expires together with the heard line it belongs to."""
+        if not self._latest_speaker:
+            return ""
+        age = time.time() - self._latest_heard_ts
+        if age > self._cfg.hearing.max_context_age_sec:
+            return ""
+        return self._latest_speaker
+
+    # --- Speaker ID (voice prints): live enrollment + status -----------------
+
+    def start_voice_enrollment(self) -> int:
+        """Begin capturing the owner's voice for a new voice print.
+        Returns the number of utterances already buffered."""
+        if self._enrollment_buffer is None:
+            return -1
+        self._enrollment_buffer.cancel()
+        return self._enrollment_buffer.pending
+
+    def finish_voice_enrollment(self, name: str, *, replace: bool = False) -> bool:
+        if self._enrollment_buffer is None:
+            return False
+        ok = self._enrollment_buffer.finish(self._speaker_store, name, replace=replace) if self._speaker_store else False
+        if ok and self._speaker_id is not None:
+            self._speaker_id.collect_other_voices = self._cfg.hearing.speaker_id.collect_other_voices
+        return ok
+
+    def cancel_voice_enrollment(self) -> None:
+        if self._enrollment_buffer is not None:
+            self._enrollment_buffer.cancel()
+
+    @property
+    def speaker_id_active(self) -> bool:
+        return self._speaker_id is not None
 
     @staticmethod
     def _norm_for_echo(text: str) -> str:
@@ -1497,11 +1585,49 @@ class Orchestrator:
         if intent.kind == "hearing":
             energy = (self._mood.arousal + self._mood.talkativity) / 2.0
             target = random.choice([1, 2, 2]) if energy < 0.6 else random.choice([2, 2, 3])
+            heard = intent.heard or self._fresh_heard()
+            # Per-person memory: if the current speaker is an enrolled voice
+            # with memories bound to them, surface those memories now — this is
+            # how "yato told me X last week" comes back when yato talks again.
+            speaker = self._fresh_speaker()
+            # Per-voice instruction written by the user (e.g. "this is my mom —
+            # treat her warmly"): injected whenever that voice is recognized.
+            speaker_note = ""
+            if self._speaker_store is not None and speaker:
+                try:
+                    resolved = self._speaker_store.find_name(speaker)
+                    if resolved:
+                        speaker_note = self._speaker_store.get_note(resolved)
+                except Exception:
+                    speaker_note = ""
+            about_memories = ""
+            if (
+                self._ltm is not None and speaker
+                and speaker not in ("other", "unknown", "")
+                and speaker in self._ltm.about_speakers()
+            ):
+                try:
+                    hits = self._ltm.search(heard or speaker, limit=4, about=speaker)
+                    if not hits:
+                        hits = self._ltm.search(speaker, limit=4, about=speaker)
+                    if not hits:
+                        # Fall back to that person's most reinforced facts.
+                        hits = sorted(
+                            (e for e in self._ltm.list() if e.get("about", "").lower() == speaker.lower()),
+                            key=lambda e: -e["hits"],
+                        )[:4]
+                    if hits:
+                        about_memories = "\n".join(f"- {e['text']}" for e in hits)
+                except Exception:
+                    about_memories = ""
             return (
                 self._persona.hearing_turn(
-                    heard=intent.heard or self._fresh_heard(),
+                    heard=heard,
                     mood_label=self._mood.label,
                     target_sentences=target,
+                    speaker=speaker,
+                    speaker_note=speaker_note,
+                    about_memories=about_memories,
                 ),
                 [],
                 "hearing",

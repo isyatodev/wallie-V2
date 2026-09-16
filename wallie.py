@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import re as _re
 import sys
 from typing import Optional
 
@@ -16,6 +17,73 @@ from donations import DonationDedupe, DonationEvent
 from donations.queue import DonationQueue
 from llm import build_provider
 from tts import build_tts
+
+
+_PROVIDER_SLUG_RE = _re.compile(r"[^a-z0-9_]+")
+
+
+def _provider_slug(pid: str) -> str:
+    """Env-safe slug for a provider id (matches secrets_store normalization)."""
+    s = _PROVIDER_SLUG_RE.sub("_", (pid or "").lower()).strip("_")
+    return s[:40] or "provider"
+
+
+_CATEGORY_KEY_FIELD = {
+    "llm": "openai_compatible_api_key",
+    "vision": "openai_compatible_vision_api_key",
+    "tts": "openai_compatible_tts_api_key",
+    "stt": "openai_compatible_stt_api_key",
+    "memory": "openai_compatible_memory_api_key",
+    "thoughts": "openai_compatible_thoughts_api_key",
+}
+
+
+def _resolve_provider(cfg, secrets, category: str, ref: str = "", allow_default: bool = True) -> dict:
+    """Resolve the endpoint settings for a subsystem (module-level, testable).
+
+    Order: block named by `ref` → first block of the category → the block
+    named "default" → the legacy per-subsystem fields. Returns a dict with
+    base_url / model / api_key / from.
+    """
+    import os as _os
+    blocks = [p.model_dump() for p in (getattr(cfg, "providers", None) or [])]
+    ref = (ref or "").strip()
+    block = None
+    if ref:
+        for b in blocks:
+            if b.get("id") == ref:
+                block = b
+                break
+    if block is None:
+        for b in blocks:
+            if b.get("category") == category:
+                block = b
+                break
+    if block is None and allow_default:
+        for b in blocks:
+            if b.get("id") == "default":
+                block = b
+                break
+    if block is not None:
+        pid = block.get("id", "")
+        key_env = "PROVIDER_" + _provider_slug(pid).upper() + "_API_KEY"
+        return {
+            "base_url": (block.get("base_url") or "").strip(),
+            "model": (block.get("model") or "").strip(),
+            "api_key": _os.getenv(key_env, ""),
+            "from": f"provider:{pid}",
+        }
+    # Legacy fallback — the per-subsystem fields.
+    cat = {
+        "llm": cfg.llm, "vision": cfg.llm, "tts": cfg.tts, "stt": cfg.hearing,
+        "memory": cfg.memory, "thoughts": cfg.random_thoughts,
+    }.get(category)
+    return {
+        "base_url": getattr(cat, "openai_compatible_base_url", "") if cat else "",
+        "model": getattr(cat, "openai_compatible_model", "") if cat else "",
+        "api_key": getattr(secrets, _CATEGORY_KEY_FIELD.get(category, ""), ""),
+        "from": "legacy",
+    }
 
 
 def _compat_api_key(api_key: str, base_url: str, purpose: str) -> str:
@@ -73,6 +141,181 @@ def _configure_logger(level: str) -> None:
     logger.add(sys.stderr, level=level, enqueue=True, backtrace=False, diagnose=False)
 
 
+# ---------------------------------------------------------------------------
+# Pre-start checks (dashboard Start button)
+#
+# `preflight()` mirrors, statically, what `build_orchestrator()` will do: same
+# provider resolution (block → category → default → legacy fields), same
+# localhost-doesn't-need-a-key rule, same required fields. It performs NO
+# network calls so the dashboard gets an instant checklist instead of a
+# 500 with a traceback after the user clicks Start.
+# ---------------------------------------------------------------------------
+
+
+def _pf_key_ok(api_key: str, base_url: str) -> bool:
+    """Same rule as `_compat_api_key`: a key is optional only for localhost."""
+    if (api_key or "").strip():
+        return True
+    host = (base_url or "").split("://", 1)[-1].split("/", 1)[0].lower()
+    return host.startswith(("localhost", "127.0.0.1", "[::1]", "0.0.0.0", "::1"))
+
+
+def _pf_compat(cfg, secrets, category: str, ref: str,
+               legacy_base: str, legacy_model: str, legacy_key: str) -> tuple[str, str, str]:
+    """Effective (base_url, model, api_key) for an openai_compatible subsystem,
+    exactly as `_effective_compat` + `_compat_api_key` resolve them in the build."""
+    prov = _resolve_provider(cfg, secrets, category, ref=ref)
+    if prov["from"] == "legacy":
+        return (legacy_base or "").strip(), (legacy_model or "").strip(), legacy_key
+    base = (prov["base_url"] or "").strip() or (legacy_base or "").strip()
+    model = (prov["model"] or "").strip() or (legacy_model or "").strip()
+    return base, model, prov["api_key"]
+
+
+def _pf_dep_missing(pkg: str) -> bool:
+    import importlib.util
+    import sys
+    if pkg in sys.modules:
+        return False  # already importable (covers test doubles too)
+    try:
+        return importlib.util.find_spec(pkg) is None
+    except (ImportError, ValueError):
+        return True
+
+
+def preflight(runtime: Optional[Runtime] = None) -> list[dict]:
+    """Static pre-start checklist for the dashboard.
+
+    Returns a list of issues; empty list = everything will build. Each issue
+    is {"level": "error"|"warn", "section": str, "message": str} where
+    "error" means start() WILL fail and "warn" means a feature will run
+    degraded or silently disabled.
+    """
+    runtime = runtime or get_runtime()
+    cfg = runtime.config
+    sec = runtime.secrets
+    issues: list[dict] = []
+
+    def add(level: str, section: str, message: str) -> None:
+        issues.append({"level": level, "section": section, "message": message})
+
+    # ---- Engine (LLM) — the build raises straight through, so all errors ----
+    llm = cfg.llm
+    if llm.provider == "openai_compatible":
+        base, _model, key = _pf_compat(
+            cfg, sec, "llm", llm.provider_ref,
+            llm.openai_compatible_base_url, llm.model,
+            sec.openai_compatible_api_key,
+        )
+        if not base:
+            add("error", "Engine (LLM)",
+                "provider is 'openai_compatible' but no endpoint is set — "
+                "create a block in API Keys (category LLM) or fill the base URL field")
+        elif not _pf_key_ok(key, base):
+            add("error", "Engine (LLM)",
+                f"endpoint {base} is remote and has no API key (API Keys → the LLM block)")
+        if _pf_dep_missing("openai"):
+            add("error", "Engine (LLM)", "package 'openai' is not installed (pip install openai)")
+    elif llm.provider in ("openai", "groq", "openrouter", "anthropic", "gemini"):
+        key_field = {
+            "openai": "openai_api_key", "groq": "groq_api_key",
+            "openrouter": "openrouter_api_key", "anthropic": "anthropic_api_key",
+            "gemini": "gemini_api_key",
+        }[llm.provider]
+        if not (getattr(sec, key_field) or "").strip():
+            add("error", "Engine (LLM)",
+                f"provider '{llm.provider}' has no API key ({key_field.upper()} in .env)")
+
+    # ---- Voice (TTS) — build raises, so errors ----
+    tts = cfg.tts
+    if tts.provider == "piper":
+        import pathlib
+        if not (tts.piper_model_path or "").strip():
+            add("error", "Voice (TTS)",
+                "piper has no model — download a .onnx voice and set the path, "
+                "or switch the TTS provider (Voice section)")
+        elif not pathlib.Path(tts.piper_model_path).is_file():
+            add("error", "Voice (TTS)", f"piper model file not found: {tts.piper_model_path}")
+    elif tts.provider == "fish" and not (sec.fish_api_key or "").strip():
+        add("error", "Voice (TTS)", "provider 'fish' has no API key (FISH_API_KEY)")
+    elif tts.provider == "elevenlabs" and not (sec.elevenlabs_api_key or "").strip():
+        add("error", "Voice (TTS)", "provider 'elevenlabs' has no API key (ELEVENLABS_API_KEY)")
+    elif tts.provider == "openai_compatible":
+        base, model, key = _pf_compat(
+            cfg, sec, "tts", tts.provider_ref,
+            tts.openai_compatible_base_url, tts.openai_compatible_model,
+            sec.openai_compatible_tts_api_key,
+        )
+        if not base:
+            add("error", "Voice (TTS)",
+                "provider is 'openai_compatible' but no endpoint is set (API Keys → TTS block)")
+        elif not _pf_key_ok(key, base):
+            add("error", "Voice (TTS)", f"endpoint {base} is remote and has no API key")
+        if base and not model:
+            add("warn", "Voice (TTS)", "no TTS model set — the endpoint's default will be used")
+
+    # ---- Hearing (STT) — remote STT is lenient in the build, so warns there ----
+    hearing = cfg.hearing
+    if hearing.enabled:
+        if hearing.engine == "openai_compatible":
+            base, _m, key = _pf_compat(
+                cfg, sec, "stt", hearing.provider_ref,
+                hearing.openai_compatible_base_url, hearing.openai_compatible_model,
+                sec.openai_compatible_stt_api_key,
+            )
+            if not base:
+                add("error", "Hearing (STT)",
+                    "engine is 'openai_compatible' but no endpoint is set (API Keys → STT block)")
+            elif not _pf_key_ok(key, base):
+                add("warn", "Hearing (STT)",
+                    f"remote STT endpoint {base} has no API key — transcriptions will fail with 401")
+        elif _pf_dep_missing("faster_whisper"):
+            add("warn", "Hearing (STT)",
+                "local engine selected but faster-whisper is not installed (pip install faster-whisper)")
+        if _pf_dep_missing("soundcard"):
+            add("warn", "Hearing (STT)", "package 'soundcard' not installed — audio capture will fail")
+
+    # ---- Vision — build falls back / disables, so warns (except bad config) ----
+    if cfg.vision.enabled:
+        if not llm.vision_capable:
+            add("warn", "Vision", "enabled but the LLM is not marked vision-capable — vision will be disabled")
+        if llm.vision_provider == "openai_compatible":
+            base = (llm.vision_openai_compatible_base_url or "").strip() or (llm.openai_compatible_base_url or "").strip()
+            model = (llm.vision_model or "").strip()
+            if not base:
+                add("error", "Vision", "dedicated vision provider has no endpoint (Vision section)")
+            if not model:
+                add("error", "Vision", "dedicated vision provider has no model — set the vision model, "
+                    "it cannot be inferred from the brain model")
+            elif not _pf_key_ok(sec.openai_compatible_vision_api_key, base):
+                add("warn", "Vision", "dedicated vision endpoint has no API key — will fall back to the main LLM")
+
+    # ---- Memory — build disables the whole feature on failure ----
+    mem = getattr(cfg, "memory", None)
+    if mem is not None and mem.enabled:
+        if mem.extractor == "openai_compatible":
+            prov = _resolve_provider(cfg, sec, "memory", ref=mem.provider_ref)
+            base = (prov["base_url"] or "").strip() if prov["from"] != "legacy" else ""
+            base = base or (mem.openai_compatible_base_url or "").strip()
+            if not base:
+                add("error", "Memory", "extractor is 'openai_compatible' but no endpoint is set "
+                    "(API Keys → memory block, or Memory section) — capture will be disabled")
+        elif _pf_dep_missing("openai"):
+            add("warn", "Memory", "package 'openai' not installed — extraction will fail")
+
+    # ---- Thoughts — build disables on failure ----
+    th = getattr(cfg, "random_thoughts", None)
+    if th is not None and th.enabled and th.generator == "openai_compatible":
+        prov = _resolve_provider(cfg, sec, "thoughts", ref=th.provider_ref)
+        base = (prov["base_url"] or "").strip() if prov["from"] != "legacy" else ""
+        base = base or (th.openai_compatible_base_url or "").strip()
+        if not base:
+            add("error", "Thoughts", "generator is 'openai_compatible' but no endpoint is set "
+                "(API Keys → thoughts block, or Memory → Thought generator)")
+
+    return issues
+
+
 def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
     runtime = runtime or get_runtime()
     cfg = runtime.config
@@ -80,12 +323,51 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
     _configure_logger(os.getenv("LOG_LEVEL", "INFO"))
 
     persona = Persona.from_config(cfg.persona)
-    llm = build_provider(cfg.llm, runtime.secrets)
-    tts = build_tts(cfg.tts, runtime.secrets)
+
+    def _effective_compat(category: str, sub_cfg, *, ref: str = "", allow_default: bool = True):
+        """(cfg_copy, secrets_copy) with a provider block's endpoint/model/key
+        applied when the subsystem runs on 'openai_compatible'. Legacy fields
+        remain untouched when no block matches."""
+        prov = _resolve_provider(cfg, runtime.secrets, category, ref=ref, allow_default=allow_default)
+        if prov["from"] == "legacy" or not prov["base_url"]:
+            return sub_cfg, runtime.secrets
+        updates: dict = {"openai_compatible_base_url": prov["base_url"]}
+        if prov["model"]:
+            updates["openai_compatible_model"] = prov["model"]
+            # The block's model is the directed model for dedicated blocks.
+            if category != "llm":
+                updates["model"] = prov["model"]
+        sub_cfg = sub_cfg.model_copy(update=updates)
+        key_field = {
+            "llm": "openai_compatible_api_key",
+            "vision": "openai_compatible_vision_api_key",
+            "tts": "openai_compatible_tts_api_key",
+            "stt": "openai_compatible_stt_api_key",
+            "memory": "openai_compatible_memory_api_key",
+            "thoughts": "openai_compatible_thoughts_api_key",
+        }[category]
+        secrets_eff = runtime.secrets.model_copy(update={key_field: prov["api_key"]})
+        return sub_cfg, secrets_eff
+
+    llm_cfg_eff, llm_secrets_eff = (
+        _effective_compat("llm", cfg.llm, ref=cfg.llm.provider_ref)
+        if cfg.llm.provider == "openai_compatible" else (cfg.llm, runtime.secrets)
+    )
+    llm = build_provider(llm_cfg_eff, llm_secrets_eff)
+    tts_cfg_eff, tts_secrets_eff = (
+        _effective_compat("tts", cfg.tts, ref=cfg.tts.provider_ref)
+        if cfg.tts.provider == "openai_compatible" else (cfg.tts, runtime.secrets)
+    )
+    tts = build_tts(tts_cfg_eff, tts_secrets_eff)
     vision_llm = None
     if cfg.llm.vision_provider == "openai_compatible":
         try:
-            vision_llm = _build_vision_llm(cfg, runtime.secrets)
+            # A dedicated vision block only applies when one actually exists
+            # (no "default" hijack — vision already falls back to the main LLM).
+            vis_cfg_eff, vis_secrets_eff = _effective_compat(
+                "vision", cfg.llm, ref=cfg.llm.vision_provider_ref, allow_default=False
+            )
+            vision_llm = _build_vision_llm(vis_cfg_eff, vis_secrets_eff)
             logger.info(f"vision: dedicated model {vision_llm.model} (OpenAI-compatible)")
         except Exception as e:
             logger.error(f"vision: dedicated provider failed, falling back to main LLM: {e}")
@@ -128,8 +410,21 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
                 vision_queue = asyncio.Queue(maxsize=4)
                 vision_loop = VisionLoop(cfg.vision, vision_queue)
 
+    # ----- dynamic provider resolution (API Keys page) -------------------
+    # Subsystem configs may reference a named provider block (provider="my-block").
+    # Resolution order for the endpoint settings:
+    #   1. the named block (cfg.providers), if it exists;
+    #   2. the first block with matching category;
+    #   3. the block named "default" (category-agnostic);
+    #   4. the legacy per-subsystem fields (previous behavior).
+    def _resolve_provider_inner(category: str, ref: str = "", allow_default: bool = True) -> dict:
+        return _resolve_provider(cfg, runtime.secrets, category, ref=ref, allow_default=allow_default)
+
     hearing_queue = None
     hearing_loop = None
+    _speaker_id = None
+    _speaker_store = None
+    _enrollment_buffer = None
     if cfg.hearing.enabled:
         try:
             from hearing import HearingEvent, HearingLoop
@@ -144,14 +439,45 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
             # the last `window_sec` of audio, so to be sure none of it contains Wallie's
             # own voice we also cover the playback that's still draining after the write.
             self_mute_window = cfg.hearing.window_sec + 2.5
+            # Voice-print speaker ID (owner vs others). Enrollment buffer is created
+            # whenever the feature is on so the dashboard can start/finish enrollment
+            # live; the identifier itself only scores when there are prints enrolled.
+            _sid_cfg = getattr(cfg.hearing, "speaker_id", None)
+            _speaker_id = None
+            _enrollment_buffer = None
+            if _sid_cfg is not None and _sid_cfg.enabled:
+                from hearing.speaker_id import EnrollmentBuffer, SpeakerIdentifier, SpeakerPrintStore
+                _speaker_store = SpeakerPrintStore(PROFILES_DIR / f"{cfg.profile_name or 'default'}.speakers.json")
+                _speaker_id = SpeakerIdentifier(
+                    _speaker_store,
+                    threshold=_sid_cfg.threshold,
+                    unknown_threshold=_sid_cfg.unknown_threshold,
+                    collect_other_voices=_sid_cfg.collect_other_voices,
+                )
+                _enrollment_buffer = EnrollmentBuffer()
+                logger.info(
+                    f"hearing: speaker ID on ({len(_speaker_store.names())} enrolled, "
+                    f"threshold {_sid_cfg.threshold})"
+                )
             hearing_loop = HearingLoop(
                 cfg.hearing, hearing_queue,
                 is_self_speaking=lambda: player.speaking_recently(self_mute_window),
+                speaker_identifier=_speaker_id,
+                enrollment_buffer=_enrollment_buffer,
             )
             if getattr(cfg.hearing, "engine", "") == "openai_compatible":
-                hearing_loop._stt_api_key = runtime.secrets.openai_compatible_stt_api_key
-                hearing_loop._stt_base_url = cfg.hearing.openai_compatible_base_url
-                logger.info("hearing: remote STT via OpenAI-compatible transcription API")
+                prov = _resolve_provider_inner("stt", ref=getattr(cfg.hearing, "provider_ref", ""))
+                try:
+                    hearing_loop._stt_api_key = _compat_api_key(
+                        prov["api_key"], prov["base_url"], "STT endpoint"
+                    )
+                except RuntimeError:
+                    # Don't kill the whole build over a missing key — the
+                    # transcription request will just 401 and be logged.
+                    hearing_loop._stt_api_key = ""
+                    logger.warning("hearing: remote STT endpoint has no API key set")
+                hearing_loop._stt_base_url = prov["base_url"]
+                logger.info(f"hearing: remote STT via OpenAI-compatible transcription API ({prov['from']})")
             logger.info("hearing: enabled (system-audio loopback + STT, self-muted while speaking)")
 
     avatar = None
@@ -189,25 +515,29 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
 
             extractor = None
             if memory_cfg.extractor == "openai_compatible":
-                base_url = (memory_cfg.openai_compatible_base_url or "").strip()
+                prov = _resolve_provider_inner("memory", ref=memory_cfg.provider_ref)
+                base_url = (prov["base_url"] or "").strip()
                 if not base_url:
                     raise RuntimeError(
-                        "memory.extractor=openai_compatible: set the base URL in "
-                        "Memory → Extraction model (e.g. http://localhost:11434/v1)"
+                        "memory.extractor=openai_compatible: set the endpoint in "
+                        "API Keys → provider block (or Memory → base URL), "
+                        "e.g. http://localhost:11434/v1"
                     )
                 from llm.openai_compat import OpenAICompatProvider
+                # A named provider block's model wins; else the Memory field; else a safe default.
+                mem_model = (
+                    prov["model"] if prov["from"] != "legacy" and prov["model"]
+                    else (memory_cfg.model or "").strip() or prov["model"] or "gpt-4o-mini"
+                )
                 extractor = OpenAICompatProvider(
                     name="openai_compatible_memory",
-                    model=memory_cfg.model or "gpt-4o-mini",
-                    api_key=_compat_api_key(
-                        runtime.secrets.openai_compatible_memory_api_key,
-                        base_url, "memory extractor",
-                    ),
+                    model=mem_model,
+                    api_key=_compat_api_key(prov["api_key"], base_url, "memory extractor"),
                     base_url=base_url,
                     supports_vision=False,
                     timeout=memory_cfg.timeout,
                 )
-                logger.info(f"memory: extraction via OpenAI-compatible block ({memory_cfg.model})")
+                logger.info(f"memory: extraction via OpenAI-compatible block ({mem_model}, {prov['from']})")
             elif memory_cfg.extractor == "main":
                 extractor = llm  # reuse the brain LLM
                 logger.info("memory: extraction via the main engine LLM")
@@ -232,19 +562,21 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
             if thoughts_cfg.style in ("context", "random", "mix") and thoughts_cfg.generator != "off":
                 if thoughts_cfg.generator == "openai_compatible":
                     from llm.openai_compat import OpenAICompatProvider
-                    t_base = (thoughts_cfg.openai_compatible_base_url or "").strip()
+                    t_prov = _resolve_provider_inner("thoughts", ref=thoughts_cfg.provider_ref)
+                    t_base = (t_prov["base_url"] or "").strip()
                     if not t_base:
                         raise RuntimeError(
                             "random_thoughts.generator=openai_compatible: "
-                            "set the base URL in Memory → Thought generator"
+                            "set the endpoint in API Keys → provider block (or Memory → Thought generator)"
                         )
+                    th_model = (
+                        t_prov["model"] if t_prov["from"] != "legacy" and t_prov["model"]
+                        else (thoughts_cfg.model or "").strip() or t_prov["model"] or "gpt-4o-mini"
+                    )
                     generator = OpenAICompatProvider(
                         name="openai_compatible_thoughts",
-                        model=thoughts_cfg.model or "gpt-4o-mini",
-                        api_key=_compat_api_key(
-                            runtime.secrets.openai_compatible_thoughts_api_key,
-                            t_base, "thought generator",
-                        ),
+                        model=th_model,
+                        api_key=_compat_api_key(t_prov["api_key"], t_base, "thought generator"),
                         base_url=t_base,
                         supports_vision=False,
                         timeout=thoughts_cfg.timeout,
@@ -297,6 +629,10 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
     orch._memory_capture = memory_capture
     orch._memory_consolidator = memory_consolidator
     orch._thoughts = thought_scheduler
+    # Voice-print speaker ID (owner vs others in voice chat).
+    orch._speaker_id = _speaker_id
+    orch._speaker_store = _speaker_store
+    orch._enrollment_buffer = _enrollment_buffer
     _setup_donations(runtime, chat_manager, orch)
     return orch
 

@@ -97,14 +97,16 @@ function emptyCfg() {
       address_style: "by_name", reply_length: "snappy", react_to_highlights_hype: true,
       vision_first_person: true, vision_commentary_density: "balanced",
     },
-    llm: { provider: "groq", model: "", temperature: 0.85, top_p: 0.95, max_tokens: 500, presence_penalty: 0.3, frequency_penalty: 0.4, vision_capable: false, ollama_base_url: "http://localhost:11434", ollama_keep_alive: "5m", vision_provider: "main", vision_model: "", vision_openai_compatible_base_url: "", vision_openai_compatible_timeout: 30, vision_max_tokens: 200 },
-    tts: { provider: "fish", voice_id: "", sample_rate: 24000, el_model_id: "eleven_turbo_v2_5", el_stability: 0.45, el_similarity_boost: 0.75, el_style: 0.0, fish_latency_mode: "balanced", fish_chunk_length: 100, piper_model_path: "", piper_length_scale: 1.0, kokoro_voice: "af_heart", kokoro_lang_code: "a", kokoro_speed: 1.0, openai_compatible_base_url: "", openai_compatible_model: "", openai_compatible_timeout: 30, openai_compatible_voice: "alloy", openai_compatible_speed: 1.0, openai_compatible_pcm_sample_rate: 24000 },
+    llm: { provider: "groq", model: "", temperature: 0.85, top_p: 0.95, max_tokens: 500, presence_penalty: 0.3, frequency_penalty: 0.4, vision_capable: false, ollama_base_url: "http://localhost:11434", ollama_keep_alive: "5m", vision_provider: "main", vision_model: "", vision_provider_ref: "", vision_openai_compatible_base_url: "", vision_openai_compatible_timeout: 30, vision_max_tokens: 200, provider_ref: "", openai_compatible_base_url: "", openai_compatible_timeout: 25 },
+    tts: { provider: "fish", voice_id: "", sample_rate: 24000, el_model_id: "eleven_turbo_v2_5", el_stability: 0.45, el_similarity_boost: 0.75, el_style: 0.0, fish_latency_mode: "balanced", fish_chunk_length: 100, piper_model_path: "", piper_length_scale: 1.0, kokoro_voice: "af_heart", kokoro_lang_code: "a", kokoro_speed: 1.0, openai_compatible_base_url: "", openai_compatible_model: "", openai_compatible_timeout: 30, openai_compatible_voice: "alloy", openai_compatible_speed: 1.0, openai_compatible_pcm_sample_rate: 24000, provider_ref: "" },
     vision: { enabled: false, source: "monitor", monitor_index: 1, interval_sec: 3.0, min_change_threshold: 8, max_edge_px: 768, startup_delay_sec: 5 },
     play: { enabled: false, game: "minecraft", goal: "Build a thriving Minecraft empire LIVE for an audience — gather, craft full gear, build, fight and explore. Make the journey entertaining, not a speedrun.", talk_from_agent: true, hide_chat: true, avoid_water: true },
-    hearing: { enabled: false, window_sec: 5.0, model_size: "small", language: "", silence_threshold: 0.006, sound_event_threshold: 0.06, max_context_age_sec: 12.0, engine: "", openai_compatible_base_url: "", openai_compatible_model: "whisper-1", openai_compatible_timeout: 20, openai_compatible_prompt: "" },
+    hearing: { enabled: false, window_sec: 5.0, model_size: "small", language: "", silence_threshold: 0.006, sound_event_threshold: 0.06, max_context_age_sec: 12.0, engine: "", openai_compatible_base_url: "", openai_compatible_model: "whisper-1", openai_compatible_timeout: 20, openai_compatible_prompt: "", provider_ref: "", speaker_id: { enabled: false, threshold: 0.68, unknown_threshold: 0.45, collect_other_voices: false } },
+    speaker_id: { enabled: false, threshold: 0.68, unknown_threshold: 0.45, collect_other_voices: false },
+    providers: [],
     chat: { youtube_enabled: false, twitch_enabled: false, kick_enabled: false, reply_probability: 0.35, min_reply_interval_sec: 8.0, max_message_age_sec: 45.0 },
-    memory: { enabled: false, extractor: "openai_compatible", openai_compatible_base_url: "", model: "", timeout: 12.0, max_memories: 500, short_term_ttl_sec: 86400.0, promote_hits: 3, prompt_max_chars: 1200, janitor_interval_sec: 300.0 },
-    random_thoughts: { enabled: false, schedule: "fixed", interval_sec: 180.0, min_interval_sec: 90.0, max_interval_sec: 420.0, jitter: 0.35, style: "mix", generator: "main", openai_compatible_base_url: "", model: "", timeout: 12.0, seed_topics: [], seed_topics_text: "", memory_callback_chance: 0.35, memory_callback_kinds: ["long_term", "short_term"] },
+    memory: { enabled: false, extractor: "openai_compatible", openai_compatible_base_url: "", model: "", timeout: 12.0, max_memories: 500, short_term_ttl_sec: 86400.0, promote_hits: 3, prompt_max_chars: 1200, janitor_interval_sec: 300.0, provider_ref: "", consolidate_threshold: 300, consolidate_batch: 40 },
+    random_thoughts: { enabled: false, schedule: "fixed", interval_sec: 180.0, min_interval_sec: 90.0, max_interval_sec: 420.0, jitter: 0.35, style: "mix", generator: "main", openai_compatible_base_url: "", model: "", timeout: 12.0, seed_topics: [], seed_topics_text: "", memory_callback_chance: 0.35, memory_callback_kinds: ["long_term", "short_term"], provider_ref: "", only_when_quiet_sec: 20.0 },
     donations: { livepix_enabled: false, livepix_webhook_path: "/webhooks/livepix", livepix_enrich: true, livepix_verify_user_id: true, streamlabs_enabled: false, streamlabs_url: "https://sockets.streamlabs.com", streamlabs_reconnect_max_sec: 60.0, donation_reply_probability: 1.0, donation_cooldown_sec: 0.0 },
     topics: { mode: "ai_picks", topics: [], switch_min_sec: 90, switch_chance: 0.15 },
     orchestrator: {
@@ -186,6 +188,14 @@ function app() {
 
     running: false,
     status: {},
+    startBusy: false,
+    startError: "",
+    // Pre-start checklist (GET /api/preflight): shown when Start finds errors,
+    // or on demand via the ⚠ badge. dismissed = "start anyway" this page load.
+    preflight: [],
+    preflightOpen: false,
+    preflightLoading: false,
+    preflightDismissed: false,
     logs: [],
     playLog: "",
     playBusy: false,
@@ -194,9 +204,9 @@ function app() {
 
     // Durable memory (long-term store) UI state.
     ltm: { long_term: [], short_term: [], tags: [], stats: {} },
-    ltmDraft: { text: "", tag: "", kind: "long_term" },
+    ltmDraft: { text: "", tag: "", kind: "long_term", about: "" },
     ltmEditId: null,
-    ltmEdit: { text: "", tag: "", kind: "long_term" },
+    ltmEdit: { text: "", tag: "", kind: "long_term", about: "" },
     ltmQuery: "",
     ltmFilter: "all",
     memoryBusy: false,
@@ -226,6 +236,22 @@ function app() {
     // Secrets UI state. Raw values live ONLY inside `secretEdits`, keyed by env
     // name; cleared the moment we save / cancel so they don't linger in memory.
     secrets: [],
+    // Dynamic provider blocks (API Keys page)
+    providers: [],
+    providerCategories: ["llm", "vision", "tts", "stt", "memory", "thoughts"],
+    providerBusy: false,
+    providerMsg: "",
+    // Voice-print speaker ID
+    speakersInfo: { speakers: [], clips: [], enrolling: 0, active: false },
+    enrollName: "",
+    enrollReplace: false,
+    enrollPending: 0,
+    clipNames: {},
+    voiceBusy: false,
+    voiceMsg: "",
+    // Per-voice prompt instruction ("this is my mom — treat her warmly")
+    noteEditing: null,   // name of the speaker being edited
+    noteDraft: "",
     secretEdits: {},     // env -> draft value (only set while editing)
     secretShow: {},      // env -> whether the input is unmasked while editing
     secretMsg: {},       // env -> "saved" / "tested ✓" / error text
@@ -239,13 +265,198 @@ function app() {
       await this.loadConfig();
       await this.refreshStatus();
       await this.loadSecrets();
+      await this.loadProviders();
+      await this.loadSpeakers();
       await this.loadLtm();
       this.wizardMaybeOpen();
       this.connectWs();
-      setInterval(() => this.refreshStatus(), 2000);
+      setInterval(() => { this.refreshStatus(); this.loadSpeakers(); }, 2000);
       setInterval(() => this.refreshAvatarStatus(), 3000);
       setInterval(() => this.refreshCaptions(), 3000);
       setInterval(() => this.loadLtm(), 5000);
+    },
+
+    // ----- dynamic provider blocks (API Keys page) -----
+    async loadProviders() {
+      try {
+        const r = await fetch("/api/providers");
+        if (r.ok) {
+          const data = await r.json();
+          this.providers = data.providers || [];
+          this.providerCategories = data.categories || [];
+        }
+      } catch (e) { console.warn("loadProviders:", e); }
+    },
+
+    providerAdd() {
+      // Local draft; persisted by providerSaveAll (one PUT, ids assigned server-side).
+      this.providers.push({ id: "", name: "New provider", category: "llm", base_url: "", model: "" });
+    },
+
+    providerRemove(i) {
+      this.providers.splice(i, 1);
+    },
+
+    async providerSaveAll() {
+      this.providerBusy = true;
+      try {
+        const r = await fetch("/api/providers", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(this.providers),
+        });
+        if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+        const data = await r.json();
+        this.providers = data.providers || [];
+        this.providerMsg = "saved";
+        await this.loadSecrets();   // new blocks immediately get their key field
+      } catch (e) {
+        this.providerMsg = e.message || "fail";
+      } finally {
+        this.providerBusy = false;
+        setTimeout(() => (this.providerMsg = ""), 1800);
+      }
+    },
+
+    async providerTest(p) {
+      // Persist first so the server knows the block (id assignment) before probing.
+      await this.providerSaveAll();
+      this.providerBusy = true;
+      try {
+        const r = await fetch(`/api/providers/${encodeURIComponent(p.id)}/test`, { method: "POST" });
+        const data = await r.json();
+        this.providerMsg = data.ok ? (data.preview ? `ok: ${data.preview}` : (data.note || "ok")) : (data.error || "fail");
+      } catch (e) {
+        this.providerMsg = e.message || "fail";
+      } finally {
+        this.providerBusy = false;
+        setTimeout(() => this.providerMsg = "", 4000);
+      }
+    },
+
+    providerKeyEnv(p) {
+      const slug = (p.id || p.name || "provider").toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40) || "provider";
+      return "PROVIDER_" + slug.toUpperCase() + "_API_KEY";
+    },
+
+    // ----- voice-print speaker ID -----
+    async loadSpeakers() {
+      try {
+        const r = await fetch("/api/speakers");
+        if (r.ok) this.speakersInfo = await r.json();
+      } catch (e) { console.warn("loadSpeakers:", e); }
+    },
+
+    async enrollStart() {
+      this.voiceBusy = true;
+      try {
+        const r = await fetch("/api/speakers/enroll/start", { method: "POST" });
+        if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+        this.enrollPending = 0;
+        await this.loadSpeakers();
+      } catch (e) {
+        this.voiceMsg = e.message;
+        setTimeout(() => this.voiceMsg = "", 3000);
+      } finally { this.voiceBusy = false; }
+    },
+
+    async enrollFinish() {
+      this.voiceBusy = true;
+      try {
+        const name = (this.enrollName || "").trim();
+        if (!name) throw new Error("type a name first");
+        const r = await fetch("/api/speakers/enroll/finish", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, replace: this.enrollReplace === true }),
+        });
+        if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+        this.enrollPending = 0;
+        this.enrollName = "";
+        this.voiceMsg = "voice print saved";
+        await this.loadSpeakers();
+      } catch (e) {
+        this.voiceMsg = e.message;
+      } finally {
+        this.voiceBusy = false;
+        setTimeout(() => this.voiceMsg = "", 3000);
+      }
+    },
+
+    async enrollCancel() {
+      this.voiceBusy = true;
+      try {
+        await fetch("/api/speakers/enroll/cancel", { method: "POST" });
+        this.enrollPending = 0;
+        await this.loadSpeakers();
+      } finally { this.voiceBusy = false; }
+    },
+
+    noteEdit(s) {
+      this.noteEditing = s.name;
+      this.noteDraft = s.note || "";
+      this.$nextTick(() => {
+        const el = document.querySelector('.note-edit input');
+        if (el) el.focus();
+      });
+    },
+
+    noteCancel() {
+      this.noteEditing = null;
+      this.noteDraft = "";
+    },
+
+    async noteSave(s) {
+      this.voiceBusy = true;
+      try {
+        const r = await fetch(`/api/speakers/${encodeURIComponent(s.name)}/note`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ note: (this.noteDraft || "").trim() }),
+        });
+        if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+        this.noteEditing = null;
+        this.noteDraft = "";
+        await this.loadSpeakers();
+      } catch (e) {
+        this.voiceMsg = e.message;
+        setTimeout(() => this.voiceMsg = "", 3000);
+      } finally { this.voiceBusy = false; }
+    },
+
+    async speakerRemove(name) {
+      this.voiceBusy = true;
+      try {
+        await fetch(`/api/speakers/${encodeURIComponent(name)}`, { method: "DELETE" });
+        await this.loadSpeakers();
+      } finally { this.voiceBusy = false; }
+    },
+
+    async clipEnroll(clipId) {
+      const name = (this.clipNames[clipId] || "").trim();
+      if (!name) return;
+      this.voiceBusy = true;
+      try {
+        const r = await fetch(`/api/speakers/clips/${encodeURIComponent(clipId)}/enroll`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        });
+        if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+        delete this.clipNames[clipId];
+        await this.loadSpeakers();
+      } catch (e) {
+        this.voiceMsg = e.message;
+        setTimeout(() => this.voiceMsg = "", 3000);
+      } finally { this.voiceBusy = false; }
+    },
+
+    async clipDelete(clipId) {
+      this.voiceBusy = true;
+      try {
+        await fetch(`/api/speakers/clips/${encodeURIComponent(clipId)}`, { method: "DELETE" });
+        await this.loadSpeakers();
+      } finally { this.voiceBusy = false; }
     },
 
     // ----- secrets -----
@@ -311,6 +522,15 @@ function app() {
       this.secretBusy[env] = true;
       this.secretMsg[env] = "testing…";
       try {
+        // Dynamic provider blocks get their own live probe.
+        if (env && env.startsWith("PROVIDER_")) {
+          const pid = env.removeprefix("PROVIDER_").removesuffix("_API_KEY").toLowerCase();
+          const r = await fetch(`/api/providers/${encodeURIComponent(pid)}/test`, { method: "POST" });
+          const data = await r.json();
+          this.secretMsg[env] = data.ok ? `✓ ${data.preview || data.note || "ok"}` : `✗ ${data.error || "failed"}`;
+          setTimeout(() => { delete this.secretMsg[env]; }, 4000);
+          return;
+        }
         const r = await fetch("/api/secrets/test", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -515,7 +735,7 @@ function app() {
         const r = await fetch("/api/longterm", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, kind: this.ltmDraft.kind, tag: this.ltmDraft.tag }),
+          body: JSON.stringify({ text, kind: this.ltmDraft.kind, tag: this.ltmDraft.tag, about: (this.ltmDraft.about || "").trim() }),
         });
         if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
         this.ltmDraft.text = "";
@@ -529,7 +749,7 @@ function app() {
 
     ltmStartEdit(m) {
       this.ltmEditId = m.id;
-      this.ltmEdit = { text: m.text, tag: m.tag || "", kind: m.kind };
+      this.ltmEdit = { text: m.text, tag: m.tag || "", kind: m.kind, about: m.about || "" };
     },
 
     async ltmSave() {
@@ -542,6 +762,7 @@ function app() {
           body: JSON.stringify({
             text: this.ltmEdit.text,
             tag: this.ltmEdit.tag,
+            about: this.ltmEdit.about || "",
             kind: this.ltmEdit.kind,
           }),
         });
@@ -630,7 +851,57 @@ function app() {
       } catch { this.running = false; }
     },
 
-    async start() { await fetch("/api/start", { method: "POST" }); await this.refreshStatus(); },
+    async runPreflight() {
+      this.preflightLoading = true;
+      try {
+        const r = await fetch("/api/preflight");
+        this.preflight = r.ok ? await r.json() : [];
+      } catch { this.preflight = []; }
+      finally { this.preflightLoading = false; }
+      return this.preflight;
+    },
+    preflightErrors() { return this.preflight.filter(p => p.level === "error"); },
+    dismissPreflight() {
+      this.preflightOpen = false;
+      this.preflightDismissed = true;
+      this.startError = "";
+    },
+    async start() {
+      this.startBusy = true;
+      this.startError = "";
+      try {
+        // Preflight: static config check. Errors open the checklist instead of
+        // failing deep inside build_orchestrator with a cryptic exception.
+        if (!this.preflightDismissed) {
+          const issues = await this.runPreflight();
+          if (issues.some(p => p.level === "error")) {
+            this.preflightOpen = true;
+            return;
+          }
+        }
+        const r = await fetch("/api/start", { method: "POST" });
+        if (!r.ok) {
+          // Surface WHY the session refused to start (bad TTS model, missing
+          // key, unreachable endpoint…) instead of a silently dead button.
+          let detail = `HTTP ${r.status}`;
+          try {
+            const data = await r.json();
+            detail = data.detail || detail;
+          } catch {
+            const txt = await r.text().catch(() => "");
+            const m = txt.match(/(TTSError|LLMError|RuntimeError|ValueError)[:\s]+([^<\n]+)/);
+            if (m) detail = m[2] || m[1];
+          }
+          this.startError = detail.slice(0, 240);
+        }
+      } catch (e) {
+        this.startError = String(e);
+      } finally {
+        this.startBusy = false;
+        await this.refreshStatus();
+        if (this.running) this.startError = "";
+      }
+    },
     async stop()  { await fetch("/api/stop",  { method: "POST" }); await this.refreshStatus(); },
 
     // ----- donation test strip -----
@@ -744,6 +1015,27 @@ function app() {
       navigator.clipboard?.writeText(url).catch(() => {});
       this.captionsTestMsg = "URL copied — paste it in OBS → Browser Source";
       setTimeout(() => (this.captionsTestMsg = ""), 3000);
+    },
+
+    // ----- live who's-talking indicator (speaker ID) -----
+    nowSpeakerLabel() {
+      const sid = this.status.speaker_id;
+      if (!sid || !sid.enabled) return "";
+      const now = (sid.now || "").toLowerCase();
+      if (!now) return "silent";
+      if (now === "owner") return "Owner";
+      if (now === "other") return "Someone else";
+      if (now === "unknown") return "Unknown voice";
+      return sid.now;   // enrolled name as-is
+    },
+
+    nowSpeakerClass() {
+      const sid = this.status.speaker_id;
+      if (!sid || !sid.enabled || !sid.now) return "";
+      const now = (sid.now || "").toLowerCase();
+      if (now === "owner") return "speaker-owner";
+      if (now === "other" || now === "unknown") return "speaker-other";
+      return "speaker-enrolled";
     },
 
     // ----- live log -----
