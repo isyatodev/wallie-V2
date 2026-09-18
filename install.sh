@@ -58,18 +58,25 @@ if [ ! -d ".venv" ]; then
     echo "[OK] Virtual environment created."
 fi
 
+# --- Auto-repair venv if launchers are stale (folder renamed/moved) ---
+if ! .venv/bin/python scripts/repair_venv.py; then
+    echo "[ERROR] Could not repair the virtual environment."
+    echo "        Recreate it:  rm -rf .venv && ./install.sh"
+    exit 1
+fi
+
 # --- Install dependencies ---
 echo "[*] Installing dependencies..."
 .venv/bin/python -m pip install --upgrade pip -q 2>/dev/null
-.venv/bin/pip install -r requirements.txt -q
+.venv/bin/python -m pip install -r requirements.txt -q
 
 # --- Verify Hearing deps (soundcard + faster-whisper) ---
 if ! .venv/bin/python -c "import soundcard, faster_whisper" 2>/dev/null; then
     echo "[!] Hearing deps missing. Installing soundcard + faster-whisper..."
-    .venv/bin/pip install soundcard faster-whisper -q
+    .venv/bin/python -m pip install soundcard faster-whisper -q
     if ! .venv/bin/python -c "import soundcard, faster_whisper" 2>/dev/null; then
         echo "[ERROR] Could not install Hearing dependencies. Hearing will be disabled."
-        echo "        Try manually: .venv/bin/pip install soundcard faster-whisper"
+        echo "        Try manually: .venv/bin/python -m pip install soundcard faster-whisper"
         exit 1
     fi
 fi

@@ -64,10 +64,19 @@ if not exist ".venv\Scripts\python.exe" (
     echo [OK] Virtual environment created.
 )
 
-REM --- Install dependencies ---
+REM --- Auto-repair venv if launchers are stale (folder renamed/moved) ---
+.venv\Scripts\python.exe "%~dp0scripts\repair_venv.py"
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Could not repair the virtual environment.
+    echo         Recreate it:  rmdir /s /q .venv  &&  run install.bat again
+    pause
+    exit /b 1
+)
+
 echo [*] Installing dependencies (this may take a minute)...
 .venv\Scripts\python.exe -m pip install --upgrade pip -q 2>nul
-.venv\Scripts\pip.exe install -r requirements.txt -q
+.venv\Scripts\python.exe -m pip install -r requirements.txt -q
 if errorlevel 1 (
     echo.
     echo [ERROR] Dependency installation failed.
@@ -80,11 +89,25 @@ REM --- Verify Hearing deps (soundcard + faster-whisper) ---
 .venv\Scripts\python.exe -c "import soundcard, faster_whisper" 2>nul
 if errorlevel 1 (
     echo [!] Hearing deps missing. Installing soundcard + faster-whisper...
-    .venv\Scripts\pip.exe install soundcard faster-whisper -q
+    .venv\Scripts\python.exe -m pip install soundcard faster-whisper -q
     .venv\Scripts\python.exe -c "import soundcard, faster_whisper" 2>nul
     if errorlevel 1 (
         echo [ERROR] Could not install Hearing dependencies. Hearing will be disabled.
-        echo         Try manually: .venv\Scripts\pip install soundcard faster-whisper
+        echo         Try manually: .venv\Scripts\python -m pip install soundcard faster-whisper
+        pause
+        exit /b 1
+    )
+)
+
+REM --- Sanity check: pip launcher must spawn (catches renamed-folder breakage) ---
+.venv\Scripts\pip.exe --version >nul 2>&1
+if errorlevel 1 (
+    echo [!] pip.exe launcher still stale — running repair again...
+    .venv\Scripts\python.exe "%~dp0scripts\repair_venv.py"
+    .venv\Scripts\pip.exe --version >nul 2>&1
+    if errorlevel 1 (
+        echo [ERROR] Could not repair the virtual environment.
+        echo         Recreate it:  rmdir /s /q .venv  &&  run install.bat again
         pause
         exit /b 1
     )

@@ -11,6 +11,20 @@ if not exist ".venv\Scripts\python.exe" (
     echo.
 )
 
+REM --- Auto-repair venv if launchers are stale (folder renamed/moved) ---
+.venv\Scripts\pip.exe --version >nul 2>&1
+if errorlevel 1 (
+    echo [!] Broken venv launchers detected. Repairing...
+    .venv\Scripts\python.exe "%~dp0scripts\repair_venv.py"
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] Could not repair the virtual environment.
+        echo         Recreate it:  rmdir /s /q .venv  ^&^&  run install.bat again
+        pause
+        exit /b 1
+    )
+)
+
 echo.
 echo   ========================================
 echo        WALLIE - Starting...

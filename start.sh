@@ -10,6 +10,16 @@ if [ ! -d ".venv" ]; then
     echo ""
 fi
 
+# --- Auto-repair venv if launchers are stale (folder renamed/moved) ---
+if ! .venv/bin/pip --version >/dev/null 2>&1; then
+    echo "[!] Broken venv launchers detected. Repairing..."
+    if ! .venv/bin/python scripts/repair_venv.py; then
+        echo "[ERROR] Could not repair the virtual environment."
+        echo "        Recreate it:  rm -rf .venv && ./install.sh"
+        exit 1
+    fi
+fi
+
 echo ""
 echo "  ========================================"
 echo "       WALLIE - Starting..."
