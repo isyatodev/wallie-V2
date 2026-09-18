@@ -772,6 +772,21 @@ input.switch:checked::after { left: 18px; background: var(--accent); box-shadow:
   line-height: 1.6;
 }
 
+/* Inline warning under a provider-ref select pointing at a deleted block. */
+.stale-ref-warn {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 6px 10px;
+  background: rgba(245,158,11,.08);
+  border: 1px solid rgba(245,158,11,.35);
+  color: #f7cc7c;
+  border-radius: var(--radius);
+  font-size: 12px;
+}
+
 /* ============ AVATAR SECTION ============ */
 .avatar-test-strip {
   margin-top: 4px;

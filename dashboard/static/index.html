@@ -444,6 +444,15 @@
                 <option :value="p.id" x-text="p.name + (p.base_url ? ` (${p.base_url})` : '')" :selected="cfg.tts.provider_ref===p.id"></option>
               </template>
             </select>
+            <template x-if="staleRef(cfg.tts.provider_ref, 'tts')">
+              <div class="stale-ref-warn">
+                <span x-text="'⚠ ' + staleRef(cfg.tts.provider_ref, 'tts')"></span>
+                <template x-if="suggestedRef('tts')">
+                  <button type="button" class="btn tiny" @click="applySuggestedRef('cfg.tts.provider_ref', 'tts')"
+                    x-text="'→ use “' + (providers.find(p => p.id === suggestedRef('tts'))?.name || suggestedRef('tts')) + '”'"></button>
+                </template>
+              </div>
+            </template>
             <small class="hint">Blocks are managed on the <b>API Keys</b> page. Without a block, the legacy base URL below is used.</small>
           </div>
         </template>
@@ -887,6 +896,15 @@
                   <option :value="p.id" x-text="p.name + (p.base_url ? ` (${p.base_url})` : '')" :selected="cfg.llm.vision_provider_ref===p.id"></option>
                 </template>
               </select>
+              <template x-if="staleRef(cfg.llm.vision_provider_ref, 'vision')">
+                <div class="stale-ref-warn">
+                  <span x-text="'⚠ ' + staleRef(cfg.llm.vision_provider_ref, 'vision')"></span>
+                  <template x-if="suggestedRef('vision')">
+                    <button type="button" class="btn tiny" @click="applySuggestedRef('cfg.llm.vision_provider_ref', 'vision')"
+                      x-text="'→ use “' + (providers.find(p => p.id === suggestedRef('vision'))?.name || suggestedRef('vision')) + '”'"></button>
+                  </template>
+                </div>
+              </template>
               <small class="hint">Blocks are managed on the <b>API Keys</b> page. Without a block, the base URL below is used.</small>
             </div>
             <div class="field">
@@ -992,6 +1010,15 @@
                 <option :value="p.id" x-text="p.name + (p.base_url ? ` (${p.base_url})` : '')" :selected="cfg.hearing.provider_ref===p.id"></option>
               </template>
             </select>
+            <template x-if="staleRef(cfg.hearing.provider_ref, 'stt')">
+              <div class="stale-ref-warn">
+                <span x-text="'⚠ ' + staleRef(cfg.hearing.provider_ref, 'stt')"></span>
+                <template x-if="suggestedRef('stt')">
+                  <button type="button" class="btn tiny" @click="applySuggestedRef('cfg.hearing.provider_ref', 'stt')"
+                    x-text="'→ use “' + (providers.find(p => p.id === suggestedRef('stt'))?.name || suggestedRef('stt')) + '”'"></button>
+                </template>
+              </div>
+            </template>
             <small class="hint">Blocks are managed on the <b>API Keys</b> page. Without a block, the legacy base URL below is used.</small>
           </div>
         </template>
@@ -1660,6 +1687,15 @@
                 <option :value="p.id" x-text="p.name + (p.base_url ? ` (${p.base_url})` : '')" :selected="cfg.llm.provider_ref===p.id"></option>
               </template>
             </select>
+            <template x-if="staleRef(cfg.llm.provider_ref, 'llm')">
+              <div class="stale-ref-warn">
+                <span x-text="'⚠ ' + staleRef(cfg.llm.provider_ref, 'llm')"></span>
+                <template x-if="suggestedRef('llm')">
+                  <button type="button" class="btn tiny" @click="applySuggestedRef('cfg.llm.provider_ref', 'llm')"
+                    x-text="'→ use “' + (providers.find(p => p.id === suggestedRef('llm'))?.name || suggestedRef('llm')) + '”'"></button>
+                </template>
+              </div>
+            </template>
             <small class="hint">Blocks are managed on the <b>API Keys</b> page — endpoint, model and key live there. Without a block, the legacy base URL below is used.</small>
           </div>
         </template>
@@ -1775,7 +1811,7 @@
               <input x-model="p.model" placeholder="model (e.g. llama3.1 / qwen-vl / tts-1)" />
               <div style="display:flex; gap:6px;">
                 <button class="btn tiny" @click="providerTest(p)" :disabled="providerBusy">test</button>
-                <button class="btn tiny danger" @click="providerRemove(i)">✕</button>
+                <button class="btn tiny" @click="providerConfirmDelete(p)">🗑</button>
               </div>
             </div>
           </div>

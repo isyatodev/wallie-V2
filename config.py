@@ -11,9 +11,42 @@ from pydantic import BaseModel, Field, model_validator
 
 load_dotenv()
 
+import re
+import unicodedata
+
 BASE_DIR = Path(__file__).resolve().parent
 PROFILES_DIR = BASE_DIR / "profiles"
 STATE_FILE = BASE_DIR / ".wallie_state.json"
+
+
+# -------------------------------------------------------------------
+# Provider id slugs (single source of truth)
+# -------------------------------------------------------------------
+# A provider block's id IS its slug (AppConfig's validator re-slugs ids on
+# save), and the block's API key env is PROVIDER_<SLUG>_API_KEY. Every place
+# that derives that env name — runtime key lookup, dashboard delete/test
+# routes, the API Keys page — MUST go through these two helpers. Divergent
+# local slugging has already caused real bugs (env names built in lowercase,
+# ids with accents silently resolving to different keys).
+_SLUG_RE = re.compile(r"[^a-z0-9_]+")
+
+
+def provider_slug(pid: str) -> str:
+    """Canonical slug for a provider block id → used in PROVIDER_<SLUG>_API_KEY.
+
+    ASCII-normalized (é→e) so "Visão" and "Visao" cannot map to different
+    .env keys. Must stay byte-for-byte in sync with the JS port in
+    dashboard/static/app.js (_providerSlugJs).
+    """
+    d = unicodedata.normalize("NFKD", str(pid or ""))
+    d = "".join(ch for ch in d if not unicodedata.combining(ch))
+    s = _SLUG_RE.sub("_", d.lower()).strip("_")
+    return s[:40] or "provider"
+
+
+def provider_key_env(pid: str) -> str:
+    """The .env name holding a provider block's API key: PROVIDER_<SLUG>_API_KEY."""
+    return "PROVIDER_" + provider_slug(pid).upper() + "_API_KEY"
 
 
 # -------------------------------------------------------------------
@@ -617,8 +650,7 @@ class AppConfig(BaseModel):
         seen: set[str] = set()
         for i, p in enumerate(self.providers):
             base = (p.id or p.name or f"provider-{i + 1}").strip()
-            base = "".join(c if c.isalnum() else "_" for c in base.lower()).strip("_")[:40] \
-                or f"provider-{i + 1}"
+            base = provider_slug(base) or f"provider-{i + 1}"
             cand, n = base, 2
             while cand in seen:
                 cand = f"{base}_{n}"   # underscore survives re-slugging (ids stay stable)

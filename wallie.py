@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-import re as _re
+import re as _re  # kept: other regexes below also use it
 import sys
 from typing import Optional
 
@@ -19,13 +19,12 @@ from llm import build_provider
 from tts import build_tts
 
 
-_PROVIDER_SLUG_RE = _re.compile(r"[^a-z0-9_]+")
+from config import provider_key_env as _provider_key_env
 
 
 def _provider_slug(pid: str) -> str:
-    """Env-safe slug for a provider id (matches secrets_store normalization)."""
-    s = _PROVIDER_SLUG_RE.sub("_", (pid or "").lower()).strip("_")
-    return s[:40] or "provider"
+    """Deprecated shim — use config.provider_slug / config.provider_key_env."""
+    return _provider_key_env(pid).removeprefix("PROVIDER_").removesuffix("_API_KEY").lower()
 
 
 _CATEGORY_KEY_FIELD = {
@@ -66,7 +65,7 @@ def _resolve_provider(cfg, secrets, category: str, ref: str = "", allow_default:
                 break
     if block is not None:
         pid = block.get("id", "")
-        key_env = "PROVIDER_" + _provider_slug(pid).upper() + "_API_KEY"
+        key_env = _provider_key_env(pid)
         return {
             "base_url": (block.get("base_url") or "").strip(),
             "model": (block.get("model") or "").strip(),

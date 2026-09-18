@@ -2,6 +2,17 @@
 // Wallie dashboard — Alpine component
 // =====================================================================
 
+// JS port of config.provider_slug (Python) — the two MUST stay in sync.
+// ASCII-normalizes ids ("Visão" → "visao") so the browser and the server
+// always agree on the PROVIDER_<SLUG>_API_KEY name.
+function _providerSlugJs(pid) {
+  const d = String(pid || "").normalize("NFD").replace(/\p{Diacritic}/gu, "");
+  return (d.toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40)) || "provider";
+}
+function _providerKeyEnvJs(pid) {
+  return "PROVIDER_" + _providerSlugJs(pid).toUpperCase() + "_API_KEY";
+}
+
 const SECTIONS = [
   { id: "identity",    label: "Identity",     ico: "🪪" },
   { id: "personality", label: "Personality",  ico: "🎭" },
@@ -372,8 +383,31 @@ function app() {
       this.providers.push({ id: "", name: "New provider", category: "llm", base_url: "", model: "" });
     },
 
-    providerRemove(i) {
-      this.providers.splice(i, 1);
+    providerConfirmDelete(p) {
+      // Unsaved draft (no id yet): just drop the row, nothing to clean on the server.
+      if (!p.id) { this.providers.splice(this.providers.indexOf(p), 1); return; }
+      const label = p.name || p.id;
+      const slugEnv = _providerKeyEnvJs(p.id);
+      if (confirm(`Delete provider "${label}"?\n\nIts API key (${slugEnv}) will also be removed from .env.`)) {
+        this.providerDelete(p.id);
+      }
+    },
+
+    async providerDelete(id) {
+      this.providerBusy = true;
+      try {
+        const r = await fetch(`/api/providers/${encodeURIComponent(id)}`, { method: "DELETE" });
+        if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+        this.providers = this.providers.filter(x => x.id !== id);
+        this.providerMsg = "deleted";
+        await this.loadSecrets();   // orphan key row disappears from the list
+        await this.loadConfig();
+      } catch (e) {
+        this.providerMsg = e.message || "delete failed";
+      } finally {
+        this.providerBusy = false;
+        setTimeout(() => (this.providerMsg = ""), 2500);
+      }
     },
 
     async providerSaveAll() {
@@ -414,9 +448,37 @@ function app() {
       }
     },
 
+    staleRef(ref, category) {
+      // A provider_ref is stale when it points to a block id that no longer
+      // exists (deleted/renamed). The runtime silently falls back — this warns
+      // so the user notices. Returns "" when everything is fine.
+      if (!ref || this.providers.some(p => p.id === ref)) return "";
+      return `points to deleted block “${ref}” — using fallback`;
+    },
+
+    suggestedRef(category) {
+      // Mirror of the runtime fallback chain: first block of the category,
+      // else the block named "default", else "" (legacy fields take over).
+      const first = this.providers.find(p => p.category === category);
+      if (first) return first.id;
+      const def = this.providers.find(p => p.id === "default");
+      return def ? def.id : "";
+    },
+
+    applySuggestedRef(refPath, category) {
+      // refPath like "cfg.llm.vision_provider_ref"; category is passed
+      // explicitly (hearing selects stt blocks — not parseable from the path).
+      const sug = this.suggestedRef(category);
+      if (!sug) return;
+      const parts = refPath.split(".");
+      let obj = this;
+      for (const k of parts.slice(0, -1)) obj = obj[k];
+      obj[parts[parts.length - 1]] = sug;
+      this.save();
+    },
+
     providerKeyEnv(p) {
-      const slug = (p.id || p.name || "provider").toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40) || "provider";
-      return "PROVIDER_" + slug.toUpperCase() + "_API_KEY";
+      return _providerKeyEnvJs(p.id || p.name || "provider");
     },
 
     // ----- voice-print speaker ID -----

@@ -260,6 +260,59 @@ def test_api_providers_crud_roundtrip(api):
     assert api.delete("/api/providers/mic").status_code == 404
 
 
+def test_api_put_secret_accepts_dynamic_provider_key(api, monkeypatch):
+    """Regression: PUT /api/secrets used to 400 for PROVIDER_* keys because it
+    validated against the static SECRET_FIELDS only. Saving an STT block's key
+    from the dashboard hit exactly that."""
+    # A block exists in the profile so its metadata is registered.
+    api.put("/api/providers", json=[
+        {"name": "My STT", "category": "stt", "base_url": "http://s/v1", "model": "whisper-1"},
+    ])
+    env = "PROVIDER_MY_STT_API_KEY"
+
+    r = api.put("/api/secrets", json={"env": env, "value": "sk-stt-123"})
+    assert r.status_code == 200, r.text
+    assert r.json()["is_set"] is True
+    import secrets_store
+    assert os.getenv(env) == "sk-stt-123"
+
+    # Clearing works too (and the env var leaves the process immediately).
+    r2 = api.put("/api/secrets", json={"env": env, "value": ""})
+    assert r2.status_code == 200
+    assert os.getenv(env) is None
+
+
+def test_api_put_secret_still_rejects_unknown_env(api):
+    r = api.put("/api/secrets", json={"env": "TOTALLY_MADE_UP_KEY", "value": "x"})
+    assert r.status_code == 400
+
+
+def test_api_delete_provider_clears_its_key(api, tmp_path: Path, monkeypatch):
+    """Deleting a block must not leave the key behind as an orphan row."""
+    import secrets_store
+    env_file = tmp_path / ".env"
+    monkeypatch.setattr(secrets_store, "ENV_FILE", env_file)  # never touch the real .env
+    # Create the block first so its id exists in the profile.
+    r0 = api.put("/api/providers", json=[
+        {"name": "Ghost TTS", "category": "tts", "base_url": "http://t/v1", "model": "tts-1"},
+    ])
+    assert r0.status_code == 200
+    env = "PROVIDER_GHOST_TTS_API_KEY"
+    secrets_store.set_secret(env, "sk-to-be-removed")
+    assert os.getenv(env) == "sk-to-be-removed"
+    assert env in env_file.read_text(encoding="utf-8")
+
+    r = api.delete("/api/providers/ghost_tts")
+    assert r.status_code == 200
+    assert r.json()["deleted"] == "ghost_tts"
+    assert os.getenv(env) is None  # key removed from .env + process
+    assert env not in env_file.read_text(encoding="utf-8")
+
+    # And it no longer shows up on the API Keys page.
+    rows = [s for s in api.get("/api/secrets").json()["secrets"] if s["env"] == env]
+    assert rows == []
+
+
 def test_api_speakers_endpoints(api, tmp_path: Path):
     from hearing.speaker_id import SpeakerPrintStore, embed
     import config
@@ -534,3 +587,83 @@ def test_per_person_memory_full_chain(tmp_path: Path):
     # A stranger gets no such block.
     plain = persona.hearing_turn(heard="hello", speaker="other", about_memories="")
     assert "REMEMBER about this person" not in plain
+
+
+# ---------------------------------------------------------------------------
+# Provider slug normalization (single source of truth: config.provider_slug)
+# ---------------------------------------------------------------------------
+
+def test_provider_slug_ascii_normalization():
+    """Accent-bearing ids must produce the SAME env name everywhere —
+    the pre-unification implementations kept é (isalnum) in config/secrets_store
+    but dropped it (ASCII) in wallie/dashboard, silently splitting keys."""
+    from config import provider_key_env, provider_slug
+    assert provider_slug("Visão") == "visao"
+    assert provider_key_env("Visão") == "PROVIDER_VISAO_API_KEY"
+    assert provider_key_env("  Main LLM ") == "PROVIDER_MAIN_LLM_API_KEY"
+    assert provider_key_env("") == "PROVIDER_PROVIDER_API_KEY"
+
+
+def test_provider_block_validator_uses_canonical_slug():
+    """AppConfig's validator must route through the canonical slug."""
+    cfg = AppConfig(providers=[{"id": "Visão", "name": "V", "category": "vision"}])
+    assert cfg.providers[0].id == "visao"
+
+
+def test_secrets_metadata_matches_canonical_env_names():
+    """set_provider_context registers metadata under the canonical env name —
+    and the dashboard's runtime lookup resolves the key for the same id."""
+    import secrets_store as ss
+    import wallie as _w
+    from config import Runtime, Secrets
+
+    class _P:
+        def __init__(self, pid, name, category):
+            self.id, self.name, self.category = pid, name, category
+
+    ss.set_provider_context([_P("Visão", "Visão", "vision")])
+    rows = [r for r in ss.list_secrets() if r["env"] == "PROVIDER_VISAO_API_KEY"]
+    assert rows and rows[0]["label"] == "Visão (vision)"
+
+    # The runtime derives the SAME env name for the same id.
+    cfg = AppConfig(profile_name="p-prov", providers=[
+        {"id": "visao", "name": "Visão", "category": "vision",
+         "base_url": "http://h/v1", "model": "vl"},
+    ])
+    monkey_env = "PROVIDER_VISAO_API_KEY"
+    os.environ[monkey_env] = "k-123"
+    try:
+        r = _w._resolve_provider(cfg, Secrets(), "vision")
+        assert r["api_key"] == "k-123"
+    finally:
+        del os.environ[monkey_env]
+    ss.set_provider_context([])
+
+
+def test_speaker_delete_is_case_insensitive(api, tmp_path: Path):
+    """DELETE /api/speakers/{name} resolves like the note route: 'owner' hits
+    the stored 'Owner' instead of 404ing on case."""
+    from hearing.speaker_id import SpeakerPrintStore, embed
+    import config as _cfg_mod
+    store = SpeakerPrintStore(_cfg_mod.PROFILES_DIR / "default.speakers.json")
+    store.enroll("Owner", embed(_tone(130)))
+
+    assert api.delete("/api/speakers/owner").json()["ok"] is True
+    # Re-read from disk: the route mutates its own store instance.
+    reloaded = SpeakerPrintStore(_cfg_mod.PROFILES_DIR / "default.speakers.json")
+    reloaded.load()
+    assert reloaded.names() == []
+    assert api.delete("/api/speakers/owner").status_code == 404
+
+
+def test_dashboard_provider_routes_use_canonical_env(api):
+    """The delete route's .env cleanup targets the canonical env name —
+    pre-fix it built PROVIDER_ghost_tts_API_KEY (lowercase) and missed."""
+    from config import provider_key_env
+    r = api.put("/api/providers", json=[
+        {"name": "Ghost STT", "category": "stt", "base_url": "http://s/v1", "model": "w"},
+    ])
+    assert r.status_code == 200
+    assert r.json()["providers"][0]["id"] == "ghost_stt"
+    env = provider_key_env("ghost_stt")
+    assert env == "PROVIDER_GHOST_STT_API_KEY"

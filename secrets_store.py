@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Iterable
 
-from config import BASE_DIR, ProviderCategory
+from config import BASE_DIR, ProviderCategory, provider_key_env, provider_slug
 
 ENV_FILE = BASE_DIR / ".env"
 
@@ -33,8 +33,9 @@ def set_provider_context(providers: list) -> None:
         if not pid:
             continue
         # Normalize exactly like config._provider_slug so lookups always match.
-        pid = "".join(c if c.isalnum() else "_" for c in pid.lower())[:40].strip("_") or "provider"
-        _dynamic_provider_meta["PROVIDER_" + pid.upper() + "_API_KEY"] = {
+        # Canonical slug (config.provider_slug) so metadata keys match the
+        # env names every other component derives via provider_key_env.
+        _dynamic_provider_meta[provider_key_env(pid)] = {
             "label": f"{getattr(p, 'name', pid)} ({getattr(p, 'category', 'llm')})",
             "kind": str(getattr(p, "category", "llm")),
             "url": "",
@@ -244,6 +245,7 @@ def set_secret(env_name: str, value: str) -> None:
         except Exception:
             # If the key wasn't there, that's fine.
             pass
+        os.environ.pop(env_name, None)  # gone from .env AND this process, now
 
     _harden_perms(ENV_FILE)
     load_dotenv(str(ENV_FILE), override=True)

@@ -30,6 +30,7 @@ from config import (
     delete_profile,
     list_profiles,
     load_profile,
+    provider_key_env,
     save_profile,
 )
 from core import Orchestrator, Persona
@@ -72,9 +73,9 @@ def _default_model_for(provider: str) -> str:
 
 
 def _provider_env_slug(pid: str) -> str:
-    """Env-safe slug for a provider id (matches wallie/secrets_store)."""
-    s = _re.sub(r"[^a-z0-9_]+", "_", (pid or "").lower()).strip("_")
-    return s[:40] or "provider"
+    """Deprecated shim — canonical slug lives in config.provider_slug."""
+    from config import provider_slug
+    return provider_slug(pid)
 
 
 import re as _re
@@ -673,7 +674,11 @@ def _build_app(
 
     @app.delete("/api/speakers/{name}")
     def api_speaker_delete(name: str) -> dict[str, Any]:
-        if not _speaker_store().remove(name):
+        store = _speaker_store()
+        # Case-insensitive resolution, same contract as the note route
+        # (labels like "owner" hit the stored "Owner").
+        resolved = store.find_name(name) or name
+        if not store.remove(resolved):
             raise HTTPException(status_code=404, detail=f"unknown speaker: {name}")
         return {"ok": True}
 
@@ -948,8 +953,11 @@ def _build_app(
 
     @app.put("/api/secrets")
     def api_secrets_update(body: SecretUpdateBody) -> dict[str, Any]:
-        from secrets_store import SECRET_FIELDS, set_secret
-        if body.env not in SECRET_FIELDS:
+        # Validate with _resolve_field (NOT just the static SECRET_FIELDS) so
+        # dynamic provider-block keys (PROVIDER_<ID>_API_KEY) are accepted too —
+        # they live in the same .env, but only exist as metadata at runtime.
+        from secrets_store import _resolve_field, set_secret
+        if _resolve_field(body.env) is None:
             raise HTTPException(400, "unknown secret field")
         try:
             set_secret(body.env, body.value)
@@ -1017,7 +1025,22 @@ def _build_app(
         if len(blocks) == len(cfg.providers):
             raise HTTPException(status_code=404, detail=f"unknown provider: {provider_id}")
         _save_providers(blocks)
-        return {"ok": True}
+        # Clean the block's key out of .env so deleted blocks don't leave
+        # orphan PROVIDER_*_API_KEY rows piling up on the API Keys page.
+        # Direct unset_key + pop (bypasses set_secret's load_dotenv reload).
+        from secrets_store import ENV_FILE, _harden_perms
+        key_env = provider_key_env(provider_id)
+        try:
+            from dotenv import unset_key
+            unset_key(str(ENV_FILE), key_env)
+        except Exception:
+            pass  # best-effort; the block itself is already gone
+        os.environ.pop(key_env, None)
+        try:
+            _harden_perms(ENV_FILE)
+        except Exception:
+            pass
+        return {"ok": True, "deleted": provider_id}
 
     @app.post("/api/providers/{provider_id}/test")
     async def api_providers_test(provider_id: str) -> dict[str, Any]:
@@ -1032,7 +1055,7 @@ def _build_app(
             return {"ok": False, "error": "no endpoint URL set on this block"}
         from secrets_store import mask
         import httpx
-        key_env = "PROVIDER_" + _provider_env_slug(provider_id) + "_API_KEY"
+        key_env = provider_key_env(provider_id)
         api_key = os.getenv(key_env, "")
         host = base_url.split("://", 1)[-1].split("/", 1)[0].lower()
         local = host.startswith(("localhost", "127.0.0.1", "[::1]", "0.0.0.0", "::1"))
