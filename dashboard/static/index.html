@@ -866,8 +866,18 @@
         <template x-if="cfg.llm.vision_provider==='openai_compatible'">
           <div class="grid two">
             <div class="field">
-              <label>Vision model</label>
-              <input x-model="cfg.llm.vision_model" placeholder="e.g. qwen-vl-max / qwen2.5-vl-72b-instruct" />
+              <label>Vision model <button type="button" class="mini-btn" style="float:right;font-size:.72rem;padding:.1rem .55rem"
+                @click="loadVisionModels()" :disabled="vlModelsBusy"
+                x-text="vlModelsBusy ? 'listing…' : 'list models'"></button></label>
+              <input list="vl-model-options" x-model="cfg.llm.vision_model" placeholder="e.g. qwen-vl-max / qwen2.5-vl-72b-instruct" />
+              <datalist id="vl-model-options">
+                <template x-for="m in vlModels" :key="m">
+                  <option :value="m"></option>
+                </template>
+              </datalist>
+              <small class="hint" x-show="vlModelsMsg" x-text="vlModelsMsg"></small>
+              <small class="hint" x-show="!vlModelsMsg && vlModels.length">Models listed from <code x-text="vlModelsEndpoint"></code> — VL models first. Pick from the dropdown or type free-form.</small>
+              <small class="hint" x-show="!vlModelsMsg && !vlModels.length">Model name as the endpoint expects it. <b>list models</b> queries the endpoint's /models.</small>
             </div>
             <div class="field">
               <label>Vision provider block</label>
@@ -1033,6 +1043,18 @@
           <small class="hint">How long a heard line stays relevant for fusing with vision.</small>
         </div>
       </div>
+      <div x-show="cfg.hearing.enabled" class="test-strip" style="margin-top:14px;">
+        <button class="btn" :disabled="hearingTestBusy" @click="testHearing('system')"
+                x-text="hearingTestBusy && hearingSource==='system' ? '… listening (5s)' : '🎙 Test hearing (system loopback)'"></button>
+        <button class="btn" :disabled="hearingTestBusy" @click="testHearing('mic')"
+                x-text="hearingTestBusy && hearingSource==='mic' ? '… listening (5s) — speak now' : '🎙 Test hearing (microphone)'"></button>
+        <small class="hint" x-show="hearingTestMsg" x-text="hearingTestMsg" style="flex-basis:100%;"></small>
+        <div class="test-text" x-show="hearingTestResult" x-text="hearingTestResult" style="flex-basis:100%;"></div>
+        <small class="hint" style="flex-basis:100%;">
+          Records 5 seconds and transcribes them with the configured engine. <b>System loopback</b> = what the streamer hears (game/video/music); <b>microphone</b> = your voice for a round-trip test.
+        </small>
+      </div>
+
       <div x-show="cfg.hearing.enabled" class="hint" style="margin-top:8px">
         Needs <b>soundcard</b> + <b>faster-whisper</b> installed. Captures the default speaker via WASAPI loopback.
       </div>

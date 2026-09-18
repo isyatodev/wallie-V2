@@ -124,6 +124,46 @@ def _tts_voices_from_models(data: Any) -> list[str]:
     return out
 
 
+_NON_VISION_MODEL_RE = _re.compile(
+    r"tts|whisper|stt|transcri|embed|dall-e|dalle|moderation|rerank|guard|shield"
+    r"|speech|audio|kokoro|piper|voice",
+    _re.I,
+)
+_VL_MODEL_RE = _re.compile(
+    r"vl|vision|llava|pixtral|internvl|molmo|4o|omni|gemini|claude|llama-4",
+    _re.I,
+)
+
+
+def _vl_models_from_models(data: Any) -> list[str]:
+    """Extract vision-capable model ids from an OpenAI-compatible /models payload.
+
+    /models carries no reliable capability flag, so this is
+    _tts_voices_from_models with the polarity flipped: drop what obviously
+    belongs to another subsystem (speech, STT, embeddings, image-gen,
+    moderation, rerank) and keep the rest — VL-looking ids first. Still just a
+    suggestion dropdown, never a hard gate.
+    """
+    raw: Any = []
+    if isinstance(data, dict):
+        raw = data.get("data")
+        if not isinstance(raw, list):
+            raw = []
+    elif isinstance(data, list):  # a few gateways return a bare array
+        raw = data
+    models = [str(m.get("id") or "") for m in raw if isinstance(m, dict)]
+    out, seen = [], set()
+    for m in models:
+        m = m.strip()
+        if not m or m.lower() in seen or _NON_VISION_MODEL_RE.search(m):
+            continue
+        out.append(m)
+        seen.add(m.lower())
+    # Surface likely-VL models first; stable so each group keeps its order.
+    out.sort(key=lambda m: 0 if _VL_MODEL_RE.search(m) else 1)
+    return out
+
+
 def _effective_tts(runtime: Runtime) -> tuple:
     """(tts_cfg, secrets) with a TTS provider block's endpoint/model/key applied
     when tts.provider is openai_compatible — mirrors the build's _effective_compat
@@ -143,6 +183,37 @@ def _effective_tts(runtime: Runtime) -> tuple:
         update={"openai_compatible_tts_api_key":
                 _compat_api_key(prov["api_key"], prov["base_url"], "tts provider block")})
     return tts_cfg, secrets_eff
+
+
+def _effective_stt(runtime: Runtime) -> tuple:
+    """(hearing_cfg, secrets) with an STT provider block's endpoint/model/key
+    applied when hearing.engine == "openai_compatible" — mirrors the build's
+    remote-STT wiring (block named → first STT block → "default" → legacy
+    fields; localhost doesn't need a key) so a hearing test exercises EXACTLY
+    what a live session would use."""
+    cfg = runtime.config
+    hearing = cfg.hearing
+    if hearing.engine != "openai_compatible":
+        return hearing, runtime.secrets
+    prov = _resolve_provider(cfg, runtime.secrets, "stt", ref=hearing.provider_ref,
+                             allow_default=True)
+    if prov["from"] == "legacy":
+        return hearing, runtime.secrets
+    updates: dict = {}
+    if prov["base_url"]:
+        updates["openai_compatible_base_url"] = prov["base_url"]
+    if prov["model"]:
+        updates["openai_compatible_model"] = prov["model"]
+    hearing_cfg = hearing.model_copy(update=updates) if updates else hearing
+    try:
+        key = _compat_api_key(prov["api_key"], prov["base_url"], "STT provider block")
+    except RuntimeError:
+        # Same leniency as the build: a missing key doesn't kill the test —
+        # the transcription request will just 401 and be reported.
+        key = ""
+    secrets_eff = runtime.secrets.model_copy(
+        update={"openai_compatible_stt_api_key": key})
+    return hearing_cfg, secrets_eff
 
 
 async def fetch_tts_voices(cfg, secrets, ref: str = "") -> dict:
@@ -173,6 +244,49 @@ async def fetch_tts_voices(cfg, secrets, ref: str = "") -> dict:
     }
 
 
+async def fetch_vision_models(cfg, secrets, ref: str = "") -> dict:
+    """Resolve the vision endpoint (dedicated vision block → legacy fields, same
+    order as the build's effective_compat) and query its /models for available
+    vision-capable models."""
+    import httpx
+    llm = cfg.llm
+    base = ""
+    api_key = ""
+    source = ""
+    prov = _resolve_provider(cfg, secrets, "vision", ref=ref, allow_default=False)
+    if prov["from"] != "legacy" and (prov.get("base_url") or "").strip():
+        base = (prov["base_url"] or "").strip().rstrip("/")
+        api_key = prov.get("api_key") or ""
+        source = prov.get("from", "")
+    if not base:
+        # Same fallback _build_vision_llm uses: the DEDICATED legacy field, then
+        # the engine's generic OpenAI-compatible URL.
+        base = ((llm.vision_openai_compatible_base_url or "").strip()
+                or (llm.openai_compatible_base_url or "").strip()).rstrip("/")
+        source = "legacy"
+    if not base:
+        raise ValueError(
+            "no vision endpoint configured — create a VISION block on the API Keys "
+            "page or fill the Vision base URL (falls back to the engine's "
+            "OpenAI-compatible URL)"
+        )
+    api_key = _compat_api_key(api_key, base, "openai_compatible (vision)")
+    headers = {"Authorization": f"Bearer {api_key}"}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+        resp = await client.get(f"{base}/models", headers=headers)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code} from {base}/models: {resp.text[:160]}")
+    try:
+        data = resp.json()
+    except ValueError as e:
+        raise RuntimeError(f"{base}/models returned non-JSON") from e
+    return {
+        "endpoint": base,
+        "source": source,
+        "models": _vl_models_from_models(data),
+    }
+
+
 def _compat_api_key(api_key: str, base_url: str, purpose: str) -> str:
     """Local OpenAI-compatible servers (Ollama, LM Studio, kokoro-fastapi…)
     don't need a key; remote ones do. Send a placeholder for localhost so the
@@ -189,28 +303,32 @@ def _compat_api_key(api_key: str, base_url: str, purpose: str) -> str:
     )
 
 
-def _build_vision_llm(cfg, secrets):
-    """Build the DEDICATED vision provider when llm.vision_provider is
-    'openai_compatible'; None means "reuse the main LLM" (default behavior)."""
-    if cfg.llm.vision_provider != "openai_compatible":
+def _build_vision_llm(cfg: "LLMConfig", secrets):
+    """Build the DEDICATED vision provider when vision_provider is
+    'openai_compatible'; None means "reuse the main LLM" (default behavior).
+
+    Takes the LLMConfig itself (already effective: a vision block's endpoint/
+    model/key are pre-applied by effective_compat) — NOT the AppConfig.
+    """
+    if cfg.vision_provider != "openai_compatible":
         return None
     from llm.openai_compat import OpenAICompatProvider
-    base_url = (cfg.llm.vision_openai_compatible_base_url or "").strip()
+    base_url = (cfg.vision_openai_compatible_base_url or "").strip()
     if not base_url:
         # Fall back to the generic LLM endpoint if vision's own is unset —
         # handy when one gateway serves both text and vision models.
-        base_url = (cfg.llm.openai_compatible_base_url or "").strip()
+        base_url = (cfg.openai_compatible_base_url or "").strip()
     if not base_url:
         raise RuntimeError(
-            "llm.vision_provider=openai_compatible: set vision_openai_compatible_base_url "
+            "vision_provider=openai_compatible: set vision_openai_compatible_base_url "
             '(or openai_compatible_base_url) — e.g. "https://dashscope.example/v1", version path included'
         )
-    model = (cfg.llm.vision_model or "").strip()
+    model = (cfg.vision_model or "").strip()
     if not model:
         # No silent fallback to the brain model: a text-only model silently
         # receiving screenshots is exactly what this block exists to avoid.
         raise RuntimeError(
-            "llm.vision_provider=openai_compatible: set llm.vision_model "
+            "vision_provider=openai_compatible: set vision_model "
             "(e.g. qwen-vl-max) — it cannot be inferred from the brain model"
         )
     return OpenAICompatProvider(
@@ -219,7 +337,7 @@ def _build_vision_llm(cfg, secrets):
         api_key=secrets.openai_compatible_vision_api_key,
         base_url=base_url,
         supports_vision=True,
-        timeout=cfg.llm.vision_openai_compatible_timeout,
+        timeout=cfg.vision_openai_compatible_timeout,
     )
 
 
@@ -379,18 +497,26 @@ def preflight(runtime: Optional[Runtime] = None) -> list[dict]:
 
     # ---- Vision — build falls back / disables, so warns (except bad config) ----
     if cfg.vision.enabled:
-        if not llm.vision_capable:
-            add("warn", "Vision", "enabled but the LLM is not marked vision-capable — vision will be disabled")
-        if llm.vision_provider == "openai_compatible":
-            base = (llm.vision_openai_compatible_base_url or "").strip() or (llm.openai_compatible_base_url or "").strip()
-            model = (llm.vision_model or "").strip()
+        dedicated = llm.vision_provider == "openai_compatible"
+        if dedicated:
+            base, model, vkey = _pf_compat(
+                cfg, sec, "vision", ref=cfg.llm.vision_provider_ref,
+                legacy_base=(cfg.llm.vision_openai_compatible_base_url
+                             or cfg.llm.openai_compatible_base_url),
+                legacy_model=cfg.llm.vision_model,
+                legacy_key=sec.openai_compatible_vision_api_key,
+            )
             if not base:
-                add("error", "Vision", "dedicated vision provider has no endpoint (Vision section)")
+                add("error", "Vision", "dedicated vision provider has no endpoint — "
+                    "create a VISION block on the API Keys page or fill the Vision base URL")
             if not model:
-                add("error", "Vision", "dedicated vision provider has no model — set the vision model, "
-                    "it cannot be inferred from the brain model")
-            elif not _pf_key_ok(sec.openai_compatible_vision_api_key, base):
+                add("error", "Vision", "dedicated vision provider has no model — set it on the "
+                    "block or in the Vision section; it cannot be inferred from the brain model")
+            if base and not _pf_key_ok(vkey, base):
                 add("warn", "Vision", "dedicated vision endpoint has no API key — will fall back to the main LLM")
+        elif not llm.vision_capable:
+            add("warn", "Vision", "enabled but the LLM is not marked vision-capable and no dedicated "
+                "vision provider is configured — vision will be disabled")
 
     # ---- Memory — build disables the whole feature on failure ----
     mem = getattr(cfg, "memory", None)
@@ -418,6 +544,50 @@ def preflight(runtime: Optional[Runtime] = None) -> list[dict]:
     return issues
 
 
+def effective_compat(cfg, secrets, category: str, sub_cfg, *, ref: str = "",
+                     allow_default: bool = True):
+    """(cfg_copy, secrets_copy) with a provider block's endpoint/model/key
+    applied when the subsystem runs on 'openai_compatible'. Legacy fields
+    remain untouched when no block matches. Module-level so tests and the
+    dashboard routes exercise the SAME resolution the build uses.
+
+    Vision is special: the block must fill the DEDICATED fields
+    (vision_openai_compatible_base_url / vision_model / vision key) — writing
+    the generic ones would overwrite the brain's model mid-build.
+    """
+    prov = _resolve_provider(cfg, secrets, category, ref=ref, allow_default=allow_default)
+    if prov["from"] == "legacy" or not prov["base_url"]:
+        return sub_cfg, secrets
+    if category == "vision":
+        updates: dict = {"vision_openai_compatible_base_url": prov["base_url"]}
+        if prov["model"]:
+            updates["vision_model"] = prov["model"]
+        key_field = "openai_compatible_vision_api_key"
+    else:  # pragma: no cover — parity kept with the in-build closure below
+        updates = {"openai_compatible_base_url": prov["base_url"]}
+        if prov["model"]:
+            updates["openai_compatible_model"] = prov["model"]
+            # The block's model is the directed model for dedicated blocks.
+            if category != "llm":
+                updates["model"] = prov["model"]
+        key_field = {
+            "llm": "openai_compatible_api_key",
+            "tts": "openai_compatible_tts_api_key",
+            "stt": "openai_compatible_stt_api_key",
+            "memory": "openai_compatible_memory_api_key",
+            "thoughts": "openai_compatible_thoughts_api_key",
+        }[category]
+    sub_cfg = sub_cfg.model_copy(update=updates)
+    # Localhost blocks don't need a key — same rule as everywhere else;
+    # without this the provider constructor rejects an empty credential
+    # even though preflight (correctly) passes localhost blocks.
+    secrets_eff = secrets.model_copy(update={
+        key_field: _compat_api_key(prov["api_key"], prov["base_url"],
+                                   f"{category} provider block"),
+    })
+    return sub_cfg, secrets_eff
+
+
 def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
     runtime = runtime or get_runtime()
     cfg = runtime.config
@@ -430,32 +600,8 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
         """(cfg_copy, secrets_copy) with a provider block's endpoint/model/key
         applied when the subsystem runs on 'openai_compatible'. Legacy fields
         remain untouched when no block matches."""
-        prov = _resolve_provider(cfg, runtime.secrets, category, ref=ref, allow_default=allow_default)
-        if prov["from"] == "legacy" or not prov["base_url"]:
-            return sub_cfg, runtime.secrets
-        updates: dict = {"openai_compatible_base_url": prov["base_url"]}
-        if prov["model"]:
-            updates["openai_compatible_model"] = prov["model"]
-            # The block's model is the directed model for dedicated blocks.
-            if category != "llm":
-                updates["model"] = prov["model"]
-        sub_cfg = sub_cfg.model_copy(update=updates)
-        key_field = {
-            "llm": "openai_compatible_api_key",
-            "vision": "openai_compatible_vision_api_key",
-            "tts": "openai_compatible_tts_api_key",
-            "stt": "openai_compatible_stt_api_key",
-            "memory": "openai_compatible_memory_api_key",
-            "thoughts": "openai_compatible_thoughts_api_key",
-        }[category]
-        # Localhost blocks don't need a key — same rule as everywhere else;
-        # without this the provider constructor rejects an empty credential
-        # even though preflight (correctly) passes localhost blocks.
-        secrets_eff = runtime.secrets.model_copy(update={
-            key_field: _compat_api_key(prov["api_key"], prov["base_url"],
-                                       f"{category} provider block"),
-        })
-        return sub_cfg, secrets_eff
+        return effective_compat(cfg, runtime.secrets, category, sub_cfg,
+                                ref=ref, allow_default=allow_default)
 
     llm_cfg_eff, llm_secrets_eff = (
         _effective_compat("llm", cfg.llm, ref=cfg.llm.provider_ref)
@@ -504,8 +650,12 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
     vision_queue = None
     vision_loop = None
     if cfg.vision.enabled:
-        if not cfg.llm.vision_capable:
-            logger.warning("vision enabled but llm.vision_capable is False; disabling vision")
+        if not (cfg.llm.vision_capable or vision_llm is not None):
+            logger.warning(
+                "vision enabled but no vision-capable model — the engine is not "
+                "marked vision_capable and no dedicated vision provider resolved; "
+                "disabling vision"
+            )
         else:
             try:
                 from vision import VisionEvent, VisionLoop

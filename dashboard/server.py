@@ -176,6 +176,11 @@ class TestVoiceBody(BaseModel):
     text: str
 
 
+class TestHearingBody(BaseModel):
+    seconds: float = 5.0
+    source: str = "system"  # "system" = WASAPI loopback, "mic" = default microphone
+
+
 class TestExpressionBody(BaseModel):
     expression: str  # slot ("happy", "hype", ...) OR a raw hotkey id/name
 
@@ -199,6 +204,10 @@ class TtsVoicesBody(BaseModel):
     provider_ref: str = ""
 
 
+class VisionModelsBody(BaseModel):
+    provider_ref: str = ""
+
+
 class TestProviderBody(BaseModel):
     # "openai" | "groq" | "openrouter" | "anthropic" | "gemini" | "fish" | "elevenlabs" | "piper"
     provider: str
@@ -219,6 +228,48 @@ class TestDonationBody(BaseModel):
 class TestCaptionBody(BaseModel):
     text: str = "this is how the caption overlay looks on stream"
     clear_after: bool = True
+
+
+def _record_mic(seconds: float) -> Any:
+    """Record `seconds` of mono float32 PCM at 16 kHz from the DEFAULT MICROPHONE
+    (soundcard, same stack as SystemAudioCapture). Blocking — callers run it in
+    an executor. COM is initialized on the calling thread like the capture loop
+    does (soundcard's WASAPI backend requires it on non-main threads)."""
+    try:
+        import soundcard as sc
+    except Exception as e:
+        raise RuntimeError(f"soundcard not available: {e}")
+    import numpy as np
+
+    mic = sc.default_microphone()
+    if mic is None:
+        raise RuntimeError("no default microphone found")
+    sr = 16000
+    chunk = max(1, int(sr * 0.25))
+    frames: list[Any] = []
+    _co_done = False
+    try:
+        from ctypes import windll
+        hr = windll.ole32.CoInitialize(None)
+        _co_done = hr in (0, 1)  # S_OK / S_FALSE both need a matching CoUninitialize
+    except Exception:  # noqa: BLE001 — non-Windows or no COM
+        _co_done = False
+    try:
+        with mic.recorder(samplerate=sr, channels=1, blocksize=chunk) as rec:
+            remaining = seconds
+            while remaining > 0:
+                data = rec.record(numframes=chunk)
+                if data is not None and data.size:
+                    frames.append(data.flatten().astype("float32"))
+                    remaining -= data.shape[0] / sr
+    finally:
+        if _co_done:
+            try:
+                from ctypes import windll
+                windll.ole32.CoUninitialize()
+            except Exception:  # noqa: BLE001
+                pass
+    return np.concatenate(frames) if frames else np.zeros(0, dtype="float32")
 
 
 def _build_app(
@@ -381,6 +432,22 @@ def _build_app(
             raise HTTPException(status_code=400, detail=str(e)[:220])
         except Exception as e:
             logger.exception("dashboard: tts voices fetch failed")
+            raise HTTPException(status_code=500, detail=str(e)[:220])
+
+    @app.post("/api/vision/models")
+    async def api_vision_models(body: VisionModelsBody) -> dict[str, Any]:
+        """Query the configured vision endpoint's /models for available VL models,
+        so the Vision page can offer a dropdown instead of a blind text input."""
+        from wallie import fetch_vision_models
+        from config import get_runtime
+        try:
+            runtime = get_runtime()
+            return await fetch_vision_models(
+                runtime.config, runtime.secrets, ref=body.provider_ref)
+        except (ValueError, RuntimeError) as e:
+            raise HTTPException(status_code=400, detail=str(e)[:220])
+        except Exception as e:
+            logger.exception("dashboard: vision models fetch failed")
             raise HTTPException(status_code=500, detail=str(e)[:220])
 
     @app.post("/api/start")
@@ -1063,11 +1130,33 @@ def _build_app(
 
     @app.post("/api/test/vision")
     async def test_vision() -> dict[str, Any]:
-        cfg = load_profile()
-        if not cfg.llm.vision_capable:
+        """Capture + ask, using the SAME vision provider a live session uses:
+        a resolved dedicated vision block when one exists, otherwise the main
+        engine. Mirrors build_orchestrator's resolution and gate."""
+        from config import get_runtime
+        from wallie import effective_compat
+        from llm.factory import build_provider
+        runtime = get_runtime()
+        cfg = runtime.config
+        dedicated = None
+        if cfg.llm.vision_provider == "openai_compatible":
+            try:
+                vis_cfg, vis_sec = effective_compat(
+                    cfg, runtime.secrets, "vision", cfg.llm,
+                    ref=cfg.llm.vision_provider_ref, allow_default=False)
+            except RuntimeError as e:  # e.g. remote block without an API key
+                raise HTTPException(400, str(e)[:300])
+            try:
+                from wallie import _build_vision_llm
+                dedicated = _build_vision_llm(vis_cfg, vis_sec)
+            except RuntimeError as e:
+                raise HTTPException(400, str(e)[:300])
+        if dedicated is None and not cfg.llm.vision_capable:
             raise HTTPException(
                 400,
-                "Engine.vision_capable is OFF. Toggle it on for a vision-capable model.",
+                "No vision model available: Engine.vision_capable is OFF and no "
+                "dedicated vision provider is configured (create a VISION block on "
+                "the API Keys page or toggle vision_capable for the engine).",
             )
         # Capture one frame.
         try:
@@ -1106,7 +1195,7 @@ def _build_app(
                 ],
             },
         ]
-        llm = build_provider(cfg.llm, Secrets())
+        llm = dedicated if dedicated is not None else build_provider(cfg.llm, runtime.secrets)
         try:
             tokens: list[str] = []
             async for tok in llm.stream(
@@ -1128,8 +1217,9 @@ def _build_app(
             "ok": True,
             "frame_size": [frame.width, frame.height],
             "frame_bytes": len(frame.jpeg),
-            "model": cfg.llm.model,
-            "provider": cfg.llm.provider,
+            "model": getattr(llm, "model", "") or cfg.llm.model,
+            "provider": getattr(llm, "name", "") or cfg.llm.provider,
+            "dedicated": dedicated is not None,
             "text": text,
         }
 
@@ -1289,6 +1379,108 @@ def _build_app(
             note += " · decoded via ffmpeg (gateway ignored pcm)"
         return {"ok": True, "routed": routed, "decoded": decoded,
                 "bytes": len(raw), "duration_sec": round(dur, 2), "note": note}
+
+    @app.post("/api/test/hearing")
+    async def test_hearing(body: TestHearingBody) -> dict[str, Any]:
+        """Record from an audio input and transcribe it with the CONFIGURED STT.
+
+        The mirror of /api/test/voice for the ear. Two sources:
+        - ``system`` — the WASAPI loopback Wallie actually listens through live;
+        - ``mic`` — the default microphone, for a true round-trip test (loopback
+          only hears what PLAYS on the machine, not your voice).
+        The engine resolution (provider block → legacy fields) is identical to
+        the build's. Returns transcript, level and duration — or the real
+        reason on failure (device missing, silence, STT error…).
+        """
+        import numpy as np
+        from config import get_runtime
+        from wallie import _effective_stt
+
+        try:
+            from hearing.capture import SystemAudioCapture
+        except Exception as e:
+            return JSONResponse(status_code=400, content={"detail":
+                f"capture unavailable: {e}"})
+
+        source = (body.source or "system").strip().lower()
+        if source not in ("system", "mic"):
+            return JSONResponse(status_code=400, content={"detail":
+                f"unknown source {source!r} — use 'system' or 'mic'"})
+        seconds = min(15.0, max(2.0, float(body.seconds or 5.0)))
+        cfg = load_profile()
+        runtime = get_runtime()
+        try:
+            hearing_cfg, stt_secrets = _effective_stt(runtime)
+        except (ValueError, RuntimeError) as e:
+            return JSONResponse(status_code=400, content={"detail": str(e)[:220]})
+
+        def _fail(msg: str) -> JSONResponse:
+            return JSONResponse(status_code=400, content={"detail": msg})
+
+        # ---- record (same capture stack as HearingLoop) ----
+        try:
+            if source == "mic":
+                audio = await asyncio.to_thread(_record_mic, seconds)
+            else:
+                cap = SystemAudioCapture(samplerate=16000)
+                cap.open()
+                try:
+                    # Let the ring buffer fill before grabbing — same rule the
+                    # live loop uses before its first read.
+                    await asyncio.sleep(seconds)
+                    audio = cap.latest(seconds)
+                finally:
+                    cap.close()
+        except Exception as e:
+            return _fail(f"could not open audio input ({source}): {e}")
+
+        rms = float(np.sqrt(np.mean(audio ** 2))) if audio.size else 0.0
+        if rms < 1e-4:
+            return _fail(
+                "recorded silence — check that the right device is capturing "
+                "and that it is not muted"
+            )
+
+        # ---- transcribe with the CONFIGURED engine ----
+        def _transcribe() -> str:
+            if getattr(hearing_cfg, "engine", "") != "openai_compatible":
+                from hearing.hearing_loop import HearingLoop
+                loop = HearingLoop(hearing_cfg, __import__("asyncio").Queue(maxsize=2))
+                loop._model = loop._load_model()
+                return loop._transcribe(audio).strip()
+            key = (stt_secrets.openai_compatible_stt_api_key or "").strip()
+            # Same rule as the build: only a REMOTE endpoint demands a key —
+            # localhost gateways run without one. _compat_api_key encodes it.
+            from wallie import _compat_api_key
+            key = _compat_api_key(
+                key, getattr(hearing_cfg, "openai_compatible_base_url", ""),
+                "STT provider block")
+            import wave as _wave
+            import io as _io
+            from hearing.openai_stt import RemoteWhisperModel
+            engine = RemoteWhisperModel(
+                api_key=key,
+                base_url=hearing_cfg.openai_compatible_base_url,
+                model=getattr(hearing_cfg, "openai_compatible_model", "whisper-1"),
+                language=getattr(hearing_cfg, "language", ""),
+                prompt=getattr(hearing_cfg, "openai_compatible_prompt", ""),
+                timeout=getattr(hearing_cfg, "openai_compatible_timeout", 20.0),
+            )
+            # The engine accepts numpy frames; the transcription call is
+            # blocking (httpx sync) so it runs on this worker thread.
+            segs, _info = engine.transcribe(audio)
+            return " ".join(s.text.strip() for s in segs).strip()
+
+        try:
+            text = await asyncio.get_event_loop().run_in_executor(None, _transcribe)
+        except Exception as e:
+            return _fail(f"transcription failed: {str(e)[:300]}")
+
+        from hearing.hearing_loop import _is_hallucination
+        note = f"{len(text)} chars · {seconds:.0f}s ({source})"
+        return {"ok": True, "text": text, "seconds": seconds, "source": source,
+                "rms": round(rms, 4), "hallucination": bool(_is_hallucination(text)),
+                "note": note}
 
     @app.websocket("/ws/events")
     async def ws_events(ws: WebSocket) -> None:

@@ -226,6 +226,10 @@ function app() {
     donationTest: { donor: "TestDonor", amount: 10, message: "manda o salve", msg: "" },
     voiceTestText: "",
     voiceTestMsg: "",
+    hearingTestBusy: false,
+    hearingTestMsg: "",
+    hearingTestResult: "",
+    hearingSource: "",
     avatarTestExpr: "",
     avatarTestMsg: "",
     visionTestResult: "",
@@ -264,6 +268,13 @@ function app() {
     ttsVoicesSource: "",
     ttsVoicesBusy: false,
     ttsVoicesMsg: "",
+
+    // Vision model discovery (Vision page, openai_compatible provider)
+    vlModels: [],
+    vlModelsEndpoint: "",
+    vlModelsSource: "",
+    vlModelsBusy: false,
+    vlModelsMsg: "",
 
     // First-run setup wizard (additive — reuses config/secrets/start APIs, breaks nothing).
     wizard: { open: false, step: 1, path: "", busy: false, keyDrafts: {}, keyMsg: {}, keyBusy: {} },
@@ -308,6 +319,33 @@ function app() {
         this.ttsVoicesMsg = "✗ " + (e.message || e);
       } finally {
         this.ttsVoicesBusy = false;
+      }
+    },
+
+    // ----- Vision model discovery (Vision page) -----
+    async loadVisionModels() {
+      if (this.vlModelsBusy) return;
+      this.vlModelsBusy = true;
+      this.vlModelsMsg = "";
+      try {
+        const r = await fetch("/api/vision/models", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider_ref: this.cfg.llm.vision_provider_ref || "" }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+        this.vlModels = data.models || [];
+        this.vlModelsEndpoint = data.endpoint || "";
+        this.vlModelsSource = data.source || "";
+        this.vlModelsMsg = this.vlModels.length
+          ? `${this.vlModels.length} models`
+          : "endpoint reachable but no models listed — type the name manually";
+      } catch (e) {
+        this.vlModels = [];
+        this.vlModelsMsg = "✗ " + (e.message || e);
+      } finally {
+        this.vlModelsBusy = false;
       }
     },
 
@@ -1148,6 +1186,40 @@ function app() {
     async testVoice() {
       if (!this.voiceTestText) return;
       await this._voice(this.voiceTestText);
+    },
+
+    async testHearing(source) {
+      if (this.hearingTestBusy) return;
+      this.hearingTestBusy = true;
+      this.hearingSource = source;
+      this.hearingTestMsg = source === "mic"
+        ? "recording 5s… speak now"
+        : "recording 5s… play something on the machine";
+      this.hearingTestResult = "";
+      try {
+        const r = await fetch("/api/test/hearing", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ seconds: 5, source }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.hearingTestMsg = "✗ " + (data.detail || `HTTP ${r.status}`);
+          return;
+        }
+        this.hearingTestResult = data.text || "";
+        this.hearingTestMsg = "✓ " + (data.note || "transcribed");
+        if (data.hallucination) {
+          this.hearingTestMsg += " — likely Whisper hallucination over silence/noise";
+        } else if (!data.text) {
+          this.hearingTestMsg += " — nothing recognizable was said (try again closer to the mic/speakers)";
+        }
+      } catch (e) {
+        this.hearingTestMsg = "✗ " + e;
+      } finally {
+        this.hearingTestBusy = false;
+        setTimeout(() => { this.hearingTestMsg = ""; }, 8000);
+      }
     },
 
     async testExpression() {

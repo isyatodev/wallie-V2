@@ -199,7 +199,7 @@ def test_vision_llm_none_by_default():
     import wallie
 
     cfg = AppConfig()
-    assert wallie._build_vision_llm(cfg, Secrets()) is None
+    assert wallie._build_vision_llm(cfg.llm, Secrets()) is None
 
 
 def test_vision_llm_builds_dedicated_provider():
@@ -210,7 +210,7 @@ def test_vision_llm_builds_dedicated_provider():
     cfg.llm.vision_provider = "openai_compatible"
     cfg.llm.vision_model = "qwen-vl-max"
     cfg.llm.vision_openai_compatible_base_url = "https://vision.example/v1"
-    p = wallie._build_vision_llm(cfg, Secrets(openai_compatible_vision_api_key="k"))
+    p = wallie._build_vision_llm(cfg.llm, Secrets(openai_compatible_vision_api_key="k"))
     assert isinstance(p, OpenAICompatProvider)
     assert p.name == "openai_compatible_vision"
     assert p.model == "qwen-vl-max"
@@ -226,7 +226,7 @@ def test_vision_llm_falls_back_to_generic_base_url():
     cfg.llm.vision_model = "qwen-vl"
     cfg.llm.vision_openai_compatible_base_url = ""
     cfg.llm.openai_compatible_base_url = "https://generic.example/v1"
-    p = wallie._build_vision_llm(cfg, Secrets(openai_compatible_vision_api_key="k"))
+    p = wallie._build_vision_llm(cfg.llm, Secrets(openai_compatible_vision_api_key="k"))
     assert p._base_url == "https://generic.example/v1"
 
 
@@ -237,7 +237,7 @@ def test_vision_llm_requires_base_url():
     cfg.llm.vision_provider = "openai_compatible"
     cfg.llm.vision_model = "qwen-vl"
     with pytest.raises(RuntimeError) as ei:
-        wallie._build_vision_llm(cfg, Secrets(openai_compatible_vision_api_key="k"))
+        wallie._build_vision_llm(cfg.llm, Secrets(openai_compatible_vision_api_key="k"))
     assert "base_url" in str(ei.value).lower()
 
 
@@ -248,8 +248,101 @@ def test_vision_llm_requires_model():
     cfg.llm.vision_provider = "openai_compatible"
     cfg.llm.vision_openai_compatible_base_url = "https://x/v1"
     with pytest.raises(RuntimeError) as ei:
-        wallie._build_vision_llm(cfg, Secrets(openai_compatible_vision_api_key="k"))
+        wallie._build_vision_llm(cfg.llm, Secrets(openai_compatible_vision_api_key="k"))
     assert "vision_model" in str(ei.value)
+
+
+def test_effective_compat_vision_block_fills_dedicated_fields():
+    """THE wiring bug: a VISION block from the API Keys page must land in the
+    DEDICATED vision fields — never overwrite the brain's model — and the
+    key must resolve the same way the build does (env, localhost-exempt)."""
+    import wallie
+
+    cfg = AppConfig(providers=[{
+        "id": "vis1", "name": "Qwen VL", "category": "vision",
+        "base_url": "http://127.0.0.1:9990/v1", "model": "qwen2.5-vl-7b",
+    }])
+    cfg.llm.vision_provider = "openai_compatible"
+    cfg.llm.vision_provider_ref = "vis1"
+    cfg.llm.model = "brain-model"
+    cfg.llm.openai_compatible_base_url = "https://brain.example/v1"
+    secrets = Secrets()
+
+    vis_cfg, vis_sec = wallie.effective_compat(
+        cfg, secrets, "vision", cfg.llm, ref="vis1", allow_default=False)
+
+    assert vis_cfg.vision_openai_compatible_base_url == "http://127.0.0.1:9990/v1"
+    assert vis_cfg.vision_model == "qwen2.5-vl-7b"
+    # Brain untouched.
+    assert vis_cfg.model == "brain-model"
+    assert vis_cfg.openai_compatible_base_url == "https://brain.example/v1"
+    # Localhost block → no key required, placeholder is fine.
+    assert vis_sec.openai_compatible_vision_api_key
+
+    # The corrected fields feed _build_vision_llm without RuntimeError —
+    # this is exactly the path that used to dead-end.
+    p = wallie._build_vision_llm(vis_cfg, vis_sec)
+    assert p.model == "qwen2.5-vl-7b"
+    assert p._base_url == "http://127.0.0.1:9990/v1"
+    assert p.supports_vision is True
+
+
+def test_effective_compat_vision_block_requires_key_for_remote():
+    import wallie
+
+    cfg = AppConfig(providers=[{
+        "id": "vis2", "name": "Remote VL", "category": "vision",
+        "base_url": "https://vl.example/v1", "model": "qwen-vl-max",
+    }])
+    cfg.llm.vision_provider = "openai_compatible"
+    cfg.llm.vision_provider_ref = "vis2"
+
+    with pytest.raises(RuntimeError) as ei:
+        wallie.effective_compat(
+            cfg, Secrets(), "vision", cfg.llm, ref="vis2", allow_default=False)
+    assert "API key" in str(ei.value)
+
+
+def test_effective_compat_vision_env_key_reaches_provider():
+    import wallie
+
+    cfg = AppConfig(providers=[{
+        "id": "vis3", "name": "Remote VL key", "category": "vision",
+        "base_url": "https://vl.example/v1", "model": "qwen-vl-max",
+    }])
+    cfg.llm.vision_provider = "openai_compatible"
+    cfg.llm.vision_provider_ref = "vis3"
+
+    import os
+    os.environ["PROVIDER_VIS3_API_KEY"] = "vl-secret"
+    try:
+        vis_cfg, vis_sec = wallie.effective_compat(
+            cfg, Secrets(), "vision", cfg.llm, ref="vis3", allow_default=False)
+        assert vis_sec.openai_compatible_vision_api_key == "vl-secret"
+        p = wallie._build_vision_llm(vis_cfg, vis_sec)
+        assert p.model == "qwen-vl-max"
+    finally:
+        del os.environ["PROVIDER_VIS3_API_KEY"]
+
+
+def test_preflight_vision_block_with_model_no_error(tmp_path):
+    """Preflight must mirror the build: a complete VISION block (endpoint +
+    model, localhost key-exempt) is a WORKING vision setup — no issues."""
+    cfg = AppConfig(
+        providers=[{
+            "id": "vis4", "name": "Local VL", "category": "vision",
+            "base_url": "http://127.0.0.1:9990/v1", "model": "qwen2.5-vl-7b",
+        }],
+        llm={"provider": "groq", "vision_provider": "openai_compatible",
+             "vision_provider_ref": "vis4"},
+        vision={"enabled": True},
+    )
+    import wallie
+    from config import Runtime
+
+    issues = wallie.preflight(Runtime(config=cfg, secrets=Secrets()))
+    vision_issues = [i for i in issues if i.get("section") == "Vision"]
+    assert vision_issues == []
 
 
 # ---------------------------------------------------------------------------
