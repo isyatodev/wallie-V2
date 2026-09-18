@@ -18,6 +18,10 @@ websockets>=12.0
 sounddevice>=0.4.6
 numpy>=1.26.0
 
+# Hearing — system-audio loopback + local speech-to-text (Whisper)
+soundcard>=0.4.3
+faster-whisper>=1.0.0
+
 # Vision
 mss>=9.0.1
 pillow>=10.2.0
@@ -29,7 +33,7 @@ google-auth-httplib2>=0.1.1
 google-auth-oauthlib>=1.1.0
 
 # Donations — Streamlabs Socket API (Socket.IO 2.x protocol; v5+ speaks 3.x and will NOT connect)
-python-socketio>=4.7.0,<5
+python-socketio>=4.6.0,<5
 
 # Dashboard
 fastapi>=0.111.0
@@ -43,11 +47,6 @@ uvicorn[standard]>=0.30.0
 # Needs PyTorch. Install with: pip install kokoro soundfile
 # kokoro>=0.9.2
 # soundfile>=0.12.1
-
-# Optional: HEARING (system-audio loopback + speech-to-text + music analysis).
-# Required only if you enable hearing. Install with: pip install soundcard faster-whisper
-# soundcard>=0.4.3
-# faster-whisper>=1.0.0
 
 # Utilities
 orjson>=3.10.0

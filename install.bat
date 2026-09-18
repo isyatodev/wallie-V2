@@ -75,6 +75,20 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
+REM --- Verify Hearing deps (soundcard + faster-whisper) ---
+.venv\Scripts\python.exe -c "import soundcard, faster_whisper" 2>nul
+if errorlevel 1 (
+    echo [!] Hearing deps missing. Installing soundcard + faster-whisper...
+    .venv\Scripts\pip.exe install soundcard faster-whisper -q
+    .venv\Scripts\python.exe -c "import soundcard, faster_whisper" 2>nul
+    if errorlevel 1 (
+        echo [ERROR] Could not install Hearing dependencies. Hearing will be disabled.
+        echo         Try manually: .venv\Scripts\pip install soundcard faster-whisper
+        pause
+        exit /b 1
+    )
+)
 echo [OK] All dependencies installed.
 
 REM --- Setup .env ---

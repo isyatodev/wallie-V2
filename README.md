@@ -179,7 +179,7 @@ Wallie captures your system audio (WASAPI loopback) and reacts to it live, fused
 - **No self-echo** — content-based guard so Wallie never reacts to its own TTS bleeding back through the loopback.
 - **Pure-hearing mode** — run it with vision off and it reacts to audio the way it reacts to a screen: stays quiet, listens, then reacts to what's playing.
 
-Enable it in the dashboard's Hearing section. Needs two extra deps: `pip install soundcard faster-whisper`.
+Enable it in the dashboard's Hearing section — `soundcard` and `faster-whisper` come with the standard install (`install.bat` / `install.sh`).
 
 ### Wallie plays games — not just watches them
 

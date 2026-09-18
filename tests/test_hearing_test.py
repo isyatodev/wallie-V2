@@ -8,6 +8,7 @@ level and duration, or the real reason on failure.
 from __future__ import annotations
 
 import asyncio
+import sys
 
 import numpy as np
 import pytest
@@ -268,8 +269,10 @@ def test_hearing_route_silence_is_reported_not_transcribed(tmp_path, monkeypatch
 def test_hearing_route_device_error_is_actionable(tmp_path, monkeypatch):
     app = _profiled_app(tmp_path, monkeypatch, _stt_block_cfg())
     _patch_engine(monkeypatch)
-    # No fake soundcard module installed → the lazy import fails with an
-    # actionable message (this venv has no soundcard; message names it).
+    # Simulate soundcard being missing: None in sys.modules makes the lazy
+    # `import soundcard` fail with ImportError (hermetic even when the venv
+    # DOES have soundcard installed, as it now does by default).
+    monkeypatch.setitem(sys.modules, "soundcard", None)
 
     from fastapi.testclient import TestClient
     with TestClient(app) as client:
