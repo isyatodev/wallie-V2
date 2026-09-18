@@ -15,7 +15,7 @@ persona:
   archetype: variety streamer
   backstory: A chronically online streamer who has seen every weird corner of the
     internet and is mildly amused by all of it.
-  energy: warm
+  energy: chill
   humor_style:
   - ironic
   - observational
@@ -58,7 +58,7 @@ persona:
   enable_callbacks: true
   initiates: false
 llm:
-  provider: groq
+  provider: openai_compatible
   model: llama-3.3-70b-versatile
   temperature: 0.85
   top_p: 0.95
@@ -102,7 +102,7 @@ tts:
   openai_compatible_speed: 1.0
   openai_compatible_pcm_sample_rate: 24000
 vision:
-  enabled: false
+  enabled: true
   source: monitor
   monitor_index: 1
   interval_sec: 3.0
@@ -132,7 +132,7 @@ vision:
   silence_fallback_scale: 1.0
   active_content_boost: 1.0
 hearing:
-  enabled: false
+  enabled: true
   window_sec: 5.0
   model_size: small
   language: ''
@@ -153,7 +153,7 @@ hearing:
     threshold: 0.68
     unknown_threshold: 0.45
     collect_other_voices: false
-  engine: ''
+  engine: openai_compatible
   openai_compatible_base_url: ''
   openai_compatible_model: whisper-1
   openai_compatible_timeout: 20.0
@@ -161,17 +161,17 @@ hearing:
   openai_compatible_prompt: ''
 chat:
   youtube_enabled: false
-  twitch_enabled: false
+  twitch_enabled: true
   kick_enabled: false
-  reply_probability: 0.35
+  reply_probability: 0.25
   min_reply_interval_sec: 8.0
   max_message_age_sec: 45.0
 donations:
-  livepix_enabled: false
+  livepix_enabled: true
   livepix_webhook_path: /webhooks/livepix
   livepix_enrich: true
   livepix_verify_user_id: true
-  streamlabs_enabled: false
+  streamlabs_enabled: true
   streamlabs_url: https://sockets.streamlabs.com
   streamlabs_reconnect_max_sec: 60.0
   donation_reply_probability: 1.0
