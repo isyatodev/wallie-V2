@@ -49,6 +49,37 @@ def provider_key_env(pid: str) -> str:
     return "PROVIDER_" + provider_slug(pid).upper() + "_API_KEY"
 
 
+# Every subsystem that can reference a provider block: (config field path,
+# category the ref must point to). Single source of truth for the "ref cleanup
+# on block delete" cascade in dashboard/server.py — new provider_ref fields
+# must be registered here or they won't be cleaned when their block dies.
+PROVIDER_REF_FIELDS: tuple[tuple[str, str], ...] = (
+    ("llm", "provider_ref", "llm"),
+    ("llm", "vision_provider_ref", "vision"),
+    ("tts", "provider_ref", "tts"),
+    ("hearing", "provider_ref", "stt"),
+    ("memory", "provider_ref", "memory"),
+    ("random_thoughts", "provider_ref", "thoughts"),
+)
+
+
+def clear_provider_refs(cfg: "AppConfig", deleted_id: str) -> list[str]:
+    """Blank every provider_ref that points at a deleted block id.
+
+    Refs are just strings, so removing a block would otherwise leave the
+    subsystem silently falling back to the runtime's first-block-of-category
+    rule (or the legacy endpoint). Mutates cfg in place; returns the human
+    names of the settings that were cleared so the UI can tell the user.
+    """
+    cleared: list[str] = []
+    for section, field, _cat in PROVIDER_REF_FIELDS:
+        sub = getattr(cfg, section, None)
+        if sub is not None and getattr(sub, field, "") == deleted_id:
+            setattr(sub, field, "")
+            cleared.append(f"{section}.{field}")
+    return cleared
+
+
 # -------------------------------------------------------------------
 # Secrets
 # -------------------------------------------------------------------

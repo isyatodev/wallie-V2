@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from config import AppConfig
+from config import AppConfig, PROVIDER_REF_FIELDS, clear_provider_refs
 
 def run(coro):
     return asyncio.run(corro if False else coro)
@@ -667,3 +667,81 @@ def test_dashboard_provider_routes_use_canonical_env(api):
     assert r.json()["providers"][0]["id"] == "ghost_stt"
     env = provider_key_env("ghost_stt")
     assert env == "PROVIDER_GHOST_STT_API_KEY"
+
+
+# ---------------------------------------------------------------------------
+# Provider delete → dangling provider_ref cleanup cascade
+# ---------------------------------------------------------------------------
+
+def test_clear_provider_refs_blanks_matching_fields_only():
+    cfg = AppConfig()
+    cfg.llm.provider_ref = "gone"
+    cfg.llm.vision_provider_ref = "gone"
+    cfg.tts.provider_ref = "still_there"   # different block — must survive
+    cfg.hearing.provider_ref = ""
+    cleared = clear_provider_refs(cfg, "gone")
+    assert cleared == ["llm.provider_ref", "llm.vision_provider_ref"]
+    assert cfg.llm.provider_ref == ""
+    assert cfg.llm.vision_provider_ref == ""
+    assert cfg.tts.provider_ref == "still_there"
+    assert cfg.hearing.provider_ref == ""
+
+
+def test_clear_provider_refs_noop_when_nothing_matches():
+    cfg = AppConfig()
+    cfg.tts.provider_ref = "live"
+    assert clear_provider_refs(cfg, "other") == []
+    assert cfg.tts.provider_ref == "live"
+
+
+def test_provider_ref_fields_covers_every_ref_in_appconfig():
+    """Every provider_ref-shaped field in AppConfig must be registered in
+    PROVIDER_REF_FIELDS, or a block delete would leak that ref as dangling."""
+    registered = {(s, f) for s, f, _ in PROVIDER_REF_FIELDS}
+    found: set[tuple[str, str]] = set()
+    for sec_name, sub in AppConfig().model_dump().items():
+        if isinstance(sub, dict):
+            for f, v in sub.items():
+                if f.endswith("provider_ref"):
+                    found.add((sec_name, f))
+    assert found, "sanity: the scan must find the existing refs"
+    assert found == registered
+
+
+def test_api_delete_provider_clears_dangling_refs(api):
+    """Trash-can delete must blank any provider_ref pointing at the removed
+    block and report the cleared fields so the UI can warn the user."""
+    api.put("/api/providers", json=[
+        {"name": "Speak", "category": "tts", "base_url": "http://t/v1", "model": "tts-1"},
+    ])
+    api.put("/api/config", json={
+        "tts": {"provider": "openai_compatible", "provider_ref": "speak"},
+        "hearing": {"provider_ref": "speak"},   # stale ref of the wrong category
+    })
+    r = api.delete("/api/providers/speak")
+    assert r.status_code == 200
+    assert r.json()["cleared_refs"] == ["tts.provider_ref", "hearing.provider_ref"]
+    persisted = api.get("/api/config").json()
+    assert persisted["tts"]["provider_ref"] == ""
+    assert persisted["hearing"]["provider_ref"] == ""
+
+
+def test_api_providers_save_clears_refs_of_removed_rows(api):
+    """Removing a row + "save blocks" is the other delete path — refs must be
+    cleared there too, and blocks that stay must keep their refs."""
+    api.put("/api/providers", json=[
+        {"name": "Brain", "category": "llm", "base_url": "http://b/v1", "model": "m"},
+        {"name": "Mic", "category": "stt", "base_url": "http://s/v1", "model": "w"},
+    ])
+    api.put("/api/config", json={
+        "llm": {"provider_ref": "brain"},
+        "hearing": {"provider_ref": "mic"},
+    })
+    r = api.put("/api/providers", json=[
+        {"id": "brain", "name": "Brain", "category": "llm", "base_url": "http://b/v1", "model": "m"},
+    ])   # "mic" removed from the list
+    assert r.status_code == 200
+    assert r.json()["cleared_refs"] == ["hearing.provider_ref"]
+    persisted = api.get("/api/config").json()
+    assert persisted["llm"]["provider_ref"] == "brain"      # surviving block untouched
+    assert persisted["hearing"]["provider_ref"] == ""       # dangling ref cleaned

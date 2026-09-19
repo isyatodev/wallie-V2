@@ -388,25 +388,53 @@ function app() {
       if (!p.id) { this.providers.splice(this.providers.indexOf(p), 1); return; }
       const label = p.name || p.id;
       const slugEnv = _providerKeyEnvJs(p.id);
-      if (confirm(`Delete provider "${label}"?\n\nIts API key (${slugEnv}) will also be removed from .env.`)) {
-        this.providerDelete(p.id);
+      // Pre-compute which subsystem settings reference this block, so the
+      // confirm dialog can warn up-front (server re-checks on delete).
+      const refs = this.clearProviderRefsLocal(p.id);
+      let msg = `Delete provider "${label}"?\n\nIts API key (${slugEnv}) will also be removed from .env.`;
+      if (refs.length) msg += `\n\nAlso cleared (were pointing at it): ${refs.join(", ")}.`;
+      if (confirm(msg)) {
+        this.providerDelete(p.id, refs);
       }
     },
 
-    async providerDelete(id) {
+    clearProviderRefsLocal(id) {
+      // Mirrors config.PROVIDER_REF_FIELDS — must stay in sync.
+      const REF_FIELDS = [
+        ["llm", "provider_ref"], ["llm", "vision_provider_ref"],
+        ["tts", "provider_ref"], ["hearing", "provider_ref"],
+        ["memory", "provider_ref"], ["random_thoughts", "provider_ref"],
+      ];
+      const out = [];
+      for (const [sec, field] of REF_FIELDS) {
+        if (this.cfg?.[sec]?.[field] === id) out.push(`${sec}.${field}`);
+      }
+      return out;
+    },
+
+    async providerDelete(id, localRefs) {
       this.providerBusy = true;
       try {
         const r = await fetch(`/api/providers/${encodeURIComponent(id)}`, { method: "DELETE" });
         if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+        const data = await r.json().catch(() => ({}));
         this.providers = this.providers.filter(x => x.id !== id);
-        this.providerMsg = "deleted";
-        await this.loadSecrets();   // orphan key row disappears from the list
-        await this.loadConfig();
+        const refs = (data.cleared_refs?.length ? data.cleared_refs : (localRefs || []));
+        if (refs.length) {
+          this.providerMsg = `deleted — also cleared: ${refs.join(", ")}`;
+          await this.loadSecrets();
+          await this.loadConfig();
+          setTimeout(() => (this.providerMsg = ""), 6000);   // leave time to read the warning
+        } else {
+          this.providerMsg = "deleted";
+          await this.loadSecrets();   // orphan key row disappears from the list
+          await this.loadConfig();
+          setTimeout(() => (this.providerMsg = ""), 2500);
+        }
       } catch (e) {
         this.providerMsg = e.message || "delete failed";
       } finally {
         this.providerBusy = false;
-        setTimeout(() => (this.providerMsg = ""), 2500);
       }
     },
 
@@ -421,14 +449,18 @@ function app() {
         if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
         const data = await r.json();
         this.providers = data.providers || [];
-        this.providerMsg = "saved";
+        // Rows removed in this save may have cleared dangling refs server-side.
+        const refs = data.cleared_refs || [];
+        this.providerMsg = refs.length ? `saved — also cleared: ${refs.join(", ")}` : "saved";
         await this.loadSecrets();   // new blocks immediately get their key field
         await this.loadConfig();    // re-sync cfg (dropdowns read block ids)
       } catch (e) {
         this.providerMsg = e.message || "fail";
       } finally {
         this.providerBusy = false;
-        setTimeout(() => (this.providerMsg = ""), 1800);
+        // Ref-cleanup notices need longer on screen than a plain "saved".
+        const ttl = String(this.providerMsg || "").includes("also cleared") ? 6000 : 1800;
+        setTimeout(() => (this.providerMsg = ""), ttl);
       }
     },
 

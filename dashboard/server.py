@@ -24,6 +24,7 @@ from audio.player import list_output_devices
 from config import (
     AppConfig,
     ProviderBlock,
+    clear_provider_refs,
     Secrets,
     activate_profile,
     clone_profile,
@@ -976,15 +977,24 @@ def _build_app(
         from secrets_store import set_provider_context
         set_provider_context(load_profile().providers)
 
-    def _save_providers(blocks: list[ProviderBlock]) -> list[dict[str, Any]]:
+    def _save_providers(blocks: list[ProviderBlock]) -> tuple[list[dict[str, Any]], list[str]]:
         cfg = load_profile()
+        # Cascade: any provider_ref pointing at a block this save removes gets
+        # blanked (→ runtime first-block-of-category fallback) instead of
+        # silently dangling. Covers BOTH delete paths: the trash-can DELETE
+        # route and removing a row on the page + "save blocks".
+        old_ids = {p.id for p in cfg.providers}
+        new_ids = {b.id for b in blocks}
+        cleared_refs: list[str] = []
+        for removed_id in sorted(old_ids - new_ids):
+            cleared_refs.extend(clear_provider_refs(cfg, removed_id))
         try:
             cfg = cfg.model_copy(update={"providers": blocks})
             save_profile(cfg, cfg.profile_name)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"invalid provider block: {e}")
         _sync_provider_context()
-        return [p.model_dump() for p in blocks]
+        return [p.model_dump() for p in blocks], cleared_refs
 
     @app.get("/api/providers")
     def api_providers_list() -> dict[str, Any]:
@@ -1015,8 +1025,8 @@ def _build_app(
                     n += 1
                 b.id = cand
             seen.add(b.id)
-        saved = _save_providers(blocks)
-        return {"ok": True, "providers": saved}
+        saved, cleared_refs = _save_providers(blocks)
+        return {"ok": True, "providers": saved, "cleared_refs": cleared_refs}
 
     @app.delete("/api/providers/{provider_id}")
     def api_providers_delete(provider_id: str) -> dict[str, Any]:
@@ -1024,6 +1034,11 @@ def _build_app(
         blocks = [p for p in cfg.providers if p.id != provider_id]
         if len(blocks) == len(cfg.providers):
             raise HTTPException(status_code=404, detail=f"unknown provider: {provider_id}")
+        # Blank any provider_ref that pointed at the deleted block so no
+        # subsystem keeps silently falling back; report them to the UI.
+        cleared_refs = clear_provider_refs(cfg, provider_id)
+        if cleared_refs:
+            save_profile(cfg, cfg.profile_name)
         _save_providers(blocks)
         # Clean the block's key out of .env so deleted blocks don't leave
         # orphan PROVIDER_*_API_KEY rows piling up on the API Keys page.
@@ -1040,7 +1055,7 @@ def _build_app(
             _harden_perms(ENV_FILE)
         except Exception:
             pass
-        return {"ok": True, "deleted": provider_id}
+        return {"ok": True, "deleted": provider_id, "cleared_refs": cleared_refs}
 
     @app.post("/api/providers/{provider_id}/test")
     async def api_providers_test(provider_id: str) -> dict[str, Any]:
