@@ -80,6 +80,29 @@ def clear_provider_refs(cfg: "AppConfig", deleted_id: str) -> list[str]:
     return cleared
 
 
+def heal_provider_refs(cfg: "AppConfig") -> list[str]:
+    """Self-heal dangling provider_refs: refs pointing at block ids that no
+    longer exist (e.g. the YAML was hand-edited, or an older build left them
+    behind) are blanked so the runtime's documented fallback applies instead
+    of a guaranteed-dead id. Refs to blocks of the WRONG category count as
+    dangling too — _resolve_provider only consults same-category blocks.
+    Mutates cfg in place; returns the cleared "section.field" names.
+    A profile with no blocks at all is left untouched: nothing to heal yet.
+    """
+    if not cfg.providers:
+        return []
+    valid_ids = {p.id for p in cfg.providers}
+    cleared: list[str] = []
+    for section, field, cat in PROVIDER_REF_FIELDS:
+        sub = getattr(cfg, section, None)
+        ref = getattr(sub, field, "") if sub is not None else ""
+        block = next((p for p in cfg.providers if p.id == ref), None) if ref else None
+        if ref and (block is None or block.category != cat):
+            setattr(sub, field, "")
+            cleared.append(f"{section}.{field}")
+    return cleared
+
+
 # -------------------------------------------------------------------
 # Secrets
 # -------------------------------------------------------------------

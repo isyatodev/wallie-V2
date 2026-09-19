@@ -255,8 +255,8 @@ function app() {
     // Dynamic provider blocks (API Keys page)
     providers: [],
     providerCategories: ["llm", "vision", "tts", "stt", "memory", "thoughts"],
-    providerBusy: false,
-    providerMsg: "",
+    providerBusy: false,      providerMsg: "",
+      healedMsg: "",
     // Voice-print speaker ID
     speakersInfo: { speakers: [], clips: [], enrolling: 0, active: false },
     enrollName: "",
@@ -854,12 +854,22 @@ function app() {
     async loadConfig() {
       const r = await fetch("/api/config");
       const fetched = await r.json();
+      // Self-heal notice: the server blanked refs that pointed at deleted /
+      // wrong-category blocks (typically a hand-edited YAML profile).
+      if (Array.isArray(fetched.healed_refs) && fetched.healed_refs.length) {
+        this.healedMsg = `Fixed stale provider references: ${fetched.healed_refs.join(", ")}`;
+      }
+      delete fetched.healed_refs;
       // Merge into empty to ensure newly added fields exist.
       const base = emptyCfg();
       this.cfg = deepMerge(base, fetched);
       // Textarea <-> list bridge for the thought seed pool.
       this.cfg.random_thoughts.seed_topics_text =
         (this.cfg.random_thoughts.seed_topics || []).join("\n");
+    },
+
+    dismissHealed() {
+      this.healedMsg = "";
     },
 
     async save() {

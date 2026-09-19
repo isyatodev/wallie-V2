@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from config import AppConfig, PROVIDER_REF_FIELDS, clear_provider_refs
+from config import AppConfig, PROVIDER_REF_FIELDS, clear_provider_refs, heal_provider_refs
 
 def run(coro):
     return asyncio.run(corro if False else coro)
@@ -745,3 +745,60 @@ def test_api_providers_save_clears_refs_of_removed_rows(api):
     persisted = api.get("/api/config").json()
     assert persisted["llm"]["provider_ref"] == "brain"      # surviving block untouched
     assert persisted["hearing"]["provider_ref"] == ""       # dangling ref cleaned
+
+
+# ---------------------------------------------------------------------------
+# Self-heal: dangling provider_refs from hand-edited YAML profiles
+# ---------------------------------------------------------------------------
+
+def test_heal_provider_refs_blanks_dead_and_wrong_category():
+    cfg = AppConfig(providers=[
+        {"id": "speak", "name": "Speak", "category": "tts", "base_url": "http://t/v1", "model": "t"},
+    ])
+    cfg.llm.provider_ref = "speak"            # valid id, WRONG category -> dangling
+    cfg.llm.vision_provider_ref = "ghost"     # deleted block -> dangling
+    cfg.tts.provider_ref = "speak"            # valid same-category -> kept
+    cfg.hearing.provider_ref = "ghost"
+    cfg.memory.provider_ref = ""
+    healed = heal_provider_refs(cfg)
+    assert healed == ["llm.provider_ref", "llm.vision_provider_ref", "hearing.provider_ref"]
+    assert cfg.llm.provider_ref == ""
+    assert cfg.llm.vision_provider_ref == ""
+    assert cfg.tts.provider_ref == "speak"    # untouched
+    assert cfg.hearing.provider_ref == ""
+
+
+def test_heal_provider_refs_noop_when_all_valid_or_no_blocks():
+    cfg = AppConfig(providers=[
+        {"id": "b", "name": "B", "category": "llm", "base_url": "http://b/v1", "model": "m"},
+    ])
+    cfg.llm.provider_ref = "b"
+    assert heal_provider_refs(cfg) == []
+    # No blocks at all: nothing to validate against, leave the profile alone.
+    empty = AppConfig()
+    empty.llm.provider_ref = "ghost"
+    assert heal_provider_refs(empty) == []
+    assert empty.llm.provider_ref == "ghost"
+
+
+def test_api_get_config_heals_dangling_refs_from_disk(api):
+    """Simulates a hand-edited YAML: a dangling ref persisted on disk must be
+    blanked by the next GET /api/config, reported once, and stay blank."""
+    import config
+    api.put("/api/providers", json=[
+        {"name": "Speak", "category": "tts", "base_url": "http://t/v1", "model": "t"},
+    ])
+    # Hand-edit equivalent: dangling ref persisted straight to the profile file.
+    cfg = config.load_profile()
+    cfg.tts.provider_ref = "ghost_block"
+    cfg.hearing.provider_ref = "speak"   # wrong category (stt ref -> tts block)
+    config.save_profile(cfg, "default")
+
+    first = api.get("/api/config").json()
+    assert first["healed_refs"] == ["tts.provider_ref", "hearing.provider_ref"]
+    assert first["tts"]["provider_ref"] == ""
+    assert first["hearing"]["provider_ref"] == ""
+
+    # Persisted: a second load is clean (no repeated nagging).
+    second = api.get("/api/config").json()
+    assert second["healed_refs"] == []

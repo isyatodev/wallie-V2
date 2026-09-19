@@ -1,5 +1,10 @@
 profile_name: p-voices
-providers: []
+providers:
+- id: groq
+  name: groq
+  category: stt
+  base_url: https://api.groq.com/openai/v1/chat/completions
+  model: whisper-large-v3
 speaker_id:
   enabled: false
   threshold: 0.68

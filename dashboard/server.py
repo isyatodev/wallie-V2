@@ -31,6 +31,7 @@ from config import (
     delete_profile,
     list_profiles,
     load_profile,
+    heal_provider_refs,
     provider_key_env,
     save_profile,
 )
@@ -382,7 +383,15 @@ def _build_app(
     # ---------- config ----------
     @app.get("/api/config")
     def get_config() -> dict[str, Any]:
-        return load_profile().model_dump()
+        """Serve the active profile. Self-heals dangling provider_refs (refs
+        to deleted blocks or wrong-category blocks, e.g. from hand-edited
+        YAML) — blanked once on disk so the manual edit isn't re-flagged on
+        every load."""
+        cfg = load_profile()
+        healed = heal_provider_refs(cfg)
+        if healed:
+            save_profile(cfg, cfg.profile_name)
+        return {**cfg.model_dump(), "healed_refs": healed}
 
     @app.put("/api/config")
     async def put_config(payload: dict[str, Any]) -> dict[str, Any]:

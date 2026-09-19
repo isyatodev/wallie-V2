@@ -73,6 +73,11 @@
   </style>
 </head>
 <body x-data="app()" x-init="init()" :class="{ 'drawer-open': drawerOpen }">
+  <!-- Server-side self-heal notice (dangling provider_refs) -->
+  <div class="heal-toast" x-show="healedMsg" x-cloak style="display:none" role="status">
+    <span x-text="healedMsg"></span>
+    <button type="button" class="heal-toast-x" @click="dismissHealed()" aria-label="Dismiss">✕</button>
+  </div>
 
 <!-- ============ TOP BAR ============ -->
 <header class="topbar">
