@@ -85,9 +85,13 @@
       What you see below is NOT your saved configuration — do not edit or save.
       Restart the dashboard; if this persists, check profiles/ on disk.</span>
     <button type="button" class="heal-toast-x" @click="loadFailed = false" aria-label="Dismiss">✕</button>
+  </div>  <!-- Saved audio device names that no longer exist on the system -->
+  <div class="heal-toast device-warn-toast" x-show="deviceWarn.tts_output || deviceWarn.loopback" x-cloak style="display:none" role="alert">
+    <span>⚠ Wallie won't hear/speak: <span x-text="[deviceWarn.tts_output && ('voice → ' + deviceWarn.tts_output + ' not found'), deviceWarn.loopback && ('hearing → ' + deviceWarn.loopback + ' not found')].filter(Boolean).join(' · ')"></span>. Re-pick below and save.</span>
+    <button type="button" class="heal-toast-x" @click="deviceWarn = { tts_output: '', loopback: '' }" aria-label="Dismiss">✕</button>
   </div>
 
-<!-- ============ TOP BAR ============ -->
+  <!-- ============ TOP BAR ============ -->
 <header class="topbar">
   <div class="brand">
     <div class="brand-mark"></div>
@@ -448,6 +452,27 @@
             <input type="range" min="0.5" max="2.0" step="0.05" x-model.number="cfg.tts.kokoro_speed" />
           </div>
         </template>
+        <div class="field wide">
+          <label>Output device <button type="button" class="mini-btn" style="float:right;font-size:.72rem;padding:.1rem .55rem"
+            @click="loadAudioDevices()" :disabled="audioDevicesBusy"
+            x-text="audioDevicesBusy ? 'listing…' : 'list devices'"></button>
+            <button type="button" class="mini-btn" style="float:right;font-size:.72rem;padding:.1rem .55rem;margin-right:.4rem"
+            @click="testAudioOutput()" :disabled="audioTestBusy"
+            x-text="audioTestBusy ? 'beeping…' : 'test output'"></button></label>
+          <select x-model="cfg.tts.output_device">
+            <option value="">— system default —</option>
+            <template x-for="d in audioDevices" :key="d.name">
+              <option :value="d.name" :selected="cfg.tts.output_device===d.name" x-text="d.name + (d.api ? ` · ${d.api}` : '') + (d.is_default ? '   ✓ system default' : '')"></option>
+            </template>
+          </select>
+          <small class="hint" x-show="audioDevicesMsg" x-text="audioDevicesMsg"></small>
+          <small class="hint" x-show="!audioDevicesMsg && !audioDevices.length">Where Wallie's voice plays. Leave on <b>system default</b>, or pick an output — e.g. a VB-CABLE feeding your game/OBS. <b>list devices</b> scans your sound outputs.</small>
+          <small class="hint" x-show="!audioDevicesMsg && audioDevices.length">Saved by device name, so it survives Windows renumbering devices on reboot.</small>
+          <small class="warn-banner" style="display:block;margin:8px 0 0;padding:8px 12px" x-show="deviceWarn.tts_output" role="alert">
+            ⚠ Saved output "<span x-text="deviceWarn.tts_output"></span>" is no longer in the system — voice would go to the system default until you re-pick.
+          </small>
+          <small class="hint" x-show="audioTestMsg" x-text="audioTestMsg"></small>
+        </div>
         <template x-if="cfg.tts.provider==='openai_compatible'">
           <div class="field wide">
             <label>Provider block</label>
@@ -1081,6 +1106,26 @@
           <label>Context freshness <span class="slider-val" x-text="cfg.hearing.max_context_age_sec.toFixed(0)+'s'"></span></label>
           <input type="range" min="4" max="30" step="1" x-model.number="cfg.hearing.max_context_age_sec" />
           <small class="hint">How long a heard line stays relevant for fusing with vision.</small>
+        </div>
+        <div class="field wide">
+          <label>Loopback device (listen through) <button type="button" class="mini-btn" style="float:right;font-size:.72rem;padding:.1rem .55rem"
+            @click="loadHearingLoopbacks()" :disabled="hearingLoopTestBusy"
+            x-text="hearingLoopbacks.length ? 're-list' : 'list devices'"></button>
+            <button type="button" class="mini-btn" style="float:right;font-size:.72rem;padding:.1rem .55rem;margin-right:.4rem"
+            @click="testHearingLoopback()" :disabled="hearingLoopTestBusy"
+            x-text="hearingLoopTestBusy ? 'listening…' : 'test listen'"></button></label>
+          <select x-model="cfg.hearing.loopback_device">
+            <option value="">— system default speaker —</option>
+            <template x-for="d in hearingLoopbacks" :key="d.name">
+              <option :value="d.name" :selected="cfg.hearing.loopback_device===d.name" x-text="d.name + (d.is_default ? '   ✓ system default' : '')"></option>
+            </template>
+          </select>
+          <small class="hint" x-show="!hearingLoopbacks.length && !hearingLoopTestMsg">Which output Wallie's ear listens through (WASAPI loopback). Leave on <b>system default</b>, or pick e.g. the cable your game plays on — separate from the TTS output on the Voice page.</small>
+          <small class="hint" x-show="hearingLoopbacks.length">Saved by device name, same as the TTS output device.</small>
+          <small class="warn-banner" style="display:block;margin:8px 0 0;padding:8px 12px" x-show="deviceWarn.loopback" role="alert">
+            ⚠ Saved loopback "<span x-text="deviceWarn.loopback"></span>" is no longer in the system — the ear stays silent until you re-pick.
+          </small>
+          <small class="hint" x-show="hearingLoopTestMsg" x-text="hearingLoopTestMsg"></small>
         </div>
       </div>
       <div x-show="cfg.hearing.enabled" class="test-strip" style="margin-top:14px;">

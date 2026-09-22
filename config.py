@@ -444,6 +444,11 @@ class HearingConfig(BaseModel):
     # Optional: name a specific provider block (category "stt").
     provider_ref: str = ""
     openai_compatible_prompt: str = ""   # optional vocabulary/term hint for the transcription API
+    # Which output to LISTEN through for the WASAPI loopback. "" = the system's
+    # current default speaker. Saved by device name (same scheme as
+    # tts.output_device) so the ear can follow e.g. the game's cable instead of
+    # whatever the OS default happens to be at startup.
+    loopback_device: str = ""
 
 
 class ChatConfig(BaseModel):

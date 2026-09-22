@@ -16,13 +16,18 @@ import pytest
 from config import AppConfig, Runtime, Secrets
 
 
-def _profiled_app(tmp_path, monkeypatch, cfg, orch=None):
-    """Isolated profiles dir + app. get_runtime is patched for the hearing route."""
+def _profiled_app(tmp_path, monkeypatch, cfg, orch=None, activate: bool = False):
+    """Isolated profiles dir + app. get_runtime is patched for the hearing route.
+
+    ``activate=True`` also writes the cfg as the ACTIVE profile (default) —
+    needed by code paths that read load_profile() rather than get_runtime()."""
     import config
     monkeypatch.setattr(config, "PROFILES_DIR", tmp_path)
     monkeypatch.setattr(config, "STATE_FILE", tmp_path / "state.json")
     from config import load_profile, save_profile
     save_profile(cfg, "p-htest")
+    if activate:
+        save_profile(cfg, "default")
     monkeypatch.setattr(
         config, "get_runtime",
         lambda: Runtime(config=load_profile("p-htest"), secrets=Secrets()),
@@ -74,8 +79,9 @@ def _patch_capture(monkeypatch, latest_audio):
     created: list = []
 
     class _FakeCap:
-        def __init__(self, samplerate=16000):
+        def __init__(self, samplerate=16000, device=""):
             self.samplerate = samplerate
+            self.device = device
             self.opened = False
             self.closed = False
             created.append(self)
@@ -112,6 +118,9 @@ def _patch_engine(monkeypatch, result_text="hello world", fail: Exception | None
                 text = result_text
 
             return [_Seg()], {"language": "en"}
+
+        def close(self):
+            created["closed"] = True
 
     monkeypatch.setattr(stt_mod, "RemoteWhisperModel", _FakeEngine)
     return created
@@ -161,6 +170,8 @@ def test_hearing_route_mic_transcribes_and_reports(tmp_path, monkeypatch):
     assert created["model"] == "whisper-large-v3"
     # Also check the engine saw the key from the block env.
     assert created.get("api_key") == "stt-block-key"
+    # The per-request engine must release its HTTP pool on success.
+    assert created.get("closed") is True
 
 
 def test_hearing_route_system_source_uses_loopback_capture(tmp_path, monkeypatch):
@@ -180,6 +191,30 @@ def test_hearing_route_system_source_uses_loopback_capture(tmp_path, monkeypatch
         assert data["text"] == "loopback line"
         assert data["source"] == "system"
         assert caps and caps[0].opened and caps[0].closed
+
+
+def test_hearing_route_loopback_device_from_cfg_and_override(tmp_path, monkeypatch):
+    """The system-source test must capture through the SAME loopback device the
+    live loop uses (cfg.hearing.loopback_device), and the request body may
+    override it so the UI can test an unsaved pick."""
+    cfg = _stt_block_cfg()
+    cfg.hearing.loopback_device = "CABLE Input (VB-Audio Virtual Cable)"
+    app = _profiled_app(tmp_path, monkeypatch, cfg, activate=True)
+    _block_key(monkeypatch)
+    _patch_engine(monkeypatch, result_text="dev line")
+    audio = np.full(80000, 0.01, dtype="float32")
+    caps = _patch_capture(monkeypatch, audio)
+
+    from fastapi.testclient import TestClient
+    with TestClient(app) as client:
+        r = client.post("/api/test/hearing", json={"seconds": 2, "source": "system"})
+        assert r.status_code == 200, r.text
+        assert caps[0].device == "CABLE Input (VB-Audio Virtual Cable)"
+
+        r = client.post("/api/test/hearing", json={"seconds": 2, "source": "system",
+                                                   "device": "Speakers (Realtek)"})
+        assert r.status_code == 200, r.text
+        assert caps[1].device == "Speakers (Realtek)"
 
 
 def test_hearing_route_local_engine_path(tmp_path, monkeypatch):
@@ -227,7 +262,7 @@ def test_hearing_route_local_engine_path(tmp_path, monkeypatch):
 def test_hearing_route_engine_error_surfaces_reason(tmp_path, monkeypatch):
     app = _profiled_app(tmp_path, monkeypatch, _stt_block_cfg())
     _block_key(monkeypatch)
-    _patch_engine(monkeypatch, fail=RuntimeError("openai_compatible (stt) 401: bad key"))
+    created = _patch_engine(monkeypatch, fail=RuntimeError("openai_compatible (stt) 401: bad key"))
     frames = [np.full((16000, 1), 0.1, dtype="float32")] * 4
     _patch_mic(monkeypatch, frames)
 
@@ -236,6 +271,8 @@ def test_hearing_route_engine_error_surfaces_reason(tmp_path, monkeypatch):
         r = client.post("/api/test/hearing", json={"seconds": 5, "source": "mic"})
         assert r.status_code == 400
         assert "401: bad key" in r.json()["detail"]
+        # close() runs even when the engine raises (finally in the route).
+        assert created["closed"] is True
 
 
 def test_hearing_route_remote_without_key_is_actionable(tmp_path, monkeypatch):
@@ -279,6 +316,63 @@ def test_hearing_route_device_error_is_actionable(tmp_path, monkeypatch):
         r = client.post("/api/test/hearing", json={"seconds": 5, "source": "mic"})
         assert r.status_code == 400
         assert "soundcard" in r.json()["detail"]
+
+
+def test_record_mic_initializes_com_before_soundcard(monkeypatch):
+    """Regression: COM was initialized AFTER sc.default_microphone() — but the
+    mic lookup is itself a COM call (MMDevice enumeration), so on executor
+    threads the helper still died with 0x800401f0 (CO_E_NOTINITIALIZED).
+    CoInitialize must precede the FIRST soundcard touch."""
+    import ctypes
+    import types
+
+    events: list[str] = []
+
+    class _FakeOle32:
+        def CoInitialize(self, _pv):
+            events.append("CoInitialize")
+            return 0  # S_OK
+
+        def CoUninitialize(self):
+            events.append("CoUninitialize")
+
+    class _FakeWindll:
+        ole32 = _FakeOle32()
+
+    monkeypatch.setattr(ctypes, "windll", _FakeWindll(), raising=False)
+
+    fake = types.ModuleType("soundcard")
+
+    class _Rec:
+        def __enter__(self):
+            events.append("recorder")
+            return self
+
+        def __exit__(self, *a):
+            events.append("close")
+            return False
+
+        def record(self, numframes):
+            return np.full((numframes, 1), 0.1, dtype="float32")
+
+    class _Mic:
+        def recorder(self, **kw):
+            return _Rec()
+
+    def _default_microphone():
+        events.append("default_microphone")
+        return _Mic()
+
+    fake.default_microphone = _default_microphone
+    monkeypatch.setitem(sys.modules, "soundcard", fake)
+
+    from dashboard.server import _record_mic
+
+    audio = _record_mic(0.5)
+    assert audio.size == 8000  # 0.5 s @ 16 kHz mono
+    assert events[0] == "CoInitialize", f"COM must come first, got {events}"
+    assert events.index("CoInitialize") < events.index("default_microphone")
+    assert events[-1] == "CoUninitialize"  # balanced uninit on the same thread
 
 
 def test_hearing_route_unknown_source_rejected(tmp_path, monkeypatch):

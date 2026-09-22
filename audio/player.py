@@ -43,6 +43,54 @@ def resolve_output_device(spec: Optional[int | str]) -> Optional[int | str]:
     return matches[0]
 
 
+def play_test_beep(device: Optional[int | str] = None) -> dict:
+    """Play a short tone through the given output device (resolver-aware).
+
+    Used by the dashboard's "test output" button next to the device picker,
+    so the user can confirm the TTS destination without a real utterance.
+    """
+    idx = resolve_output_device(device)
+    name = ""
+    sr = 44100
+    try:
+        dev = sd.query_devices(idx)
+        name = str(dev["name"])
+        # WASAPI/WDM-KS endpoints often reject anything but their default
+        # rate (VB-Cable: PaErrorCode -9997 at 44100). Play at the device's
+        # own rate instead of forcing one.
+        sr = int(round(dev.get("default_samplerate") or sr))
+    except Exception:  # noqa: BLE001 — name/rate fall back to defaults
+        pass
+    dur = 0.25
+    t = np.linspace(0.0, dur, int(sr * dur), endpoint=False)
+    # 880 Hz sine with ~20 ms fade in/out so the beep doesn't click.
+    env = np.minimum(1.0, np.minimum(t / 0.02, (dur - t) / 0.02))
+    tone = (0.25 * np.sin(2 * np.pi * 880.0 * t) * env).astype("float32")
+    try:
+        sd.play(tone, sr, device=idx, blocking=True)
+    except Exception as e:  # surface the real reason (unplugged, busy, …)
+        raise RuntimeError(f"could not play on output {device!r}: {e}") from e
+    return {"device": name or ("system default" if idx is None else str(idx)), "index": idx, "seconds": dur}
+
+
+def check_output_device(spec: Optional[int | str]) -> dict:
+    """Does the saved TTS output spec still exist? (dashboard stale-device check)
+
+    Mirrors what real playback would do: run resolve_output_device and see if
+    the result maps to a live output. Empty/None = system default, always
+    valid. Returns {"exists": bool, "name": <concrete device name, "" when
+    unknown>}.
+    """
+    resolved = resolve_output_device(spec)
+    if resolved is None:
+        return {"exists": True, "name": ""}  # system default
+    try:
+        dev = sd.query_devices(resolved)
+        return {"exists": True, "name": str(dev.get("name", ""))}
+    except Exception:  # noqa: BLE001 — index out of range / PortAudio dead
+        return {"exists": False, "name": ""}
+
+
 class AudioPlayer:
     def __init__(
         self,
@@ -192,15 +240,73 @@ class AudioPlayer:
 
 
 def list_output_devices() -> list[dict]:
+    """Enumerate playable outputs for the dashboard's device dropdown.
+
+    One row per device NAME. Windows exposes every endpoint on up to four
+    host APIs (MME/DirectSound/WASAPI/WDM-KS) — and MME truncates names to
+    31 chars ("Alto-falantes (VB-Audio Voiceme") — so rows sharing a full
+    name are merged into one entry whose `api` says what the player will
+    actually pick (WASAPI, via resolve_output_device). Returns [] instead
+    of raising when PortAudio itself is dead (missing drivers, no audio
+    service) — the UI shows "no devices" rather than 500.
+    """
+    try:
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+        default_out = None
+        dev = getattr(sd.default, "device", None)
+        if dev is not None:
+            default_out = dev[1]  # (input, output) pair
+    except Exception:  # noqa: BLE001 — PortAudio uninitialized / device vanished
+        return []
+
+    def _api(i: int) -> str:
+        try:
+            return str(hostapis[devices[i].get("hostapi", 0)]["name"]).replace("Windows ", "")
+        except Exception:  # noqa: BLE001 — cosmetic only
+            return ""
+
+    rows = [
+        {
+            "index": i,
+            "name": d.get("name", ""),
+            "api": _api(i),
+            "default_samplerate": d.get("default_samplerate", 0),
+            "is_default": i == default_out,
+        }
+        for i, d in enumerate(devices)
+        if d.get("max_output_channels", 0) > 0
+    ]
+
+    # Merge multi-API duplicates. MME truncates names to exactly 31 chars, so
+    # a 31-char name that prefixes a longer one is the same physical endpoint.
+    full_names = {r["name"] for r in rows}
+
+    def _canonical(name: str) -> str:
+        if len(name) == 31:
+            for full in full_names:
+                if full != name and full.startswith(name):
+                    return full
+        return name
+
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(_canonical(r["name"]), []).append(r)
+
+    def _rank(api: str) -> int:
+        return {"wasapi": 3, "directsound": 2, "mme": 1}.get(api.lower(), 0)
+
     out = []
-    for i, d in enumerate(sd.query_devices()):
-        if d.get("max_output_channels", 0) > 0:
-            out.append(
-                {
-                    "index": i,
-                    "name": d.get("name", ""),
-                    "hostapi": d.get("hostapi", 0),
-                    "default_samplerate": d.get("default_samplerate", 0),
-                }
-            )
+    for name, rs in groups.items():
+        best = max(rs, key=lambda r: (_rank(r["api"]), -r["index"]))
+        out.append(
+            {
+                "index": best["index"],
+                "name": name,
+                "api": best["api"],
+                "default_samplerate": best["default_samplerate"],
+                "is_default": any(r["is_default"] for r in rs),
+            }
+        )
+    out.sort(key=lambda d: d["name"].lower())
     return out

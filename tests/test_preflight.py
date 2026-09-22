@@ -150,6 +150,59 @@ def test_preflight_hearing_local_missing_dep_is_warn(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Hearing: saved loopback device still exists (live probe, start-blocking)
+# ---------------------------------------------------------------------------
+
+def _with_soundcard_ok(monkeypatch, probe):
+    """Deterministic hearing section: soundcard 'installed', probe injectable."""
+    import wallie
+    monkeypatch.setattr(wallie, "_pf_dep_missing", lambda pkg: pkg == "faster_whisper")
+    import hearing.capture as cap_mod
+    monkeypatch.setattr(cap_mod, "resolve_loopback_device", probe)
+
+
+def test_preflight_hearing_ghost_loopback_device_is_error(tmp_path, monkeypatch):
+    """A saved loopback name that no longer exists must FAIL the start: the
+    capture thread ends immediately (no silent fallback) → a deaf session."""
+    _with_soundcard_ok(
+        monkeypatch, lambda name: {"exists": False, "is_default": False})
+    cfg = AppConfig(hearing={"enabled": True, "loopback_device": "Phantom Cable X"})
+    issues = _issues(cfg, tmp_path)
+    assert any(i["section"] == "Hearing (STT)" and i["level"] == "error"
+               and "Phantom Cable X" in i["message"] and "not in the system" in i["message"]
+               for i in issues)
+
+
+def test_preflight_hearing_existing_loopback_device_passes(tmp_path, monkeypatch):
+    _with_soundcard_ok(
+        monkeypatch, lambda name: {"exists": True, "is_default": False})
+    cfg = AppConfig(hearing={"enabled": True, "loopback_device": "CABLE Input"})
+    issues = _issues(cfg, tmp_path)
+    assert not any("loopback device" in i["message"] for i in issues)
+
+
+def test_preflight_hearing_loopback_probe_failure_is_warn_not_error(tmp_path, monkeypatch):
+    """A broken audio stack during preflight must not block the start on its
+    own — it degrades to a warning (the capture thread will report later)."""
+    def _boom(name):
+        raise RuntimeError("COM went away")
+    _with_soundcard_ok(monkeypatch, _boom)
+    cfg = AppConfig(hearing={"enabled": True, "loopback_device": "CABLE Input"})
+    issues = _issues(cfg, tmp_path)
+    hit = [i for i in issues if "could not verify the loopback" in i["message"]]
+    assert hit and hit[0]["level"] == "warn"
+
+
+def test_preflight_hearing_default_loopback_needs_no_probe(tmp_path, monkeypatch):
+    """An empty loopback name (system default) must not touch the audio stack."""
+    def _nope(name):
+        raise AssertionError("probe must not run for the system default")
+    _with_soundcard_ok(monkeypatch, _nope)
+    cfg = AppConfig(hearing={"enabled": True})
+    assert not any("loopback" in i["message"] for i in _issues(cfg, tmp_path))
+
+
+# ---------------------------------------------------------------------------
 # Vision
 # ---------------------------------------------------------------------------
 

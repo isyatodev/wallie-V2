@@ -57,14 +57,19 @@ class RemoteWhisperModel:
         self._prompt = (prompt or "").strip()
         self._samplerate = samplerate
         self._base_url = base
-        self._client = httpx.AsyncClient(
+        # Sync client ON PURPOSE: every caller (HearingLoop, the dashboard's
+        # hearing test) runs transcribe() in a worker thread via
+        # run_in_executor — there is no running event loop there, so an
+        # AsyncClient would only return un-awaited coroutines and blow up with
+        # "'coroutine' object has no attribute 'status_code'".
+        self._client = httpx.Client(
             timeout=httpx.Timeout(max(timeout, 20.0), connect=5.0),
             headers={"Authorization": f"Bearer {api_key}"},
         )
         logger.info(f"hearing: remote STT endpoint {base} (model={self._model})")
 
-    # HearingLoop calls this from a worker thread via run_in_executor — httpx's
-    # sync API is used intentionally here (same as faster-whisper's blocking call).
+    # HearingLoop calls this from a worker thread via run_in_executor — a
+    # blocking call, same as faster-whisper's (hence the sync client above).
     def transcribe(self, audio: "np.ndarray", **_kwargs: Any) -> tuple[list[_Segment], Any]:
         pcm16 = np.clip(audio, -1.0, 1.0)
         pcm16 = (pcm16 * 32767.0).astype("<i2")
@@ -97,6 +102,10 @@ class RemoteWhisperModel:
     @property
     def supports_word_timestamps(self) -> bool:
         return False
+
+    def close(self) -> None:
+        """Release the HTTP connection pool (mirrors httpx clients)."""
+        self._client.close()
 
 
 class LocalWhisperModel:

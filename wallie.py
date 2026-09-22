@@ -493,6 +493,21 @@ def preflight(runtime: Optional[Runtime] = None) -> list[dict]:
                 "local engine selected but faster-whisper is not installed (pip install faster-whisper)")
         if _pf_dep_missing("soundcard"):
             add("warn", "Hearing (STT)", "package 'soundcard' not installed — audio capture will fail")
+        elif (hearing.loopback_device or "").strip():
+            # LIVE check: a saved loopback name that no longer exists would make
+            # the capture thread end immediately (by design there is no silent
+            # fallback) — the ear would be deaf for the whole session. Fail the
+            # start instead. An empty name (system default) needs no check: if
+            # the audio stack itself is broken, the dep warning above says so.
+            from hearing.capture import resolve_loopback_device
+            try:
+                res = resolve_loopback_device(hearing.loopback_device)
+                if not res.get("exists"):
+                    add("error", "Hearing (STT)",
+                        f"loopback device '{hearing.loopback_device}' is not in the system "
+                        "anymore — the ear would stay silent. Re-pick it on the Hearing page")
+            except Exception as e:  # noqa: BLE001 — never break preflight on probe failure
+                add("warn", "Hearing (STT)", f"could not verify the loopback device: {e}")
 
     # ---- Vision — build falls back / disables, so warns (except bad config) ----
     if cfg.vision.enabled:
@@ -722,6 +737,8 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
                 speaker_identifier=_speaker_id,
                 enrollment_buffer=_enrollment_buffer,
             )
+            if getattr(cfg.hearing, "loopback_device", "").strip():
+                logger.info(f"hearing: loopback device = {cfg.hearing.loopback_device!r}")
             if getattr(cfg.hearing, "engine", "") == "openai_compatible":
                 prov = _resolve_provider_inner("stt", ref=getattr(cfg.hearing, "provider_ref", ""))
                 try:

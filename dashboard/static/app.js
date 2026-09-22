@@ -109,10 +109,10 @@ function emptyCfg() {
       vision_first_person: true, vision_commentary_density: "balanced",
     },
     llm: { provider: "groq", model: "", temperature: 0.85, top_p: 0.95, max_tokens: 500, presence_penalty: 0.3, frequency_penalty: 0.4, vision_capable: false, ollama_base_url: "http://localhost:11434", ollama_keep_alive: "5m", vision_provider: "main", vision_model: "", vision_provider_ref: "", vision_openai_compatible_base_url: "", vision_openai_compatible_timeout: 30, vision_max_tokens: 200, provider_ref: "", openai_compatible_base_url: "", openai_compatible_timeout: 25 },
-    tts: { provider: "fish", voice_id: "", sample_rate: 24000, el_model_id: "eleven_turbo_v2_5", el_stability: 0.45, el_similarity_boost: 0.75, el_style: 0.0, fish_latency_mode: "balanced", fish_chunk_length: 100, piper_model_path: "", piper_length_scale: 1.0, kokoro_voice: "af_heart", kokoro_lang_code: "a", kokoro_speed: 1.0, openai_compatible_base_url: "", openai_compatible_model: "", openai_compatible_timeout: 30, openai_compatible_voice: "alloy", openai_compatible_speed: 1.0, openai_compatible_pcm_sample_rate: 24000, provider_ref: "" },
+    tts: { provider: "fish", voice_id: "", sample_rate: 24000, el_model_id: "eleven_turbo_v2_5", el_stability: 0.45, el_similarity_boost: 0.75, el_style: 0.0, fish_latency_mode: "balanced", fish_chunk_length: 100, piper_model_path: "", piper_length_scale: 1.0, kokoro_voice: "af_heart", kokoro_lang_code: "a", kokoro_speed: 1.0, openai_compatible_base_url: "", openai_compatible_model: "", openai_compatible_timeout: 30, openai_compatible_voice: "alloy", openai_compatible_speed: 1.0, openai_compatible_pcm_sample_rate: 24000, provider_ref: "", output_device: "" },
     vision: { enabled: false, source: "monitor", monitor_index: 1, interval_sec: 3.0, min_change_threshold: 8, max_edge_px: 768, startup_delay_sec: 5 },
     play: { enabled: false, game: "minecraft", goal: "Build a thriving Minecraft empire LIVE for an audience — gather, craft full gear, build, fight and explore. Make the journey entertaining, not a speedrun.", talk_from_agent: true, hide_chat: true, avoid_water: true },
-    hearing: { enabled: false, window_sec: 5.0, model_size: "small", language: "", silence_threshold: 0.006, sound_event_threshold: 0.06, max_context_age_sec: 12.0, engine: "", openai_compatible_base_url: "", openai_compatible_model: "whisper-1", openai_compatible_timeout: 20, openai_compatible_prompt: "", provider_ref: "", speaker_id: { enabled: false, threshold: 0.68, unknown_threshold: 0.45, collect_other_voices: false } },
+    hearing: { enabled: false, window_sec: 5.0, model_size: "small", language: "", silence_threshold: 0.006, sound_event_threshold: 0.06, max_context_age_sec: 12.0, engine: "", openai_compatible_base_url: "", openai_compatible_model: "whisper-1", openai_compatible_timeout: 20, openai_compatible_prompt: "", provider_ref: "", loopback_device: "", speaker_id: { enabled: false, threshold: 0.68, unknown_threshold: 0.45, collect_other_voices: false } },
     speaker_id: { enabled: false, threshold: 0.68, unknown_threshold: 0.45, collect_other_voices: false },
     providers: [],
     chat: { youtube_enabled: false, twitch_enabled: false, kick_enabled: false, reply_probability: 0.35, min_reply_interval_sec: 8.0, max_message_age_sec: 45.0 },
@@ -284,6 +284,20 @@ function app() {
     ttsVoicesSource: "",
     ttsVoicesBusy: false,
     ttsVoicesMsg: "",
+    // Output-device discovery (Voice page): where TTS audio is played.
+    audioDevices: [],
+    audioDevicesBusy: false,
+    audioDevicesMsg: "",
+    audioTestBusy: false,
+    audioTestMsg: "",
+    // Loopback devices for HEARING (what Wallie listens through) — separate
+    // from the TTS output device above.
+    hearingLoopbacks: [],
+    hearingLoopTestBusy: false,
+    hearingLoopTestMsg: "",
+    // Saved device names that no longer exist on the system (checked right
+    // after every save — empty strings mean no warning is showing).
+    deviceWarn: { tts_output: "", loopback: "" },
 
     // Vision model discovery (Vision page, openai_compatible provider)
     vlModels: [],
@@ -298,6 +312,9 @@ function app() {
     async init() {
       await this.loadProfiles();
       await this.loadConfig();
+      this.loadAudioDevices(); // so the Output-device dropdown shows the saved pick
+      this.loadHearingLoopbacks(); // so the Hearing loopback dropdown shows the saved pick
+      this.checkSavedDevices(); // warn if a saved device name no longer exists
       await this.refreshStatus();
       await this.loadSecrets();
       await this.loadProviders();
@@ -338,7 +355,91 @@ function app() {
       }
     },
 
-    // ----- Vision model discovery (Vision page) -----
+    // ----- Output-device discovery (Voice page) -----
+    async loadAudioDevices() {
+      if (this.audioDevicesBusy) return;
+      this.audioDevicesBusy = true;
+      this.audioDevicesMsg = "";
+      try {
+        const r = await fetch("/api/audio-devices");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+        // Backend already merges the same endpoint across host APIs (MME
+        // truncates names to 31 chars) and flags the system default.
+        this.audioDevices = Array.isArray(data) ? data.filter(d => d && d.name) : [];
+        // One-time migration: an old saved index becomes its device name, so
+        // the dropdown matches and the value survives device renumbering.
+        const cur = String(this.cfg.tts.output_device || "");
+        if (cur && /^\d+$/.test(cur)) {
+          const hit = (Array.isArray(data) ? data : []).find(d => String(d.index) === cur);
+          if (hit) this.cfg.tts.output_device = hit.name;
+        }
+        this.audioDevicesMsg = this.audioDevices.length
+          ? `${this.audioDevices.length} output device${this.audioDevices.length === 1 ? "" : "s"} found`
+          : "no output devices found — check your audio drivers";
+      } catch (e) {
+        this.audioDevices = [];
+        this.audioDevicesMsg = "✗ " + (e.message || e);
+      } finally {
+        this.audioDevicesBusy = false;
+      }
+    },
+
+    async testAudioOutput() {
+      if (this.audioTestBusy) return;
+      this.audioTestBusy = true;
+      this.audioTestMsg = "";
+      try {
+        const r = await fetch("/api/test/audio-output", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ device: this.cfg.tts.output_device || "" }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+        this.audioTestMsg = "✓ beep on " + (data.device || "default output");
+      } catch (e) {
+        this.audioTestMsg = "✗ " + (e.message || e);
+      } finally {
+        this.audioTestBusy = false;
+        setTimeout(() => (this.audioTestMsg = ""), 6000);
+      }
+    },
+
+    // ----- Hearing loopback device (Hearing page) -----
+    async loadHearingLoopbacks() {
+      try {
+        const r = await fetch("/api/loopback-devices");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+        this.hearingLoopbacks = Array.isArray(data) ? data : [];
+      } catch (e) {
+        this.hearingLoopbacks = [];
+        this.hearingLoopTestMsg = "✗ " + (e.message || e);
+      }
+    },
+
+    async testHearingLoopback() {
+      if (this.hearingLoopTestBusy) return;
+      this.hearingLoopTestBusy = true;
+      this.hearingLoopTestMsg = "… listening (3s)";
+      try {
+        const r = await fetch("/api/test/hearing", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ seconds: 3, source: "system", device: this.cfg.hearing.loopback_device || "" }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+        this.hearingLoopTestMsg = "✓ heard: " + (data.text || "(only sound/silence)");
+      } catch (e) {
+        this.hearingLoopTestMsg = "✗ " + (e.message || e);
+      } finally {
+        this.hearingLoopTestBusy = false;
+        setTimeout(() => (this.hearingLoopTestMsg = ""), 8000);
+      }
+    },
+
     async loadVisionModels() {
       if (this.vlModelsBusy) return;
       this.vlModelsBusy = true;
@@ -890,6 +991,27 @@ function app() {
       this.healedMsg = "";
     },
 
+    // ----- saved-device existence check (TTS output + hearing loopback) -----
+    async checkSavedDevices() {
+      try {
+        const r = await fetch("/api/device-check", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tts_output: this.cfg.tts.output_device || "",
+            loopback: this.cfg.hearing.loopback_device || "",
+          }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+        const names = (k) => (data[k] && data[k].exists === false) ? (this.cfg[k === "tts_output" ? "tts" : "hearing"][k === "tts_output" ? "output_device" : "loopback_device"] || "") : "";
+        this.deviceWarn = { tts_output: names("tts_output"), loopback: names("loopback") };
+      } catch (e) {
+        // Check is best-effort: a failed probe never blocks saving.
+        this.deviceWarn = { tts_output: "", loopback: "" };
+      }
+    },
+
     async save() {
       // Fold the seed-topics textarea back into the list before saving.
       if (this.cfg.random_thoughts) {
@@ -907,6 +1029,10 @@ function app() {
           throw new Error(detail.detail || `HTTP ${r.status}`);
         }
         this.saveMsg = "saved";
+        // Check AFTER persisting, against what is actually on disk now: the
+        // saved TTS output / hearing loopback names may point at devices that
+        // no longer exist (unplugged headset, Windows audio device change).
+        this.checkSavedDevices();
       } catch (e) {
         // Keep the message on screen longer — a 1.4s "fail" flash is easy
         // to miss, and the user may believe the change was persisted.

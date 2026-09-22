@@ -20,7 +20,8 @@ from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.responses import Response
 
-from audio.player import list_output_devices
+from audio.player import check_output_device, list_output_devices, play_test_beep
+from hearing.capture import list_loopback_devices, resolve_loopback_device
 from config import (
     AppConfig,
     ProviderBlock,
@@ -179,9 +180,19 @@ class TestVoiceBody(BaseModel):
     text: str
 
 
+class TestAudioOutputBody(BaseModel):
+    device: str = ""  # output-device name ("" = system default)
+
+
+class DeviceCheckBody(BaseModel):
+    tts_output: str = ""       # cfg.tts.output_device ("" = system default)
+    loopback: str = ""         # cfg.hearing.loopback_device ("" = system default)
+
+
 class TestHearingBody(BaseModel):
     seconds: float = 5.0
     source: str = "system"  # "system" = WASAPI loopback, "mic" = default microphone
+    device: str = ""        # loopback override ("" = cfg.hearing.loopback_device or system default)
 
 
 class TestExpressionBody(BaseModel):
@@ -244,12 +255,10 @@ def _record_mic(seconds: float) -> Any:
         raise RuntimeError(f"soundcard not available: {e}")
     import numpy as np
 
-    mic = sc.default_microphone()
-    if mic is None:
-        raise RuntimeError("no default microphone found")
-    sr = 16000
-    chunk = max(1, int(sr * 0.25))
-    frames: list[Any] = []
+    # COM FIRST — before any soundcard call. The microphone lookup is itself a
+    # COM operation (MMDevice enumeration), so initializing after it still
+    # dies with 0x800401f0 (CO_E_NOTINITIALIZED) on worker threads. Same rule
+    # the capture loop follows (hearing/capture.py).
     _co_done = False
     try:
         from ctypes import windll
@@ -258,6 +267,12 @@ def _record_mic(seconds: float) -> Any:
     except Exception:  # noqa: BLE001 — non-Windows or no COM
         _co_done = False
     try:
+        mic = sc.default_microphone()
+        if mic is None:
+            raise RuntimeError("no default microphone found")
+        sr = 16000
+        chunk = max(1, int(sr * 0.25))
+        frames: list[Any] = []
         with mic.recorder(samplerate=sr, channels=1, blocksize=chunk) as rec:
             remaining = seconds
             while remaining > 0:
@@ -419,10 +434,45 @@ def _build_app(
     def audio_devices() -> list[dict[str, Any]]:
         return list_output_devices()
 
+    @app.get("/api/loopback-devices")
+    def loopback_devices() -> list[dict[str, Any]]:
+        """Speakers the hearing loopback can listen through (soundcard's view)."""
+        return list_loopback_devices()
+
+    @app.post("/api/device-check")
+    def device_check(body: DeviceCheckBody) -> dict[str, Any]:
+        """Do the saved audio device NAMES still exist? (post-save stale warning)
+
+        Both fields are saved by name; a device that disappeared between saves
+        (unplugged headset, Windows audio change) would otherwise fail silently
+        at playback/capture time. Sync def → threadpool; the soundcard check
+        COM-initializes on its own thread (see hearing.capture)."""
+        try:
+            return {"tts_output": check_output_device(body.tts_output),
+                    "loopback": resolve_loopback_device(body.loopback)}
+        except Exception as e:  # noqa: BLE001 — never block a save on the warning
+            logger.warning(f"dashboard: device check failed: {e}")
+            return {"tts_output": {"exists": True, "name": ""},
+                    "loopback": {"exists": True, "is_default": False}}
+
+    @app.post("/api/test/audio-output")
+    def api_test_audio_output(body: TestAudioOutputBody) -> dict[str, Any]:
+        """Play a short beep through the chosen output device so the user can
+        confirm where the TTS voice will play. Sync def → threadpool worker,
+        so the blocking sd.play() never stalls the event loop."""
+        try:
+            return play_test_beep(body.device or None)
+        except Exception as e:
+            logger.warning(f"dashboard: test output beep failed: {e}")
+            raise HTTPException(status_code=400, detail=str(e)[:220])
+
     @app.get("/api/preflight")
-    async def api_preflight() -> list[dict[str, str]]:
+    def api_preflight() -> list[dict[str, str]]:
         """Pre-start checklist: static config problems the session would hit.
-        No side effects, no network calls — the Start button runs this first."""
+        No side effects, no network calls — the Start button runs this first.
+        Sync def (not async) ON PURPOSE: preflight may probe saved audio
+        devices, and the soundcard needs COM on the calling thread — a
+        threadpool worker COM-initializes itself, the event loop must not."""
         from wallie import preflight
         try:
             return preflight()
@@ -1469,7 +1519,13 @@ def _build_app(
             if source == "mic":
                 audio = await asyncio.to_thread(_record_mic, seconds)
             else:
-                cap = SystemAudioCapture(samplerate=16000)
+                # Same loopback device the live loop listens through
+                # (cfg.hearing.loopback_device; "" = system default speaker).
+                # body.device lets the UI test an UNSAVED pick first.
+                cap = SystemAudioCapture(
+                    samplerate=16000,
+                    device=((body.device or getattr(cfg.hearing, "loopback_device", "")) or ""),
+                )
                 cap.open()
                 try:
                     # Let the ring buffer fill before grabbing — same rule the
@@ -1515,7 +1571,10 @@ def _build_app(
             )
             # The engine accepts numpy frames; the transcription call is
             # blocking (httpx sync) so it runs on this worker thread.
-            segs, _info = engine.transcribe(audio)
+            try:
+                segs, _info = engine.transcribe(audio)
+            finally:
+                engine.close()  # per-request engine — release its connection pool
             return " ".join(s.text.strip() for s in segs).strip()
 
         try:

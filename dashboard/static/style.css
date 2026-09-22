@@ -934,3 +934,12 @@ input[type=password]:focus-visible, select:focus-visible, textarea:focus-visible
 }
 .load-fail-toast .heal-toast-x { color: #fca5a5; }
 .load-fail-toast .heal-toast-x:hover { color: #fff; }
+
+/* Stale saved audio device (TTS output / hearing loopback): amber variant. */
+.device-warn-toast {
+  background: rgba(245,158,11,.10);
+  border-color: rgba(245,158,11,.45);
+  color: #f7cc7c;
+}
+.device-warn-toast .heal-toast-x { color: #f7cc7c; }
+.device-warn-toast .heal-toast-x:hover { color: #fff; }

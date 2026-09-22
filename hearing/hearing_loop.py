@@ -97,7 +97,10 @@ class HearingLoop:
                  enrollment_buffer: Optional[Any] = None) -> None:
         self._cfg = cfg
         self._queue = out_queue
-        self._capture = SystemAudioCapture(samplerate=16000)
+        self._capture = SystemAudioCapture(
+            samplerate=16000,
+            device=getattr(cfg, "loopback_device", "") or "",
+        )
         self._model = None
         # Remote STT (OpenAI-compatible) credentials, injected by wallie.build_orchestrator.
         self._stt_api_key: str = ""

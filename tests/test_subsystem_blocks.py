@@ -191,6 +191,61 @@ def test_remote_stt_encodes_wav_and_parses_text():
     assert wf.getnchannels() == 1
 
 
+def test_remote_stt_client_is_sync_not_async(monkeypatch):
+    """Regression: the engine was built with httpx.AsyncClient but transcribe()
+    runs blocking on executor threads — the post() returned an un-awaited
+    coroutine and blew up with "'coroutine' object has no attribute
+    'status_code'". The client must be the sync httpx.Client."""
+    import httpx
+
+    import numpy as np
+
+    from hearing.openai_stt import RemoteWhisperModel
+
+    m = RemoteWhisperModel(api_key="k", base_url="https://x/v1")
+    assert isinstance(m._client, httpx.Client)
+    assert not isinstance(m._client, httpx.AsyncClient)
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"text": "sync ok"}
+
+    captured: dict = {}
+
+    def _post(self, url, **kw):
+        captured["url"] = url
+        return _Resp()
+
+    monkeypatch.setattr(httpx.Client, "post", _post)
+    segs, _info = m.transcribe(np.zeros(1600, dtype="float32"))
+    assert segs[0].text == "sync ok"
+    assert captured["url"] == "https://x/v1/audio/transcriptions"
+
+
+def test_remote_stt_http_error_raises_with_status(monkeypatch):
+    """The sync client's response status still surfaces as a RuntimeError."""
+    import httpx
+    import pytest
+
+    import numpy as np
+
+    from hearing.openai_stt import RemoteWhisperModel
+
+    m = RemoteWhisperModel(api_key="k", base_url="https://x/v1")
+
+    class _Resp:
+        status_code = 401
+        text = '{"error": "bad key"}'
+
+    monkeypatch.setattr(httpx.Client, "post", lambda self, url, **kw: _Resp())
+    with pytest.raises(RuntimeError, match="401"):
+        m.transcribe(np.zeros(1600, dtype="float32"))
+
+
+
 # ---------------------------------------------------------------------------
 # Vision: dedicated OpenAI-compatible block
 # ---------------------------------------------------------------------------
