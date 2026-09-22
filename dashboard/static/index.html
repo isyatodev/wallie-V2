@@ -79,6 +79,14 @@
     <button type="button" class="heal-toast-x" @click="dismissHealed()" aria-label="Dismiss">✕</button>
   </div>
 
+  <!-- Settings could NOT be loaded from disk: nothing shown below is real -->
+  <div class="heal-toast load-fail-toast" x-show="loadFailed" x-cloak style="display:none" role="alert">
+    <span>⚠ Settings could not be loaded (<span x-text="loadErrorMsg"></span>).
+      What you see below is NOT your saved configuration — do not edit or save.
+      Restart the dashboard; if this persists, check profiles/ on disk.</span>
+    <button type="button" class="heal-toast-x" @click="loadFailed = false" aria-label="Dismiss">✕</button>
+  </div>
+
 <!-- ============ TOP BAR ============ -->
 <header class="topbar">
   <div class="brand">
@@ -133,7 +141,7 @@
       </button>
     </template>
     <div class="nav-spacer"></div>
-    <button class="nav-item save-nav" @click="save()">
+    <button class="nav-item save-nav" @click="if (loadFailed) { return; } save()" :disabled="loadFailed" :style="loadFailed ? 'opacity:.45;cursor:not-allowed' : ''">
       <span class="nav-ico">💾</span>
       <span class="nav-label">Save</span>
       <span class="save-chip" x-show="saveMsg" x-text="saveMsg"></span>

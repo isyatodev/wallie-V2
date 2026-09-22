@@ -257,6 +257,11 @@ function app() {
     providerCategories: ["llm", "vision", "tts", "stt", "memory", "thoughts"],
     providerBusy: false,      providerMsg: "",
       healedMsg: "",
+    // Persisted-load failure: when /api/config can't be read the UI would
+    // otherwise show factory defaults as if they were the user's settings,
+    // and a save in that state would OVERWRITE the profile with defaults.
+    loadFailed: false,
+    loadErrorMsg: "",
     // Voice-print speaker ID
     speakersInfo: { speakers: [], clips: [], enrolling: 0, active: false },
     enrollName: "",
@@ -852,8 +857,21 @@ function app() {
 
     // ----- config I/O -----
     async loadConfig() {
-      const r = await fetch("/api/config");
-      const fetched = await r.json();
+      this.loadFailed = false;
+      this.loadErrorMsg = "";
+      let fetched = null;
+      try {
+        const r = await fetch("/api/config");
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        fetched = await r.json();
+      } catch (e) {
+        // Never merge an error body (or nothing) over the empty cfg: the UI
+        // would show factory defaults as if they were the user's saved
+        // settings, and a save in that state would WIPE the profile.
+        this.loadFailed = true;
+        this.loadErrorMsg = String(e.message || e);
+        return;
+      }
       // Self-heal notice: the server blanked refs that pointed at deleted /
       // wrong-category blocks (typically a hand-edited YAML profile).
       if (Array.isArray(fetched.healed_refs) && fetched.healed_refs.length) {
@@ -878,12 +896,24 @@ function app() {
         this.cfg.random_thoughts.seed_topics = (this.cfg.random_thoughts.seed_topics_text || "")
           .split("\n").map(s => s.trim()).filter(Boolean);
       }
-      const r = await fetch("/api/config", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(this.cfg),
-      });
-      this.saveMsg = r.ok ? "saved" : "fail";
+      try {
+        const r = await fetch("/api/config", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(this.cfg),
+        });
+        if (!r.ok) {
+          const detail = await r.json().catch(() => ({}));
+          throw new Error(detail.detail || `HTTP ${r.status}`);
+        }
+        this.saveMsg = "saved";
+      } catch (e) {
+        // Keep the message on screen longer — a 1.4s "fail" flash is easy
+        // to miss, and the user may believe the change was persisted.
+        this.saveMsg = "✗ save failed: " + (e.message || e);
+        setTimeout(() => (this.saveMsg = ""), 6000);
+        return;
+      }
       setTimeout(() => (this.saveMsg = ""), 1400);
     },
 

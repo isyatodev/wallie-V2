@@ -925,3 +925,12 @@ input[type=password]:focus-visible, select:focus-visible, textarea:focus-visible
   font-size: 13px; padding: 0 2px; line-height: 1;
 }
 .heal-toast-x:hover { color: #fff; }
+
+/* Load-failure banner: red variant of the heal toast. */
+.load-fail-toast {
+  background: rgba(239,68,68,.12);
+  border-color: rgba(239,68,68,.45);
+  color: #fca5a5;
+}
+.load-fail-toast .heal-toast-x { color: #fca5a5; }
+.load-fail-toast .heal-toast-x:hover { color: #fff; }
