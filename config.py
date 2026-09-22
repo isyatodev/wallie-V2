@@ -270,6 +270,18 @@ class PersonaConfig(BaseModel):
     # hosting a show: short turns, replies to what the other person actually said,
     # no audience/monologue framing.
     conversational: bool = False
+    # Credit guard: when True, Wallie only answers a user input that shows the
+    # user is engaging HER — mentioned her name/handle, continues the thread
+    # she opened, is replying to what she just said, or is clearly on her
+    # current topic. Everything else is skipped (chat) or kept as context only
+    # (hearing) so no LLM call is spent answering an empty room. See
+    # core/engagement.py.
+    require_engagement: bool = False
+    # When the engagement gate skips an input, this is the chance it sends a
+    # SHORT canned acknowledgement instead of full silence — so the room knows
+    # she heard them without spending an LLM call. 0 = never, 0.25 = a quarter
+    # of gated-out inputs, 1 = every one (still throttled: max one per 45s).
+    acknowledge_rate: float = 0.25
     reveal_ai: bool = False          # openly an AI; owns it, can joke about it
     plug_url: str = ""               # soft self-plug (e.g. github) when someone's curious
     plug_rate: float = 0.15          # 0 = never bring it up unprompted; higher = more readily

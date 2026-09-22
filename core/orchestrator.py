@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 from vision.scene_classifier import ChangeType, ScreenActivity
 from vision.vision_memory import SceneMemory, UserBehaviorTracker
 from core.attention import AttentionEngine, VisionDirective, VisionReaction
+from core.engagement import EngagementGate, is_low_value_chat, pick_ack
 from core.mood import MoodEngine
 from core.memory_store import MemoryStore
 from core.live_activity import get_activity as _live_activity
@@ -118,6 +119,23 @@ class Orchestrator:
         self._streamlabs_monitor: Any = None
         self._last_reacted_heard: str = ""   # last audio context Wallie reacted to
         self._last_hearing_turn_ts: float = 0.0
+        # Engagement gate (persona.require_engagement): drops user-initiated turns
+        # that show nobody is actually talking TO Wallie — before the LLM is paid.
+        self._engagement = EngagementGate(
+            name=self._cfg.persona.name,
+            aliases=[self._cfg.persona.handle],
+        )
+        # Canned-acknowledgement state (persona.acknowledge_rate) — see
+        # _maybe_acknowledge.
+        self._last_ack_ts: float = 0.0
+        self._ack_pending: bool = False
+        # Engagement-gate session stats, surfaced in /api/status for the
+        # dashboard panel. The deque keeps the last few SKIPPED inputs as
+        # examples (bounded — a busy chat must not grow this forever).
+        self._gate_stats: dict[str, int] = {"chat_replied": 0, "chat_skipped": 0,
+                                            "chat_low_value": 0, "acks_sent": 0,
+                                            "hearing_skipped": 0}
+        self._gate_examples: deque[str] = deque(maxlen=8)
         # Rolling log of (ts, normalized_text) Wallie recently SPOKE — used to reject
         # self-echo in the hearing transcript (our own TTS bleeding through loopback).
         self._recent_spoken: "deque[tuple[float, str]]" = deque(maxlen=24)
@@ -347,6 +365,15 @@ class Orchestrator:
                 if (self._thoughts is not None and self._cfg.random_thoughts.enabled)
                 else None
             ),
+            "engagement_gate": {
+                "enabled": self._cfg.persona.require_engagement,
+                "chat_replied": self._gate_stats["chat_replied"],
+                "chat_skipped": self._gate_stats["chat_skipped"],
+                "chat_low_value": self._gate_stats["chat_low_value"],
+                "acks_sent": self._gate_stats["acks_sent"],
+                "hearing_skipped": self._gate_stats["hearing_skipped"],
+                "examples": list(self._gate_examples),
+            },
         }
 
     # --- main loop ---
@@ -457,10 +484,13 @@ class Orchestrator:
             is_speech = bool(heard) and not heard.startswith("(")
             if (is_speech and heard != self._last_reacted_heard
                     and now_h - self._last_hearing_turn_ts >= self._cfg.hearing.reply_gate_sec):
-                self._last_reacted_heard = heard
-                self._last_hearing_turn_ts = now_h
-                self._mood.on_scene_change()
-                return Intent(kind="hearing", heard=heard, urgent=True)
+                if not self._hearing_engaged(heard):
+                    self._last_reacted_heard = heard  # gated out — don't retry the same line
+                else:
+                    self._last_reacted_heard = heard
+                    self._last_hearing_turn_ts = now_h
+                    self._mood.on_scene_change()
+                    return Intent(kind="hearing", heard=heard, urgent=True)
 
         # PLAY MODE: when Wallie is playing (e.g. Minecraft), the commentary is grounded in the
         # agent's REAL actions and runs on its own cadence — fully independent of the Vision toggle.
@@ -580,10 +610,13 @@ class Orchestrator:
             now_h = time.time()
             if (heard and heard != self._last_reacted_heard
                     and now_h - self._last_hearing_turn_ts >= self._cfg.hearing.reply_gate_sec):
-                self._last_reacted_heard = heard
-                self._last_hearing_turn_ts = now_h
-                self._mood.on_scene_change()
-                return Intent(kind="hearing", heard=heard, urgent=False)
+                if not self._hearing_engaged(heard):
+                    self._last_reacted_heard = heard  # gated out — don't retry the same line
+                else:
+                    self._last_reacted_heard = heard
+                    self._last_hearing_turn_ts = now_h
+                    self._mood.on_scene_change()
+                    return Intent(kind="hearing", heard=heard, urgent=False)
 
         if self._cfg.vision.organic_vision and self._attention.should_hold_silence(
             mood_silence_probability=self._mood.silence_probability(),
@@ -834,11 +867,73 @@ class Orchestrator:
         if self._on_break:
             self._break_event.set()
 
+    def _hearing_engaged(self, heard: str) -> bool:
+        """Engagement-gate a heard line: reply only when the speech is aimed at
+        Wallie or continues her thread. Music/sound events (wrapped in parens)
+        and self-echo never reach the hearing turns, so only real speech lands
+        here. The streamer/owner voice always passes."""
+        if not self._cfg.persona.require_engagement:
+            return True
+        speaker = self._fresh_speaker()
+        if speaker and speaker not in ("other", "unknown"):
+            return True  # an enrolled voice (owner/named) is always let in
+        text = heard
+        if text.startswith("[") and "]" in text:   # strip the "[name] " label
+            text = text.split("]", 1)[1].strip()
+        ok, reason = self._engagement.should_reply(text)
+        if not ok:
+            self._gate_stats["hearing_skipped"] += 1
+            self._gate_examples.appendleft(f"[voice] {heard}")
+            logger.info(f"hearing gate: ignored ({reason}): {heard[:60]}")
+        return ok
+
     def _note_streamer_identity(self, msg: ChatMessage) -> None:
         """Capture the broadcaster's name the first time the chat platform
         identifies one (Twitch broadcaster badge). Never hardcoded."""
         if not self._streamer_name and getattr(msg, "is_streamer", False) and msg.username:
             self.set_streamer_name(msg.username)
+
+    def _maybe_acknowledge(self, preview: str) -> None:
+        """Occasionally speak a SHORT canned acknowledgement for a gated-out input.
+
+        Runs on the loop thread right after the gate decides not to answer. No
+        LLM is involved — that is the whole point: the room learns she heard
+        them, for the price of one TTS sentence. Throttled to one per 45s so a
+        noisy chat doesn't turn into a metronome of 'hmm's, and skipped
+        entirely while she is already speaking.
+        """
+        if random.random() >= self._cfg.persona.acknowledge_rate:
+            return
+        now = time.time()
+        if now - self._last_ack_ts < 45.0 or self._ack_pending:
+            return
+        if self._player.speaking_recently(2.5):
+            return
+        line = pick_ack()
+        self._last_ack_ts = now
+        self._ack_pending = True
+        self._gate_stats["acks_sent"] += 1
+        logger.info(f"engagement: ack (gated: {preview[:60]}) → {line!r}")
+
+        async def _speak() -> None:
+            try:
+                self._note_spoken(line)
+                self._conv.add_assistant(line, source="ack")
+                audio = await self._buffer_tts(line)
+                await self._play_buffered(line, audio)
+            except Exception as e:
+                logger.warning(f"engagement: ack failed: {e}")
+            finally:
+                self._ack_pending = False
+                self._last_segment_spoken_ts = time.time()
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop in this context (sync callers): the ack is best-effort.
+            self._ack_pending = False
+            return None
+        return loop.create_task(_speak())
 
     def _pop_highlight_chat_peek(self) -> Optional[ChatMessage]:
         if not self._chat:
@@ -896,6 +991,29 @@ class Orchestrator:
             logger.debug(f"chat: dropping stale message from {msg.username} ({now - msg.ts:.0f}s old)")
         if random.random() >= self._cfg.chat.reply_probability:
             return None
+        # Engagement gate (persona.require_engagement): reply only when the user
+        # mentioned Wallie / continues a thread / is on her topic. Re-queue the
+        # gated-out message instead of dropping it — a mention a moment later
+        # still gets answered. Low-value chatter ("kkkk", emote spam) is dropped.
+        if self._cfg.persona.require_engagement and msg.donation is None:
+            ok, reason = self._engagement.should_reply(
+                msg.text, username=msg.username, streamer=bool(msg.is_streamer))
+            if not ok:
+                if is_low_value_chat(msg.text):
+                    logger.info(f"chat gate: dropped low-value from {msg.username}: {msg.text[:50]}")
+                    self._gate_stats["chat_low_value"] += 1
+                    return None
+                self._gate_stats["chat_skipped"] += 1
+                self._gate_examples.appendleft(f"[{msg.username}] {msg.text}")
+                self._maybe_acknowledge(f"{msg.username}: {msg.text}")
+                try:
+                    self._chat.queue.put_nowait(msg)
+                    return None
+                except asyncio.QueueFull:
+                    logger.warning(f"chat gate: queue full, dropping gated message from {msg.username}")
+                    return None
+            logger.info(f"chat gate: reply ({reason}) to {msg.username}")
+            self._gate_stats["chat_replied"] += 1
         return msg
 
     # --- hearing (multimodal fusion) ---
@@ -1117,6 +1235,10 @@ class Orchestrator:
             self._conv.add_user(user_msg, source=source_tag, images=images)
         if intent.kind == "chat" and intent.chat is not None:
             self._last_chat_reply_ts = time.time()
+            m = intent.chat
+            if m.donation is None:
+                self._engagement.note_input(m.text, m.username)
+                self._engagement.note_reply_to(m.username)
 
         system_prompt = self._persona.system_prompt(
             topic=self._current_topic if intent.kind == "monologue" else None,
@@ -1294,6 +1416,11 @@ class Orchestrator:
             raise
 
         full = " ".join(spoken_parts).strip()
+        if full and self._cfg.persona.require_engagement:
+            # The gate tracks what Wallie just said so users can reply to it
+            # without naming her ("that boss is INSANE" after she raged).
+            self._engagement.note_reply(full)
+            self._engagement.note_topic(full)
         if intent.kind == "vision" and not full:
             # SKIP or empty output: update vision timestamp to prevent rapid re-firing.
             self._last_vision_turn_ts = time.time()

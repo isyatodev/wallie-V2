@@ -279,6 +279,15 @@
           <input type="checkbox" class="switch" x-model="cfg.persona.admit_uncertainty" />
         </label>
         <label class="toggle-row">
+          <span>Answer only when addressed (saves credits)</span>
+          <input type="checkbox" class="switch" x-model="cfg.persona.require_engagement" />
+        </label>
+        <label class="toggle-row">
+          <span>Acknowledgement chance (short lines, no LLM cost)</span>
+          <input type="number" min="0" max="1" step="0.05" style="width:80px"
+                 x-model.number="cfg.persona.acknowledge_rate" />
+        </label>
+        <label class="toggle-row">
           <span>Break 4th wall</span>
           <input type="checkbox" class="switch" x-model="cfg.persona.break_fourth_wall" />
         </label>
@@ -1981,6 +1990,23 @@
       <div class="hint" x-show="(status.speaker_id?.enrolled || 0) > 0" style="opacity:.7;">
         <span x-text="status.speaker_id?.enrolled || 0"></span> voice(s) enrolled
       </div>
+    </div>
+
+    <div class="panel-sub" x-show="status.engagement_gate?.enabled">
+      <div class="panel-title">Engagement gate <span class="muted">(credit guard)</span></div>
+      <div class="hint">
+        <span x-text="'✓ ' + (status.engagement_gate?.chat_replied || 0) + ' answered'"></span> ·
+        <span x-text="'✗ ' + (status.engagement_gate?.chat_skipped || 0) + ' skipped'"></span> ·
+        <span x-text="'🧹 ' + (status.engagement_gate?.chat_low_value || 0) + ' spam'"></span> ·
+        <span x-text="'💬 ' + (status.engagement_gate?.acks_sent || 0) + ' acks'"></span> ·
+        <span x-text="'🎙 ' + (status.engagement_gate?.hearing_skipped || 0) + ' voice'"></span>
+      </div>
+      <div class="panel-title" style="margin-top:8px" x-show="(status.engagement_gate?.examples || []).length">Recently skipped</div>
+      <ul class="thread-list" x-show="(status.engagement_gate?.examples || []).length">
+        <template x-for="(e, i) in (status.engagement_gate?.examples || [])" :key="i">
+          <li class="one-line" x-text="e"></li>
+        </template>
+      </ul>
     </div>
 
     <div class="panel-sub">

@@ -105,7 +105,7 @@ function emptyCfg() {
       extra_style_notes: "",
       strong_opinions: true, admit_uncertainty: true, break_fourth_wall: false,
       favorite_topics: [], taboo_topics: [],
-      address_style: "by_name", reply_length: "snappy", react_to_highlights_hype: true,
+      address_style: "by_name", reply_length: "snappy", react_to_highlights_hype: true, require_engagement: false, acknowledge_rate: 0.25,
       vision_first_person: true, vision_commentary_density: "balanced",
     },
     llm: { provider: "groq", model: "", temperature: 0.85, top_p: 0.95, max_tokens: 500, presence_penalty: 0.3, frequency_penalty: 0.4, vision_capable: false, ollama_base_url: "http://localhost:11434", ollama_keep_alive: "5m", vision_provider: "main", vision_model: "", vision_provider_ref: "", vision_openai_compatible_base_url: "", vision_openai_compatible_timeout: 30, vision_max_tokens: 200, provider_ref: "", openai_compatible_base_url: "", openai_compatible_timeout: 25 },
