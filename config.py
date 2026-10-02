@@ -350,6 +350,10 @@ class TTSConfig(BaseModel):
     el_stability: float = 0.45
     el_similarity_boost: float = 0.75
     el_style: float = 0.0
+    # optimize_streaming_latency (0-4): how aggressively ElevenLabs streams
+    # half-finished audio. 0 = fastest first byte (more artifacts on early
+    # chunks), 4 = best quality but slowest start. 3 was the hardcoded default.
+    el_optimize_streaming_latency: int = 3
     fish_latency_mode: Literal["normal", "balanced"] = "balanced"
     # Server-side text buffer before audio generation. Lower = faster time-to-first-audio
     # (snappier reactions), higher = smoother prosody. Range 100-300; 100 favors latency.

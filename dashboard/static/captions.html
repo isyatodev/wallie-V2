@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Wallie Captions</title>
+<title>Wallie-Kansai Captions</title>
 <style>
   html, body {
     margin: 0;
@@ -57,7 +57,7 @@
   const FONT = parseInt(qs.get("font") || "40", 10) || 40;
   const BG = Math.min(1, Math.max(0, parseFloat(qs.get("bg") || "0.55")));
   const LOWER = qs.get("lower") === "1";
-  const NAME = qs.get("name") === "1" ? (qs.get("who") || "Wallie") : "";
+  const NAME = qs.get("name") === "1" ? (qs.get("who") || "Wallie-Kansai") : "";
   const CLEAR_DELAY = Math.max(0, (parseFloat(qs.get("hold") || "0") || 0) * 1000);
 
   const box = document.getElementById("box");

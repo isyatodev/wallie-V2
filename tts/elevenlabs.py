@@ -27,6 +27,7 @@ class ElevenLabsTTS(TTSProvider):
         stability: float = 0.5,
         similarity_boost: float = 0.75,
         style: float = 0.0,
+        optimize_streaming_latency: int = 3,
     ) -> None:
         if not api_key:
             raise TTSError("elevenlabs: missing ELEVENLABS_API_KEY")
@@ -38,6 +39,7 @@ class ElevenLabsTTS(TTSProvider):
         self._api_key = api_key
         self._voice_id = voice_id
         self._model_id = model_id
+        self._optimize_latency = max(0, min(4, int(optimize_streaming_latency)))
         self._voice_settings = {
             "stability": stability,
             "similarity_boost": similarity_boost,
@@ -52,7 +54,7 @@ class ElevenLabsTTS(TTSProvider):
         url = (
             f"https://api.elevenlabs.io/v1/text-to-speech/{self._voice_id}/stream"
             f"?output_format={_pcm_format(self.sample_rate)}"
-            "&optimize_streaming_latency=3"
+            f"&optimize_streaming_latency={self._optimize_latency}"
         )
         body = {
             "text": text,

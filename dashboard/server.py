@@ -466,6 +466,23 @@ def _build_app(
             logger.warning(f"dashboard: test output beep failed: {e}")
             raise HTTPException(status_code=400, detail=str(e)[:220])
 
+    @app.get("/api/gate/skipped")
+    def gate_skipped() -> list[dict[str, Any]]:
+        """Recent inputs the engagement gate skipped, newest first."""
+        orch = state.orchestrator
+        return orch.gate_skipped() if orch else []
+
+    @app.post("/api/gate/force-reply/{msg_id}")
+    def gate_force_reply(msg_id: str) -> dict[str, Any]:
+        """Force a reply to one skipped input — it becomes the very next turn."""
+        orch = state.orchestrator
+        if orch is None:
+            raise HTTPException(status_code=409, detail="session not running")
+        try:
+            return orch.gate_force_reply(msg_id)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
     @app.get("/api/preflight")
     def api_preflight() -> list[dict[str, str]]:
         """Pre-start checklist: static config problems the session would hit.

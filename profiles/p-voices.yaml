@@ -1,9 +1,9 @@
 profile_name: p-voices
 providers:
-- id: groq
+- id: naga
   name: groq
   category: stt
-  base_url: https://api.groq.com/openai/v1/chat/completions
+  base_url: https://api.groq.com/openai/v1
   model: whisper-large-v3
 speaker_id:
   enabled: false
@@ -160,7 +160,7 @@ hearing:
     collect_other_voices: false
   engine: openai_compatible
   openai_compatible_base_url: ''
-  openai_compatible_model: whisper-1
+  openai_compatible_model: whisper-large-v3
   openai_compatible_timeout: 20.0
   provider_ref: ''
   openai_compatible_prompt: ''

@@ -1,5 +1,15 @@
 profile_name: default
-providers: []
+providers:
+- id: naga
+  name: groq
+  category: stt
+  base_url: https://api.groq.com/openai/v1
+  model: whisper-large-v3
+- id: naga_2
+  name: naga
+  category: stt
+  base_url: https://api.naga.ac/v1
+  model: whisper-large-v3:free
 speaker_id:
   enabled: false
   threshold: 0.68
@@ -8,7 +18,7 @@ speaker_id:
 persona:
   name: Wallie
   handle: '@wallie'
-  language: en
+  language: pt
   pronouns: they/them
   age_range: early 20s
   origin: somewhere online
@@ -50,6 +60,8 @@ persona:
   anecdote_seeds: []
   personal_beat_rate: 0.35
   conversational: false
+  require_engagement: false
+  acknowledge_rate: 0.25
   reveal_ai: false
   plug_url: ''
   plug_rate: 0.15
@@ -80,9 +92,9 @@ llm:
   vision_max_tokens: 200
 tts:
   provider: elevenlabs
-  voice_id: ''
+  voice_id: 4hhgiQJG3FMn8mWGAvkv
   sample_rate: 24000
-  output_device: ''
+  output_device: Output (Voicemeeter Point 1)
   el_model_id: eleven_turbo_v2_5
   el_stability: 0.45
   el_similarity_boost: 0.75
@@ -132,7 +144,7 @@ vision:
   silence_fallback_scale: 1.0
   active_content_boost: 1.0
 hearing:
-  enabled: false
+  enabled: true
   window_sec: 5.0
   model_size: small
   language: ''
@@ -152,13 +164,14 @@ hearing:
     enabled: true
     threshold: 0.68
     unknown_threshold: 0.45
-    collect_other_voices: false
-  engine: ''
-  openai_compatible_base_url: ''
-  openai_compatible_model: whisper-1
+    collect_other_voices: true
+  engine: openai_compatible
+  openai_compatible_base_url: https://api.naga.ac/v1
+  openai_compatible_model: whisper-large-v3:free
   openai_compatible_timeout: 20.0
-  provider_ref: ''
+  provider_ref: naga
   openai_compatible_prompt: ''
+  loopback_device: ''
 chat:
   youtube_enabled: false
   twitch_enabled: false

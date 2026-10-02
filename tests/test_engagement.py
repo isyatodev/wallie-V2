@@ -14,6 +14,8 @@ import random
 import time
 from pathlib import Path
 
+import pytest
+
 from config import AppConfig, Runtime, Secrets
 
 from core.engagement import EngagementGate, is_low_value_chat
@@ -344,10 +346,11 @@ def test_ack_not_fired_for_low_value_chatter(tmp_path, monkeypatch):
 # Gate session stats (status()['engagement_gate']) — the dashboard panel feed
 # ---------------------------------------------------------------------------
 
-def test_gate_stats_counters_track_all_paths(tmp_path):
+def test_gate_stats_counters_track_all_paths(tmp_path, monkeypatch):
     """Replies, skips (with examples), spam and hearing all count separately."""
     cfg = AppConfig(persona={"require_engagement": True})
     orch = _orchestrator(tmp_path, cfg)
+    monkeypatch.setattr(random, "random", lambda: 0.99)  # ack roll loses (0.99 ≥ 0.25)
 
     # One reply (mention) + one skip + one spam drop.
     orch._chat = _chat_with([
@@ -375,6 +378,31 @@ def test_gate_stats_counters_track_all_paths(tmp_path):
     assert any(e.startswith("[voice]") for e in orch._gate_examples)
 
 
+def test_llm_calls_saved_counts_and_unwinds(tmp_path):
+    """Savings = avoided turns, NET: a re-queued message that later lands
+    unwinds its +1 so the panel never overstates."""
+    cfg = AppConfig(persona={"require_engagement": True})
+    orch = _orchestrator(tmp_path, cfg)
+
+    # Spam drop + hearing skip = two inputs that will never cost a call.
+    orch._chat = _chat_with([_msg("kkkk", "c3")])
+    orch._pop_ordinary_chat()
+    assert orch._hearing_engaged("[stranger] noise") is False
+    assert orch._gate_stats["llm_calls_saved"] == 2
+
+    # A skipped message is RE-QUEUED: +1 saved now...
+    orch._chat = _chat_with([_msg("random unrelated words", "b2")])
+    assert orch._pop_ordinary_chat() is None
+    assert orch._gate_stats["llm_calls_saved"] == 3
+
+    # ...but once a thread exists it lands and WILL cost a call → unwind.
+    orch._engagement.note_input("earlier question", "b2")
+    got = orch._pop_ordinary_chat()
+    assert got is not None
+    assert orch._gate_stats["chat_replied"] == 1
+    assert orch._gate_stats["llm_calls_saved"] == 2
+
+
 def test_gate_stats_surface_in_status(tmp_path):
     cfg = AppConfig(persona={"require_engagement": True})
     orch = _orchestrator(tmp_path, cfg)
@@ -383,6 +411,7 @@ def test_gate_stats_surface_in_status(tmp_path):
     s = orch.status()["engagement_gate"]
     assert s["enabled"] is True
     assert s["chat_skipped"] == 1
+    assert s["llm_calls_saved"] == 1
     assert s["examples"] and "b2" in s["examples"][0]
 
 
@@ -394,4 +423,160 @@ def test_gate_stats_absent_when_gate_never_installed(tmp_path):
     s = orch.status()["engagement_gate"]
     assert s["enabled"] is False
     assert s["chat_skipped"] == 0 and s["chat_replied"] == 0
+    assert s["llm_calls_saved"] == 0
     assert s["examples"] == []
+    assert s["skipped"] == []
+
+
+# ---------------------------------------------------------------------------
+# Gate inspector + force-reply — what the gate ignored, and answering it anyway
+# ---------------------------------------------------------------------------
+
+def test_gate_skipped_registry_records_and_version_bumps(tmp_path):
+    """Every gated-out chat is registered for inspection (id/kind/platform set);
+    low-value chatter is NOT (it was never answerable); version bumps only when
+    the registry actually changes, so the open modal knows when to refresh."""
+    cfg = AppConfig(persona={"require_engagement": True})
+    orch = _orchestrator(tmp_path, cfg)
+    orch._chat = _chat_with([
+        _msg("totally unrelated words here", "b2"),
+        _msg("kkkk", "c3"),
+    ])
+    assert orch._pop_ordinary_chat() is None           # skipped → registered
+    assert orch._pop_ordinary_chat() is None           # spam → dropped, NOT registered
+    reg = orch.gate_skipped()
+    assert len(reg) == 1 and reg[0]["username"] == "b2"
+    assert reg[0]["kind"] == "skipped"
+    assert reg[0]["platform"] == "twitch"
+    assert reg[0]["text"] == "totally unrelated words here"
+    assert reg[0]["id"].startswith("chat-")
+    v0 = orch._gate_skipped_version
+    orch._pop_ordinary_chat()                          # nothing new to register
+    assert orch._gate_skipped_version == v0            # no change → no bump
+
+
+def test_gate_force_reply_reconstructs_and_unwinds(tmp_path):
+    """Forcing rebuilds the message with its ORIGINAL platform as an urgent next
+    turn, unwinds the savings credit (+1 → −1), and a second force on the same
+    id is rejected — never two identical replies."""
+    cfg = AppConfig(persona={"require_engagement": True})
+    orch = _orchestrator(tmp_path, cfg)
+    orch._chat = _chat_with([_msg("also the chest by the stairs is fake", "b2")])
+    assert orch._pop_ordinary_chat() is None           # gated out → in registry
+    entry = orch.gate_skipped()[0]
+    saved_before = orch._gate_stats["llm_calls_saved"]
+
+    info = orch.gate_force_reply(entry["id"])
+    assert info["ok"] is True and info["username"] == "b2"
+    assert orch._gate_stats["llm_calls_saved"] == saved_before - 1
+
+    intent = _run(orch._choose_intent())
+    assert intent is not None and intent.kind == "chat" and intent.urgent is True
+    assert intent.chat.username == "b2"
+    assert "chest by the stairs" in intent.chat.text
+    assert intent.chat.platform == "twitch"            # original platform kept
+
+    with pytest.raises(ValueError):
+        orch.gate_force_reply(entry["id"])             # already forced → no-op guard
+
+
+def test_gate_force_reply_consumed_once_by_choose_intent(tmp_path):
+    """The forced reply is consumed on the next _choose_intent call and a second
+    call falls through to the normal flow (no double execution)."""
+    cfg = AppConfig(persona={"require_engagement": True})
+    orch = _orchestrator(tmp_path, cfg)
+    orch._chat = _chat_with([_msg("some unrelated random words", "b2")])
+    assert orch._pop_ordinary_chat() is None
+    entry = orch.gate_skipped()[0]
+    orch.gate_force_reply(entry["id"])
+
+    first = _run(orch._choose_intent())
+    assert first.kind == "chat" and "unrelated random words" in first.chat.text
+    second = _run(orch._choose_intent())
+    assert second is None or second.kind != "chat"     # nothing left pending
+
+
+# ---------------------------------------------------------------------------
+# Dashboard routes — GET /api/gate/skipped, POST /api/gate/force-reply/{id}
+# ---------------------------------------------------------------------------
+
+class _StubGateOrch:
+    """Just the gate surface the two routes touch."""
+
+    def __init__(self, items=None, fail_on=None):
+        self._items = items or []
+        self._fail_on = fail_on
+        self.forced: list[str] = []
+
+    def gate_skipped(self):
+        return self._items
+
+    def gate_force_reply(self, msg_id):
+        if msg_id == self._fail_on:
+            raise ValueError("skipped message not found (expired or already forced)")
+        self.forced.append(msg_id)
+        return {"ok": True, "username": "u", "text": "t"}
+
+
+def _gate_app(tmp_path, monkeypatch, orch):
+    from fastapi.testclient import TestClient
+
+    import config
+    monkeypatch.setattr(config, "PROFILES_DIR", tmp_path)
+    monkeypatch.setattr(config, "STATE_FILE", tmp_path / "state.json")
+    from dashboard.server import DashboardState, _build_app
+    return TestClient(_build_app(DashboardState(), orch, pin="")), orch
+
+
+def test_gate_routes_list_and_force(tmp_path, monkeypatch):
+    stub = _StubGateOrch(items=[{
+        "id": "chat-abc", "username": "b2", "text": "hello?", "ts": 1.0,
+        "kind": "skipped", "platform": "twitch",
+    }])
+    client, _ = _gate_app(tmp_path, monkeypatch, stub)
+
+    r = client.get("/api/gate/skipped")
+    assert r.status_code == 200 and r.json()[0]["id"] == "chat-abc"
+
+    r = client.post("/api/gate/force-reply/chat-abc")
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert stub.forced == ["chat-abc"]
+
+
+def test_gate_route_404_on_unknown_id_and_empty_when_no_session(tmp_path, monkeypatch):
+    stub = _StubGateOrch(items=[], fail_on="chat-nope")
+    client, _ = _gate_app(tmp_path, monkeypatch, stub)
+
+    r = client.post("/api/gate/force-reply/chat-nope")
+    assert r.status_code == 404 and "not found" in r.json()["detail"]
+    assert stub.forced == []                      # never force-called on miss
+
+    client2, _ = _gate_app(tmp_path, monkeypatch, None)
+    assert client2.get("/api/gate/skipped").json() == []     # no session → empty list
+    assert client2.post("/api/gate/force-reply/x").status_code == 409  # no session
+
+
+def test_gate_force_reply_removes_queued_twin_and_does_not_double_count(tmp_path):
+    """Skips are RE-QUEUED. Forcing must (a) remove the gated original still
+    waiting in the queue so the input can't be answered twice, and (b) not
+    re-register identical rows when the queue re-passes the message."""
+    cfg = AppConfig(persona={"require_engagement": True})
+    orch = _orchestrator(tmp_path, cfg)
+    orch._chat = _chat_with([_msg("a random statement nobody asked about", "b2")])
+    assert orch._pop_ordinary_chat() is None               # gated, re-queued, registered once
+    reg0 = orch.gate_skipped()
+    assert len(reg0) == 1
+    orch._pop_ordinary_chat()                              # re-pass of the re-queued twin
+    assert len(orch.gate_skipped()) == 1                   # dedup — no second row
+    assert orch._gate_skipped_version == 1
+
+    entry = reg0[0]
+    saved_before = orch._gate_stats["llm_calls_saved"]
+    orch.gate_force_reply(entry["id"])
+    assert orch._gate_stats["llm_calls_saved"] == saved_before - 1
+    assert orch._chat.queue.empty()                        # twin removed → answered ONCE
+
+    intent = _run(orch._choose_intent())
+    assert intent.kind == "chat" and intent.urgent and intent.chat.username == "b2"
+    second = _run(orch._choose_intent())
+    assert second is None or second.kind != "chat"         # no queued twin behind it

@@ -109,7 +109,7 @@ function emptyCfg() {
       vision_first_person: true, vision_commentary_density: "balanced",
     },
     llm: { provider: "groq", model: "", temperature: 0.85, top_p: 0.95, max_tokens: 500, presence_penalty: 0.3, frequency_penalty: 0.4, vision_capable: false, ollama_base_url: "http://localhost:11434", ollama_keep_alive: "5m", vision_provider: "main", vision_model: "", vision_provider_ref: "", vision_openai_compatible_base_url: "", vision_openai_compatible_timeout: 30, vision_max_tokens: 200, provider_ref: "", openai_compatible_base_url: "", openai_compatible_timeout: 25 },
-    tts: { provider: "fish", voice_id: "", sample_rate: 24000, el_model_id: "eleven_turbo_v2_5", el_stability: 0.45, el_similarity_boost: 0.75, el_style: 0.0, fish_latency_mode: "balanced", fish_chunk_length: 100, piper_model_path: "", piper_length_scale: 1.0, kokoro_voice: "af_heart", kokoro_lang_code: "a", kokoro_speed: 1.0, openai_compatible_base_url: "", openai_compatible_model: "", openai_compatible_timeout: 30, openai_compatible_voice: "alloy", openai_compatible_speed: 1.0, openai_compatible_pcm_sample_rate: 24000, provider_ref: "", output_device: "" },
+    tts: { provider: "fish", voice_id: "", sample_rate: 24000, el_model_id: "eleven_turbo_v2_5", el_stability: 0.45, el_similarity_boost: 0.75, el_style: 0.0, el_optimize_streaming_latency: 3, fish_latency_mode: "balanced", fish_chunk_length: 100, piper_model_path: "", piper_length_scale: 1.0, kokoro_voice: "af_heart", kokoro_lang_code: "a", kokoro_speed: 1.0, openai_compatible_base_url: "", openai_compatible_model: "", openai_compatible_timeout: 30, openai_compatible_voice: "alloy", openai_compatible_speed: 1.0, openai_compatible_pcm_sample_rate: 24000, provider_ref: "", output_device: "" },
     vision: { enabled: false, source: "monitor", monitor_index: 1, interval_sec: 3.0, min_change_threshold: 8, max_edge_px: 768, startup_delay_sec: 5 },
     play: { enabled: false, game: "minecraft", goal: "Build a thriving Minecraft empire LIVE for an audience — gather, craft full gear, build, fight and explore. Make the journey entertaining, not a speedrun.", talk_from_agent: true, hide_chat: true, avoid_water: true },
     hearing: { enabled: false, window_sec: 5.0, model_size: "small", language: "", silence_threshold: 0.006, sound_event_threshold: 0.06, max_context_age_sec: 12.0, engine: "", openai_compatible_base_url: "", openai_compatible_model: "whisper-1", openai_compatible_timeout: 20, openai_compatible_prompt: "", provider_ref: "", loopback_device: "", speaker_id: { enabled: false, threshold: 0.68, unknown_threshold: 0.45, collect_other_voices: false } },
@@ -1189,6 +1189,40 @@ function app() {
         this.status = await r.json();
         this.running = !!this.status.running;
       } catch { this.running = false; }
+    },
+
+    // ----- engagement-gate inspector (what was skipped + force a reply) -----
+    gate: { open: false, loading: false, items: [], busyId: "", msg: "" },
+
+    async openGateInspector() {
+      this.gate.open = true;
+      await this.gateRefresh();
+    },
+    async gateRefresh() {
+      if (this.gate.loading) return;
+      this.gate.loading = true;
+      try {
+        const r = await fetch("/api/gate/skipped");
+        this.gate.items = r.ok ? await r.json() : [];
+      } catch { this.gate.items = []; }
+      finally { this.gate.loading = false; }
+    },
+    async gateForceReply(id) {
+      if (this.gate.busyId) return;
+      this.gate.busyId = id;
+      this.gate.msg = "";
+      try {
+        const r = await fetch(`/api/gate/force-reply/${encodeURIComponent(id)}`, { method: "POST" });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+        this.gate.msg = "✓ queued as her very next turn";
+        await this.gateRefresh();
+      } catch (e) {
+        this.gate.msg = "✗ " + (e.message || e);
+      } finally {
+        this.gate.busyId = "";
+        setTimeout(() => (this.gate.msg = ""), 5000);
+      }
     },
 
     async runPreflight() {

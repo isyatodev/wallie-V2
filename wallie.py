@@ -454,6 +454,21 @@ def preflight(runtime: Optional[Runtime] = None) -> list[dict]:
         add("error", "Voice (TTS)", "provider 'fish' has no API key (FISH_API_KEY)")
     elif tts.provider == "elevenlabs" and not (sec.elevenlabs_api_key or "").strip():
         add("error", "Voice (TTS)", "provider 'elevenlabs' has no API key (ELEVENLABS_API_KEY)")
+    # LIVE check: a saved output that Windows lists but that refuses to OPEN
+    # (PaErrorCode -9996, e.g. a virtual cable under Voicemeeter) would run the
+    # whole session mute — the stream build in AudioPlayer.start() dies on the
+    # first utterance. Empty spec = system default, which PortAudio always opens.
+    if (tts.output_device or "").strip():
+        from audio.player import probe_output_device
+        try:
+            res = probe_output_device(tts.output_device, sample_rate=tts.sample_rate)
+            if not res.get("ok"):
+                detail = res.get("reason", "")
+                add("error", "Voice (TTS)",
+                    f"output device '{tts.output_device}' is listed by Windows but refuses to "
+                    f"open ({detail}) — the voice would stay silent. Re-pick it on the Voice page")
+        except Exception as e:  # noqa: BLE001 — never break preflight on probe failure
+            add("warn", "Voice (TTS)", f"could not verify the output device: {e}")
     elif tts.provider == "openai_compatible":
         base, model, key = _pf_compat(
             cfg, sec, "tts", tts.provider_ref,

@@ -264,3 +264,50 @@ def test_api_preflight_route(monkeypatch):
         r = client.get("/api/preflight")
         assert r.status_code == 200
         assert r.json() == canned
+
+
+# ---------------------------------------------------------------------------
+# TTS output device — listed by Windows but refuses to OPEN (dead endpoint)
+# ---------------------------------------------------------------------------
+
+def test_preflight_flags_output_device_that_refuses_to_open(tmp_path, monkeypatch):
+    """A saved output that Windows lists but that cannot open (PaErrorCode
+    -9996, e.g. a virtual cable under Voicemeeter) fails the start — the
+    voice would stay silent for the whole session."""
+    import audio.player
+
+    monkeypatch.setattr(
+        audio.player, "probe_output_device",
+        lambda spec, **kw: {"ok": False, "index": 7,
+                            "reason": "Invalid device [PaErrorCode -9996]",
+                            "fallback_index": None})
+    cfg = AppConfig(tts={"provider": "fish", "output_device": "Ghost Endpoint"})
+    issues = [i for i in _issues(cfg, tmp_path) if "refuses to open" in i["message"]]
+    assert issues and issues[0]["section"] == "Voice (TTS)"
+    assert issues[0]["level"] == "error"
+    assert "Ghost Endpoint" in issues[0]["message"]
+
+
+def test_preflight_output_device_ok_passes_silently(tmp_path, monkeypatch):
+    """A healthy saved output adds no issues (probe ok via sibling or direct)."""
+    import audio.player
+
+    monkeypatch.setattr(
+        audio.player, "probe_output_device",
+        lambda spec, **kw: {"ok": True, "index": 7, "fallback_index": 9})
+    cfg = AppConfig(tts={"provider": "fish", "output_device": "Healthy Speaker"})
+    issues = [i for i in _issues(cfg, tmp_path) if "output device" in i["message"]]
+    assert issues == []
+
+
+def test_preflight_probe_failure_degrades_to_warn(tmp_path, monkeypatch):
+    """A crashed audio stack must never break preflight — warn instead."""
+    import audio.player
+
+    def _boom(spec, **kw):
+        raise RuntimeError("PortAudio died")
+
+    monkeypatch.setattr(audio.player, "probe_output_device", _boom)
+    cfg = AppConfig(tts={"provider": "fish", "output_device": "Anything"})
+    issues = [i for i in _issues(cfg, tmp_path) if "could not verify the output" in i["message"]]
+    assert issues and issues[0]["level"] == "warn"

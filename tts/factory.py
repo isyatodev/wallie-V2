@@ -40,6 +40,7 @@ def build_tts(cfg: TTSConfig, secrets: Secrets) -> TTSProvider:
             stability=cfg.el_stability,
             similarity_boost=cfg.el_similarity_boost,
             style=cfg.el_style,
+            optimize_streaming_latency=cfg.el_optimize_streaming_latency,
         )
 
     if cfg.provider == "piper":

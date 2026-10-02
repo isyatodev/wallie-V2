@@ -1,17 +1,19 @@
 /* =====================================================================
  * Wallie Control Room — design system
  * -----------------------------------
- * Dark, dense, made for a streamer running a cockpit at 2am.
+ * Black + soft cyan. Dense, made for a streamer running a cockpit
+ * at 2am — pure-black surfaces with a gentle cyan accent that stays
+ * easy on the eyes through long sessions.
  * ===================================================================== */
 
 :root {
-  /* Surfaces */
-  --bg-0: #08090d;
-  --bg-1: #0e1117;
-  --bg-2: #141821;
-  --bg-3: #1a1f2a;
-  --line: #222836;
-  --line-strong: #2e3647;
+  /* Surfaces — neutral near-black, no blue cast */
+  --bg-0: #050607;
+  --bg-1: #0a0c0e;
+  --bg-2: #101316;
+  --bg-3: #16191d;
+  --line: #1f2429;
+  --line-strong: #2a3036;
 
   /* Text */
   --fg-0: #f2f4f7;
@@ -20,9 +22,9 @@
   --fg-3: #5d6472;
 
   /* Accents */
-  --accent: #f43f5e;           /* rose-500 — primary */
-  --accent-soft: #f43f5e22;
-  --accent-hot: #ff6b8a;
+  --accent: #22d3ee;           /* cyan-400 — primary, soft on black */
+  --accent-soft: #22d3ee24;
+  --accent-hot: #67e8f9;
   --ok: #34d399;
   --warn: #f59e0b;
   --err: #ef4444;
@@ -39,6 +41,8 @@
   /* Typography */
   --font: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+
+  color-scheme: dark;   /* UA controls (dropdowns, autofill, scrollbars) stay dark */
 }
 
 * { box-sizing: border-box; }
@@ -49,8 +53,8 @@ body {
   font-size: 13px;
   color: var(--fg-0);
   background:
-    radial-gradient(1200px 600px at 80% -10%, #1b1422 0%, transparent 60%),
-    radial-gradient(900px 500px at -10% 110%, #0e1824 0%, transparent 60%),
+    radial-gradient(1200px 600px at 80% -10%, #0c1418 0%, transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, #081114 0%, transparent 60%),
     var(--bg-0);
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
@@ -74,7 +78,7 @@ body {
   width: 24px; height: 24px;
   border-radius: 6px;
   background:
-    radial-gradient(circle at 30% 30%, var(--accent-hot), var(--accent) 60%, #7a1d2f 100%);
+    radial-gradient(circle at 30% 30%, var(--accent-hot), var(--accent) 60%, #0b4a56 100%);
   box-shadow: 0 0 18px var(--accent-soft), inset 0 0 6px rgba(255,255,255,.25);
 }
 .brand-text { line-height: 1; }
@@ -132,10 +136,10 @@ body {
   font-weight: 600;
   transition: all .15s ease;
 }
-.btn:hover:not(:disabled) { background: #232a39; border-color: #3a4260; }
+.btn:hover:not(:disabled) { background: #1a1e23; border-color: #343b43; }
 .btn:active:not(:disabled) { transform: translateY(1px); }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-.btn.primary { background: var(--accent); color: #1a0610; border-color: var(--accent); }
+.btn.primary { background: var(--accent); color: #04161b; border-color: var(--accent); }
 .btn.primary:hover:not(:disabled) { background: var(--accent-hot); }
 .btn.warn { background: transparent; color: var(--warn); border-color: var(--warn); }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--fg-2); }
@@ -255,6 +259,19 @@ body:not(.drawer-open) .drawer { display: none; }
 .hint-block { color: var(--fg-2); font-size: 12px; background: var(--bg-2); padding: 10px 14px; border-radius: var(--radius); border: 1px solid var(--line); }
 .hint-block code { background: var(--bg-3); padding: 1px 6px; border-radius: 4px; }
 
+/* Base for ALL inputs — many config fields have no type attribute, and the
+   UA default paints them white on a black theme. */
+input {
+  background: var(--bg-1);
+  color: var(--fg-0);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  padding: 9px 11px;
+  font-family: inherit;
+  font-size: 13px;
+  transition: border-color .15s ease, background .15s ease, box-shadow .15s ease;
+  caret-color: var(--accent);
+}
 input[type=text], input[type=number], input[type=password], select, textarea {
   background: var(--bg-1);
   color: var(--fg-0);
@@ -266,8 +283,7 @@ input[type=text], input[type=number], input[type=password], select, textarea {
   transition: border-color .15s ease, background .15s ease, box-shadow .15s ease;
   caret-color: var(--accent);
 }
-input[type=text]:focus, input[type=number]:focus, input[type=password]:focus,
-select:focus, textarea:focus {
+input:focus, select:focus, textarea:focus {
   outline: none;
   border-color: var(--accent);
   background: var(--bg-0);
@@ -354,8 +370,8 @@ input[type=range]::-moz-range-thumb {
 .segmented button:hover { color: var(--fg-0); background: var(--bg-2); }
 .segmented button.on {
   background: var(--accent);
-  color: #1a0610;
-  box-shadow: 0 1px 4px rgba(244,63,94,.35);
+  color: #04161b;
+  box-shadow: 0 1px 4px rgba(34,211,238,.28);
 }
 
 /* Toggle switch (checkbox styled) */
@@ -832,7 +848,7 @@ input[type=password]:focus-visible, select:focus-visible, textarea:focus-visible
 ::-webkit-scrollbar { width: 7px; height: 7px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: #384259; }
+::-webkit-scrollbar-thumb:hover { background: #3a4149; }
 
 /* ===== Memory section (durable fact store) ===== */
 .memory-crud { display: flex; flex-direction: column; gap: 10px; }

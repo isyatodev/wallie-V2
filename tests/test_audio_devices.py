@@ -2,10 +2,13 @@
 
 Covers: the backend resolver that turns the saved spec into a concrete
 device index, the /api/audio-devices route the dropdown is fed from
-(host-API name + default flag), and graceful behavior when PortAudio
-itself is unavailable.
+(host-API name + default flag), graceful behavior when PortAudio
+itself is unavailable, and the AudioPlayer drained-signal race that
+cut the voice test short.
 """
 from __future__ import annotations
+
+import asyncio
 
 import pytest
 
@@ -423,3 +426,218 @@ def test_device_check_never_500s_when_audio_stack_dead(tmp_path, monkeypatch):
     data = r.json()
     assert data["tts_output"]["exists"] is False
     assert data["loopback"]["exists"] is False
+
+
+# ---------------------------------------------------------------------------
+# Multi-instance fallback: one endpoint, several host-API instances. The
+# preferred (WASAPI) one can be enumerated but unroutable (-9996) — the beep
+# and the preflight probe must try the other instances of the SAME endpoint.
+# ---------------------------------------------------------------------------
+
+_DEV_ROWS = [
+    {"name": "Ghost Endpoint", "hostapi": 0, "max_output_channels": 2,
+     "default_samplerate": 48000.0},   # idx 0: WASAPI — refuses to OPEN (-9996)
+    {"name": "Ghost Endpoint", "hostapi": 1, "max_output_channels": 2,
+     "default_samplerate": 48000.0},   # idx 1: DirectSound — opens, dies at START
+    {"name": "Healthy Speaker", "hostapi": 0, "max_output_channels": 2,
+     "default_samplerate": 48000.0},   # idx 2: unrelated healthy device
+]
+_APIS = [{"name": "Windows WASAPI"}, {"name": "Windows DirectSound"}]
+
+
+def _patch_multi_instance(monkeypatch, *, mode="sibling_ok"):
+    """mode: 'sibling_ok'  → idx0 fails open, idx1 opens+starts fine
+             'all_dead'    → idx0 fails open, idx1 opens then fails start"""
+    import sounddevice as sd
+
+    monkeypatch.setattr(
+        sd, "query_devices",
+        lambda idx=None: _DEV_ROWS[idx] if idx is not None else _DEV_ROWS)
+    monkeypatch.setattr(sd, "query_hostapis", lambda *a: _APIS)
+    monkeypatch.setattr(sd, "default",
+                        type("D", (), {"device": [None, 2], "output": None})(),
+                        raising=False)
+
+    opened: list = []
+
+    class _FakeStream:
+        def __init__(self, **kw):
+            self.device = kw.get("device")
+
+        def start(self):
+            if self.device == 0:
+                raise Exception("Error opening OutputStream: Invalid device [PaErrorCode -9996]")
+            if mode == "all_dead" and self.device == 1:
+                raise Exception("Error starting stream: Unanticipated host error [PaErrorCode -9999]")
+            opened.append(self.device)
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sd, "RawOutputStream", lambda **kw: _FakeStream(**kw))
+    return opened
+
+
+def test_play_test_beep_falls_back_to_sibling_instance(monkeypatch):
+    """WASAPI instance refuses to open (-9996) → the beep plays on the
+    DirectSound sibling of the SAME endpoint and reports that instance."""
+    import sounddevice as sd
+
+    from audio.player import play_test_beep
+
+    opened = _patch_multi_instance(monkeypatch)
+    played: dict = {}
+
+    def _fake_play(data, samplerate, *, device=None, blocking=False):
+        if device == 0:  # the WASAPI instance refuses, like the real -9996
+            raise Exception("Error opening OutputStream: Invalid device [PaErrorCode -9996]")
+        played["device"] = device
+
+    monkeypatch.setattr(sd, "play", _fake_play)
+
+    out = play_test_beep("Ghost Endpoint")
+    assert played["device"] == 1                       # sibling instance used
+    assert out["index"] == 1 and out["device"] == "Ghost Endpoint"
+
+
+def test_play_test_beep_all_instances_dead_actionable_message(monkeypatch):
+    """Every instance dead → RuntimeError whose text tells the user what to do
+    (re-pick the output), keeping the original PaErrorCode."""
+    import sounddevice as sd
+
+    from audio.player import play_test_beep
+
+    _patch_multi_instance(monkeypatch, mode="all_dead")
+
+    def _boom(data, samplerate, *, device=None, blocking=False):
+        raise Exception("Error opening OutputStream: Invalid device [PaErrorCode -9996]")
+
+    monkeypatch.setattr(sd, "play", _boom)
+
+    with pytest.raises(RuntimeError, match="re-pick the output") as ei:
+        play_test_beep("Ghost Endpoint")
+    assert "-9996" in str(ei.value)                    # original reason kept
+
+
+def test_probe_output_device_tries_all_instances_and_starts(monkeypatch):
+    """The preflight probe must open AND start (a dead endpoint's DirectSound
+    instance opens fine and only fails at start) and succeed via a sibling."""
+    from audio.player import probe_output_device
+
+    opened = _patch_multi_instance(monkeypatch)
+    res = probe_output_device("Ghost Endpoint", sample_rate=24000)
+    assert res["ok"] is True and res["index"] == 0
+    assert res["fallback_index"] == 1                  # succeeded on the sibling
+    assert opened == [1]
+
+
+def test_probe_output_device_all_dead_reports_reason(monkeypatch):
+    """All instances dead → ok: False with the first error, for preflight."""
+    from audio.player import probe_output_device
+
+    _patch_multi_instance(monkeypatch, mode="all_dead")
+    res = probe_output_device("Ghost Endpoint", sample_rate=24000)
+    assert res["ok"] is False
+    assert "-9996" in res["reason"]
+
+
+def test_probe_output_device_default_spec_is_ok_without_probing(monkeypatch):
+    """Empty spec = system default → ok without touching the audio stack."""
+    from audio.player import probe_output_device
+
+    opened = _patch_multi_instance(monkeypatch, mode="all_dead")
+    assert probe_output_device("") == {"ok": True, "index": None, "fallback_index": None}
+    assert opened == []                                # nothing was opened
+
+
+# ---------------------------------------------------------------------------
+# AudioPlayer drained signal — wait_drained() race regression
+#
+# The voice test (dashboard /api/test/voice, preview path) does
+# start() → write(all) → wait_drained() → close(). The drained event starts
+# SET, and the audio callback re-sets it whenever it sees an empty buffer —
+# via a DEFERRED call_soon_threadsafe. A callback that ran just before the
+# write re-set the event AFTER the write cleared it, so wait_drained()
+# returned with the fresh audio still queued and close() killed the stream:
+# ElevenLabs streams arrive in one burst, so its test was cut to <2s.
+#
+# These tests drive _callback() directly (no real device, never started),
+# yielding once after each pump so the deferred loop callbacks run.
+# ---------------------------------------------------------------------------
+
+
+def _pump(p, frames: int = 960) -> None:
+    """Run one audio callback by hand, like PortAudio would."""
+    out = bytearray(frames * p._channels * 2)
+    p._callback(out, frames, None, 0)
+
+
+def _fresh_player():
+    from audio.player import AudioPlayer
+
+    p = AudioPlayer()  # no start(): no stream, callbacks invoked manually
+    return p
+
+
+@pytest.mark.asyncio
+async def test_wait_drained_ignores_stale_drain_callbacks():
+    """Callbacks that saw an empty buffer BEFORE a write must not signal
+    drained after it — the race that truncated the ElevenLabs voice test."""
+    p = _fresh_player()
+    p._loop = asyncio.get_running_loop()  # what start() would set
+
+    _pump(p)                                    # callback sees an empty buffer
+    p._buf.extend(b"\x00\x01" * 960)            # one block appears
+    _pump(p)                                    # drains it; buffer empty again
+    await asyncio.sleep(0)                      # deferred re-sets fire
+    assert p._finished_event.is_set()
+
+    await p.write(b"\x00\x01" * (960 * 10))     # fresh audio lands NOW
+    assert not p._finished_event.is_set()
+
+    # The stale deferred sets (scheduled before the write) must NOT wake it.
+    await asyncio.sleep(0.05)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(p.wait_drained(), timeout=0.25)
+    assert p.seconds_queued() > 0               # audio is still queued
+
+    # Draining the real audio DOES signal, and the wait completes.
+    while p.seconds_queued() > 0:
+        _pump(p)
+        await asyncio.sleep(0)
+    await asyncio.wait_for(p.wait_drained(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_wait_drained_returns_immediately_when_idle():
+    """Idle player (nothing ever written): wait_drained is instant."""
+    p = _fresh_player()
+    p._loop = asyncio.get_running_loop()
+
+    await asyncio.wait_for(p.wait_drained(), timeout=0.1)  # must not block
+
+
+@pytest.mark.asyncio
+async def test_write_rearms_drained_wait_after_completion():
+    """write → drained → write again: the second wait must block until the
+    new audio drains (the orchestrator's wait_drained-then-write pattern)."""
+    p = _fresh_player()
+    p._loop = asyncio.get_running_loop()
+
+    await p.write(b"\x00\x01" * 1920)
+    assert not p._finished_event.is_set()
+    while p.seconds_queued() > 0:
+        _pump(p)
+        await asyncio.sleep(0)
+    await asyncio.wait_for(p.wait_drained(), timeout=1.0)
+
+    await p.write(b"\x00\x01" * 1920)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(p.wait_drained(), timeout=0.15)
+    while p.seconds_queued() > 0:
+        _pump(p)
+        await asyncio.sleep(0)
+    await asyncio.wait_for(p.wait_drained(), timeout=1.0)

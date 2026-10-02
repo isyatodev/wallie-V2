@@ -134,8 +134,20 @@ class Orchestrator:
         # examples (bounded — a busy chat must not grow this forever).
         self._gate_stats: dict[str, int] = {"chat_replied": 0, "chat_skipped": 0,
                                             "chat_low_value": 0, "acks_sent": 0,
-                                            "hearing_skipped": 0}
+                                            "hearing_skipped": 0, "llm_calls_saved": 0}
         self._gate_examples: deque[str] = deque(maxlen=8)
+        # Full record of what the gate SKIPPED (bounded), so the dashboard can
+        # inspect the gate's decisions and force a reply to one of them.
+        self._gate_skipped: deque[dict] = deque(maxlen=50)
+        # Monotonic counter for stable registry ids (chat-N / voice-N).
+        self._gate_skipped_seq = 0
+        # Bumped every time the registry changes; the open inspector modal
+        # compares it to notice new skips arrived and refresh itself.
+        self._gate_skipped_version = 0
+        # Message currently forced via the dashboard (id → original ChatMessage).
+        # Consumed by _choose_intent ahead of everything else — the user asked
+        # for THIS reply now, so it outranks vision/monologue/highlights.
+        self._forced_reply: Optional[dict] = None
         # Rolling log of (ts, normalized_text) Wallie recently SPOKE — used to reject
         # self-echo in the hearing transcript (our own TTS bleeding through loopback).
         self._recent_spoken: "deque[tuple[float, str]]" = deque(maxlen=24)
@@ -372,7 +384,12 @@ class Orchestrator:
                 "chat_low_value": self._gate_stats["chat_low_value"],
                 "acks_sent": self._gate_stats["acks_sent"],
                 "hearing_skipped": self._gate_stats["hearing_skipped"],
+                # Net LLM calls avoided this session: every gated-out chat/voice
+                # input counts +1, but a re-queued message that later lands is
+                # unwound (−1) so the number never overstates the savings.
+                "llm_calls_saved": self._gate_stats["llm_calls_saved"],
                 "examples": list(self._gate_examples),
+                "skipped": self.gate_skipped(),
             },
         }
 
@@ -470,6 +487,17 @@ class Orchestrator:
     # --- intent ---
     async def _choose_intent(self) -> Intent:
         self._drain_hearing()
+        # Dashboard-forced reply (gate panel "reply" button) — outranks every
+        # other intent so the user's explicit ask is honored immediately.
+        if self._forced_reply is not None:
+            fr = self._forced_reply
+            self._forced_reply = None
+            msg = ChatMessage(
+                platform=fr["platform"], username=fr["username"], text=fr["text"],
+                ts=time.time(), is_highlight=True,
+            )
+            self._mood.on_highlight_chat()
+            return Intent(kind="chat", chat=msg, urgent=True)
         highlight = self._pop_highlight_chat()
         if highlight:
             self._mood.on_highlight_chat()
@@ -867,6 +895,52 @@ class Orchestrator:
         if self._on_break:
             self._break_event.set()
 
+    # --- engagement gate: dashboard inspection + force reply ---
+    def gate_skipped(self) -> list[dict]:
+        """Recent inputs the gate skipped, newest first (dashboard panel)."""
+        return list(self._gate_skipped)
+
+    def gate_force_reply(self, msg_id: str) -> dict:
+        """Force a reply to a previously SKIPPED chat input.
+
+        Reconstructs the message and queues it ahead of everything else — the
+        user asked for THIS reply now. The savings counter unwinds (+1 skipped
+        → −1 now, so the panel never counts a forced turn as saved); the gated
+        original still waiting in the chat queue is removed so one input can't
+        be answered twice; forcing twice is a no-op.
+        """
+        entry = next((e for e in self._gate_skipped if e["id"] == msg_id), None)
+        if entry is None:
+            raise ValueError("skipped message not found (expired or already forced)")
+        if entry.get("forced"):
+            raise ValueError("already forced")
+        self._remove_gated_twin(entry["username"], entry["text"])
+        entry["forced"] = True
+        self._gate_stats["llm_calls_saved"] -= 1          # it WILL cost a call now
+        self._forced_reply = {"username": entry["username"], "text": entry["text"],
+                              "platform": entry["platform"]}
+        logger.info(f"gate: forcing reply to {entry['username']}: {entry['text'][:50]}")
+        return {"ok": True, "username": entry["username"], "text": entry["text"]}
+
+    def _remove_gated_twin(self, username: str, text: str) -> None:
+        """Skips are RE-QUEUED, not dropped — the gated original may still be
+        waiting in the chat queue. The forced reply replaces it; leave it in
+        and the same input ends up answered twice (and unwinds savings twice)."""
+        if not self._chat:
+            return
+        kept: list = []
+        while True:
+            try:
+                m = self._chat.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if (getattr(m, "gate_tagged_skip", False)
+                    and m.username == username and m.text == text):
+                continue                       # the twin — drop it
+            kept.append(m)
+        for m in kept:                         # ≥1 removed → cannot overflow
+            self._chat.queue.put_nowait(m)
+
     def _hearing_engaged(self, heard: str) -> bool:
         """Engagement-gate a heard line: reply only when the speech is aimed at
         Wallie or continues her thread. Music/sound events (wrapped in parens)
@@ -883,7 +957,20 @@ class Orchestrator:
         ok, reason = self._engagement.should_reply(text)
         if not ok:
             self._gate_stats["hearing_skipped"] += 1
+            self._gate_stats["llm_calls_saved"] += 1   # context-only → never a turn
             self._gate_examples.appendleft(f"[voice] {heard}")
+            # Same dedup as chat: the same line re-heard shouldn't stack rows.
+            if not any(e["kind"] == "voice" and e["text"] == heard
+                       for e in self._gate_skipped):
+                self._gate_skipped_seq += 1
+                self._gate_skipped.appendleft({
+                    "id": f"voice-{self._gate_skipped_seq}",
+                    "kind": "voice",
+                    "username": "",
+                    "text": heard,
+                    "ts": time.time(),
+                })
+                self._gate_skipped_version += 1
             logger.info(f"hearing gate: ignored ({reason}): {heard[:60]}")
         return ok
 
@@ -1002,10 +1089,31 @@ class Orchestrator:
                 if is_low_value_chat(msg.text):
                     logger.info(f"chat gate: dropped low-value from {msg.username}: {msg.text[:50]}")
                     self._gate_stats["chat_low_value"] += 1
+                    self._gate_stats["llm_calls_saved"] += 1   # dropped → never answered
                     return None
-                self._gate_stats["chat_skipped"] += 1
-                self._gate_examples.appendleft(f"[{msg.username}] {msg.text}")
-                self._maybe_acknowledge(f"{msg.username}: {msg.text}")
+                # Count ONCE per message: a gated skip is RE-QUEUED, so every
+                # main-loop pass would re-increment skip/savings and flood the
+                # examples deque — the tag marks it as already counted.
+                if not getattr(msg, "gate_tagged_skip", False):
+                    self._gate_stats["chat_skipped"] += 1
+                    self._gate_stats["llm_calls_saved"] += 1   # skipped now; unwinds if it lands later
+                    self._gate_examples.appendleft(f"[{msg.username}] {msg.text}")
+                    # Registry holds DISTINCT inputs (re-passes of a re-queued
+                    # message would otherwise pile identical forceable rows).
+                    if not any(e["kind"] == "skipped" and e["username"] == msg.username
+                               and e["text"] == msg.text for e in self._gate_skipped):
+                        self._gate_skipped_seq += 1
+                        self._gate_skipped.appendleft({
+                            "id": f"chat-{self._gate_skipped_seq}",
+                            "kind": "skipped",
+                            "username": msg.username,
+                            "text": msg.text,
+                            "ts": msg.ts,
+                            "platform": msg.platform,
+                        })
+                        self._gate_skipped_version += 1
+                    self._maybe_acknowledge(f"{msg.username}: {msg.text}")
+                    msg.gate_tagged_skip = True   # if it later lands, this counter unwinds
                 try:
                     self._chat.queue.put_nowait(msg)
                     return None
@@ -1014,6 +1122,12 @@ class Orchestrator:
                     return None
             logger.info(f"chat gate: reply ({reason}) to {msg.username}")
             self._gate_stats["chat_replied"] += 1
+            if getattr(msg, "gate_tagged_skip", False):
+                # This input was counted as "saved" when the gate skipped it, but
+                # a later mention brought it back and it WILL cost a call now —
+                # unwind so the panel doesn't overstate the savings.
+                msg.gate_tagged_skip = False
+                self._gate_stats["llm_calls_saved"] -= 1
         return msg
 
     # --- hearing (multimodal fusion) ---

@@ -43,11 +43,38 @@ def resolve_output_device(spec: Optional[int | str]) -> Optional[int | str]:
     return matches[0]
 
 
+def _output_candidates(spec: Optional[int | str], resolved: Optional[int | str]) -> list:
+    """Instances to try, in order: the resolved one first, then every other
+    instance of the same endpoint (one per host API). Windows exposes each
+    endpoint on up to four APIs and virtual-cable instances are sometimes
+    unroutable on one but fine on another — callers fall back down this list.
+    Only meaningful when the spec is a NAME; indices/default have no aliases."""
+    candidates = [resolved]
+    s = str(spec or "").strip()
+    if s and not s.lstrip("-").isdigit():
+        try:
+            nm = s.lower()
+            candidates.extend(
+                i for i, d in enumerate(sd.query_devices())
+                if i != resolved and nm in str(d.get("name", "")).lower()
+                and d.get("max_output_channels", 0) > 0
+            )
+        except Exception:  # noqa: BLE001 — enumeration is best-effort
+            pass
+    return candidates
+
+
 def play_test_beep(device: Optional[int | str] = None) -> dict:
     """Play a short tone through the given output device (resolver-aware).
 
     Used by the dashboard's "test output" button next to the device picker,
     so the user can confirm the TTS destination without a real utterance.
+
+    A bare NAME can match several instances of the same endpoint (one per
+    host API). If the preferred instance (WASAPI) refuses to open — virtual
+    cables managed by Voicemeeter are often enumerated but unroutable — the
+    other instances are tried before giving up, and the failure message says
+    what to do instead of surfacing a bare PaErrorCode.
     """
     idx = resolve_output_device(device)
     name = ""
@@ -62,15 +89,88 @@ def play_test_beep(device: Optional[int | str] = None) -> dict:
     except Exception:  # noqa: BLE001 — name/rate fall back to defaults
         pass
     dur = 0.25
-    t = np.linspace(0.0, dur, int(sr * dur), endpoint=False)
-    # 880 Hz sine with ~20 ms fade in/out so the beep doesn't click.
-    env = np.minimum(1.0, np.minimum(t / 0.02, (dur - t) / 0.02))
-    tone = (0.25 * np.sin(2 * np.pi * 880.0 * t) * env).astype("float32")
-    try:
-        sd.play(tone, sr, device=idx, blocking=True)
-    except Exception as e:  # surface the real reason (unplugged, busy, …)
-        raise RuntimeError(f"could not play on output {device!r}: {e}") from e
-    return {"device": name or ("system default" if idx is None else str(idx)), "index": idx, "seconds": dur}
+    candidates = _output_candidates(device, idx)
+
+    def _tone(rate: int):
+        t = np.linspace(0.0, dur, int(rate * dur), endpoint=False)
+        # 880 Hz sine with ~20 ms fade in/out so the beep doesn't click.
+        env = np.minimum(1.0, np.minimum(t / 0.02, (dur - t) / 0.02))
+        return (0.25 * np.sin(2 * np.pi * 880.0 * t) * env).astype("float32")
+
+    last_err: Optional[Exception] = None
+    for cand in candidates:
+        try:
+            rate = sr
+            try:
+                rate = int(round(sd.query_devices(cand).get("default_samplerate") or sr))
+            except Exception:  # noqa: BLE001 — keep the resolved rate
+                pass
+            sd.play(_tone(rate), rate, device=cand, blocking=True)
+            if cand != idx:
+                logger.warning(f"audio: test beep: device {idx} refused to open; "
+                               f"played on alternate instance {cand} instead")
+            return {"device": name or ("system default" if cand is None else str(cand)),
+                    "index": cand, "seconds": dur}
+        except Exception as e:  # try the next instance of the same endpoint
+            last_err = e
+
+    # Total failure. When the spec resolved to a REAL endpoint (Windows lists
+    # it), the useful message is 'it exists but won't open — re-pick it',
+    # regardless of which PaErrorCode each instance died with (-9996 open,
+    # -9999/-2004287478 DirectSound start, -9985 unavailable…).
+    resolved_to_real = any(isinstance(c, int) for c in candidates)
+    msg = f"could not play on output {device!r}: {last_err}"
+    if resolved_to_real:
+        msg += (" — the endpoint is listed by Windows but refuses to open "
+                "(typical of virtual cables under Voicemeeter); re-pick the "
+                "output on the Voice page and save")
+    raise RuntimeError(msg) from last_err
+
+
+def probe_output_device(spec: Optional[int | str], *, sample_rate: int = 24000,
+                        channels: int = 1) -> dict:
+    """Preflight probe: can the saved TTS output actually OPEN?
+
+    Enumeration alone lies — Windows lists endpoints that refuse to open
+    (PaErrorCode -9996), e.g. virtual cables managed by Voicemeeter, and the
+    session would run mute. Mirrors AudioPlayer.start()'s parameters (rate,
+    channels, WASAPI auto-convert) and candidate order (preferred instance
+    first, then every other instance of the same endpoint) WITHOUT playing:
+    a silent stream is opened, STARTED and immediately closed — some broken
+    instances (DirectSound of a dead endpoint) open fine and only fail at
+    start, so the probe does both. Nothing is audible: no audio is ever fed.
+    """
+    resolved = resolve_output_device(spec)
+    if resolved is None:
+        return {"ok": True, "index": None, "fallback_index": None}  # system default
+    candidates = _output_candidates(spec, resolved)
+    first_err: Optional[Exception] = None
+    for i, cand in enumerate(candidates):
+        try:
+            extra = None
+            try:
+                if isinstance(cand, int):
+                    ha = sd.query_hostapis(sd.query_devices(cand)["hostapi"])["name"]
+                    if "wasapi" in ha.lower():
+                        extra = sd.WasapiSettings(auto_convert=True)
+            except Exception:  # noqa: BLE001 — fall back to no extra settings
+                extra = None
+            # Matches AudioPlayer.start(); never fed audio → inaudible.
+            stream = sd.RawOutputStream(samplerate=sample_rate, channels=channels,
+                                        dtype="int16", device=cand,
+                                        extra_settings=extra,
+                                        callback=lambda outdata, frames, ti, st: None)
+            stream.start()
+            stream.stop()
+            stream.close()
+            return {"ok": True, "index": resolved,
+                    "fallback_index": (cand if i > 0 else None)}
+        except Exception as e:  # try the next instance of the same endpoint
+            if first_err is None:
+                first_err = e
+    return {"ok": False, "index": resolved,
+            "reason": str(first_err) if first_err else "no output device",
+            "fallback_index": None}
 
 
 def check_output_device(spec: Optional[int | str]) -> dict:
@@ -110,12 +210,37 @@ class AudioPlayer:
         self._finished_event = asyncio.Event()
         self._finished_event.set()
         self._pending_odd: Optional[int] = None
+        self._device_spec = device   # original spec, for messages/candidates
+        self._drain_gen = 0  # bumped by every write(); guards the drained signal
 
         self._stream: Optional[sd.RawOutputStream] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._last_write_ts: float = 0.0  # when audio was last queued (for hearing self-mute)
 
     # ----- lifecycle -----
+    def _open_stream(self, device) -> tuple[sd.RawOutputStream, bool]:
+        """Open (and start) the output stream on one concrete instance.
+        Returns (stream, used_wasapi_auto_convert)."""
+        extra = None
+        try:
+            if isinstance(device, int):
+                ha = sd.query_hostapis(sd.query_devices(device)["hostapi"])["name"]
+                if "wasapi" in ha.lower():
+                    extra = sd.WasapiSettings(auto_convert=True)
+        except Exception:  # noqa: BLE001 — fall back to no extra settings
+            extra = None
+        stream = sd.RawOutputStream(
+            samplerate=self._sr,
+            channels=self._channels,
+            dtype="int16",
+            blocksize=self._blocksize,
+            device=device,
+            callback=self._callback,
+            extra_settings=extra,
+        )
+        stream.start()
+        return stream, extra is not None
+
     def start(self) -> None:
         if self._stream is not None:
             return
@@ -126,26 +251,29 @@ class AudioPlayer:
         # WASAPI shared mode demands the stream rate match the device's mix format
         # (e.g. VB-CABLE is fixed at 48 kHz) and rejects our 24 kHz TTS otherwise.
         # Enable auto-convert on WASAPI devices so PortAudio resamples for us.
-        extra = None
-        try:
-            if isinstance(self._device, int):
-                ha = sd.query_hostapis(sd.query_devices(self._device)["hostapi"])["name"]
-                if "wasapi" in ha.lower():
-                    extra = sd.WasapiSettings(auto_convert=True)
-        except Exception:  # noqa: BLE001 — fall back to no extra settings
-            extra = None
-        self._stream = sd.RawOutputStream(
-            samplerate=self._sr,
-            channels=self._channels,
-            dtype="int16",
-            blocksize=self._blocksize,
-            device=self._device,
-            callback=self._callback,
-            extra_settings=extra,
-        )
-        self._stream.start()
-        logger.info(f"audio: playing at {self._sr} Hz, {self._channels}ch, block={self._blocksize}"
-                    f"{' (WASAPI auto-convert)' if extra else ''}")
+        # Some instances of the named endpoint refuse to open entirely
+        # (PaErrorCode -9996, e.g. virtual cables under Voicemeeter) while
+        # other instances of the SAME endpoint work — fall down the candidate
+        # list before failing. This is not a silent device change: every
+        # candidate routes to the endpoint the user picked.
+        last_err: Optional[Exception] = None
+        for i, cand in enumerate(_output_candidates(self._device_spec, self._device)):
+            try:
+                self._stream, auto = self._open_stream(cand)
+                if i > 0:
+                    logger.warning(
+                        f"audio: output {self._device_spec!r} refused to open on "
+                        f"instance {self._device!r}; using alternate instance {cand} "
+                        f"of the same endpoint")
+                logger.info(f"audio: playing at {self._sr} Hz, {self._channels}ch, "
+                            f"block={self._blocksize}{' (WASAPI auto-convert)' if auto else ''}")
+                return
+            except Exception as e:  # try the next instance of the same endpoint
+                last_err = e
+        raise RuntimeError(
+            f"could not open output {self._device_spec!r}: {last_err} — the endpoint "
+            "is listed by Windows but refuses to open (typical of virtual cables "
+            "under Voicemeeter); re-pick the output on the Voice page and save") from last_err
 
     def close(self) -> None:
         if self._stream is not None:
@@ -170,6 +298,7 @@ class AudioPlayer:
             return
         with self._lock:
             self._buf.extend(pcm)
+            self._drain_gen += 1  # invalidates any "empty buffer" seen before this write
         self._last_write_ts = time.time()
         self._finished_event.clear()
         await asyncio.sleep(0)
@@ -227,16 +356,30 @@ class AudioPlayer:
             else:
                 chunk = b""
             empty_after = len(self._buf) == 0
+            gen = self._drain_gen
 
         if take < needed:
             chunk = chunk + b"\x00" * (needed - take)
         outdata[: len(chunk)] = chunk
 
         if empty_after and self._loop is not None:
+            # "Drained" only if nothing was written since we observed the empty
+            # buffer. A write landing between that observation and this deferred
+            # set bumps _drain_gen, and the callback that drains the NEW audio
+            # signals instead. Without this guard, a callback that ran just
+            # before a write re-set the event after the write cleared it, and
+            # wait_drained() returned with the fresh audio still queued — the
+            # voice test got cut off after ~2s (ElevenLabs streams arrive in
+            # one burst, hitting the race almost every time).
+            def _signal_drained(g: int = gen) -> None:
+                with self._lock:
+                    if self._drain_gen == g:
+                        self._finished_event.set()
+
             try:
-                self._loop.call_soon_threadsafe(self._finished_event.set)
+                self._loop.call_soon_threadsafe(_signal_drained)
             except RuntimeError:
-                pass
+                pass  # event loop closed mid-playback
 
 
 def list_output_devices() -> list[dict]:
