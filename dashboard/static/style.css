@@ -30,6 +30,14 @@
   --err: #ef4444;
   --info: #60a5fa;
 
+  /* Accent helpers — re-derived per theme below (body[data-theme]) so every
+     accent-tinted surface swaps together when the theme changes. */
+  --accent-ink: #04161b;                       /* text on solid accent fills */
+  --accent-deep: #0b4a56;                      /* dark end of the brand-mark gradient */
+  --accent-glow: rgba(34, 211, 238, .28);      /* accent-tinted shadows */
+  --bg-tint-a: #0c1418;                        /* body radial tints (theme-flavored) */
+  --bg-tint-b: #081114;
+
   /* Geometry */
   --radius: 8px;
   --radius-sm: 6px;
@@ -45,6 +53,32 @@
   color-scheme: dark;   /* UA controls (dropdowns, autofill, scrollbars) stay dark */
 }
 
+/* ============ THEMES ============ */
+/* The dashboard accent theme is a per-profile setting (AppConfig.dashboard_theme).
+   The UI sets <body data-theme="…">; the :root defaults above ARE the cyan
+   theme, so cyan needs no overrides. Only swap what is accent-tinted — the
+   neutral surfaces/text stay identical across themes. */
+body[data-theme="amber"] {
+  --accent: #fbbf24;                        /* amber-400 */
+  --accent-soft: #fbbf2424;
+  --accent-hot: #fcd34d;                    /* amber-300 */
+  --accent-ink: #201302;
+  --accent-deep: #5c3a05;
+  --accent-glow: rgba(251, 191, 36, .28);
+  --bg-tint-a: #171005;
+  --bg-tint-b: #120d04;
+}
+body[data-theme="rose"] {
+  --accent: #fb7185;                        /* rose-400 */
+  --accent-soft: #fb718524;
+  --accent-hot: #fda4af;                    /* rose-300 */
+  --accent-ink: #26060d;
+  --accent-deep: #5c1122;
+  --accent-glow: rgba(251, 113, 133, .28);
+  --bg-tint-a: #170a10;
+  --bg-tint-b: #11060b;
+}
+
 * { box-sizing: border-box; }
 html, body { height: 100%; }
 body {
@@ -53,8 +87,8 @@ body {
   font-size: 13px;
   color: var(--fg-0);
   background:
-    radial-gradient(1200px 600px at 80% -10%, #0c1418 0%, transparent 60%),
-    radial-gradient(900px 500px at -10% 110%, #081114 0%, transparent 60%),
+    radial-gradient(1200px 600px at 80% -10%, var(--bg-tint-a) 0%, transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, var(--bg-tint-b) 0%, transparent 60%),
     var(--bg-0);
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
@@ -78,7 +112,7 @@ body {
   width: 24px; height: 24px;
   border-radius: 6px;
   background:
-    radial-gradient(circle at 30% 30%, var(--accent-hot), var(--accent) 60%, #0b4a56 100%);
+    radial-gradient(circle at 30% 30%, var(--accent-hot), var(--accent) 60%, var(--accent-deep) 100%);
   box-shadow: 0 0 18px var(--accent-soft), inset 0 0 6px rgba(255,255,255,.25);
 }
 .brand-text { line-height: 1; }
@@ -108,6 +142,9 @@ body {
 .profile-picker select option {
   background: var(--bg-2); color: var(--fg-0);
 }
+
+/* Accent-theme picker (topbar) — same chrome as the profile picker. */
+.theme-picker select { min-width: 84px; text-transform: capitalize; }
 
 .topbar-right { display: flex; align-items: center; gap: 8px; }
 .status-pill {
@@ -139,7 +176,7 @@ body {
 .btn:hover:not(:disabled) { background: #1a1e23; border-color: #343b43; }
 .btn:active:not(:disabled) { transform: translateY(1px); }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-.btn.primary { background: var(--accent); color: #04161b; border-color: var(--accent); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 .btn.primary:hover:not(:disabled) { background: var(--accent-hot); }
 .btn.warn { background: transparent; color: var(--warn); border-color: var(--warn); }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--fg-2); }
@@ -370,8 +407,8 @@ input[type=range]::-moz-range-thumb {
 .segmented button:hover { color: var(--fg-0); background: var(--bg-2); }
 .segmented button.on {
   background: var(--accent);
-  color: #04161b;
-  box-shadow: 0 1px 4px rgba(34,211,238,.28);
+  color: var(--accent-ink);
+  box-shadow: 0 1px 4px var(--accent-glow);
 }
 
 /* Toggle switch (checkbox styled) */

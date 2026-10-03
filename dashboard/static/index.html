@@ -14,8 +14,8 @@
   .wz-head{display:flex;align-items:center;justify-content:space-between;padding:1.5rem 1.75rem 1rem}
   .wz-steps{display:flex;gap:.5rem;align-items:center}
   .wz-dot{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:.78rem;font-weight:700;background:rgba(255,255,255,.07);color:#8b96a3;border:1px solid rgba(255,255,255,.08);transition:.2s}
-  .wz-dot.on{background:linear-gradient(120deg,#67e8f9,#22d3ee);color:#04161b;border-color:transparent}
-  .wz-dot.done{background:rgba(34,211,238,.18);color:#22d3ee}
+  .wz-dot.on{background:linear-gradient(120deg,var(--accent-hot),var(--accent));color:var(--accent-ink);border-color:transparent}
+  .wz-dot.done{background:var(--accent-soft);color:var(--accent)}
   .wz-x{background:none;border:none;color:#8b96a3;font-size:1.4rem;cursor:pointer;line-height:1;padding:.2rem .4rem;border-radius:8px}
   .wz-x:hover{color:#fff;background:rgba(255,255,255,.06)}
   /* ---- pre-start checklist ---- */
@@ -39,27 +39,27 @@
   .wz-sub{color:#aeb6c2;font-size:.95rem;line-height:1.55;margin-bottom:1.4rem}
   .wz-grid{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}
   .wz-opt{text-align:left;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:1.1rem 1.2rem;cursor:pointer;transition:.2s;color:inherit;font-family:inherit}
-  .wz-opt:hover{border-color:rgba(34,211,238,.5);background:rgba(34,211,238,.08);transform:translateY(-2px)}
-  .wz-opt.sel{border-color:#22d3ee;background:rgba(34,211,238,.12)}
+  .wz-opt:hover{border-color:var(--accent-glow);background:var(--accent-soft);transform:translateY(-2px)}
+  .wz-opt.sel{border-color:var(--accent);background:var(--accent-soft)}
   .wz-opt h4{font-size:1.02rem;font-weight:700;margin:0 0 .25rem;display:flex;align-items:center;gap:.45rem}
   .wz-opt p{font-size:.84rem;color:#aeb6c2;line-height:1.45;margin:0}
-  .wz-badge{font-size:.62rem;font-weight:800;text-transform:uppercase;letter-spacing:.06em;padding:.12rem .5rem;border-radius:980px;background:rgba(34,211,238,.16);color:#22d3ee}
+  .wz-badge{font-size:.62rem;font-weight:800;text-transform:uppercase;letter-spacing:.06em;padding:.12rem .5rem;border-radius:980px;background:var(--accent-soft);color:var(--accent)}
   .wz-price{font-size:.78rem;color:#6b7480;margin-top:.5rem}
   .wz-keyrow{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:1.1rem 1.2rem;margin-bottom:.8rem}
   .wz-keyrow .wz-kh{display:flex;align-items:center;justify-content:space-between;gap:.5rem;margin-bottom:.6rem}
   .wz-keyrow label{font-weight:600;font-size:.95rem}
-  .wz-getlink{font-size:.8rem;color:#22d3ee;text-decoration:none;white-space:nowrap}
+  .wz-getlink{font-size:.8rem;color:var(--accent);text-decoration:none;white-space:nowrap}
   .wz-getlink:hover{text-decoration:underline}
   .wz-inrow{display:flex;gap:.5rem}
   .wz-inrow input{flex:1;background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.14);border-radius:10px;padding:.6rem .8rem;color:#fff;font-size:.9rem;font-family:inherit;outline:none}
-  .wz-inrow input:focus{border-color:#22d3ee}
+  .wz-inrow input:focus{border-color:var(--accent)}
   .wz-msg{font-size:.82rem;margin-top:.5rem}
   .wz-msg.ok{color:#34d399}
   .wz-msg.bad{color:#f87171}
-  .wz-note{font-size:.82rem;color:#aeb6c2;background:rgba(34,211,238,.07);border:1px solid rgba(34,211,238,.16);border-radius:12px;padding:.8rem 1rem;line-height:1.5;margin-top:.4rem}
+  .wz-note{font-size:.82rem;color:#aeb6c2;background:var(--accent-soft);border:1px solid var(--accent-glow);border-radius:12px;padding:.8rem 1rem;line-height:1.5;margin-top:.4rem}
   .wz-foot{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:1.1rem 1.75rem 1.6rem;border-top:1px solid rgba(255,255,255,.07)}
   .wz-btn{border:none;cursor:pointer;font-family:inherit;font-weight:700;font-size:.95rem;padding:.7rem 1.5rem;border-radius:980px;transition:.2s}
-  .wz-btn.primary{background:linear-gradient(120deg,#67e8f9,#22d3ee);color:#04161b}
+  .wz-btn.primary{background:linear-gradient(120deg,var(--accent-hot),var(--accent));color:var(--accent-ink)}
   .wz-btn.primary:hover{filter:brightness(1.08);transform:translateY(-1px)}
   .wz-btn.primary:disabled{opacity:.4;cursor:not-allowed;filter:none;transform:none}
   .wz-btn.ghost{background:rgba(255,255,255,.06);color:#d6d8ea}
@@ -114,6 +114,14 @@
   </div>
 
   <div class="topbar-right">
+    <div class="profile-picker theme-picker" title="Accent theme — saved per profile">
+      <label>Theme</label>
+      <select x-model="cfg.dashboard_theme" @change="setTheme($event.target.value)">
+        <option value="cyan">Cyan</option>
+        <option value="amber">Amber</option>
+        <option value="rose">Rose</option>
+      </select>
+    </div>
     <div class="status-pill" :class="running ? 'on' : 'off'">
       <span class="dot"></span>
       <span x-text="running ? 'LIVE' : 'IDLE'"></span>
@@ -1850,7 +1858,7 @@
         </p>
       </header>
 
-      <div class="warn-banner" style="border-color: rgba(34,211,238,.35); background: rgba(34,211,238,.06); color: #9fdbe8;">
+      <div class="warn-banner" style="border-color: var(--accent-glow); background: var(--accent-soft); color: var(--accent-hot);">
         <b>Heads up:</b> the dashboard runs on <code>127.0.0.1</code> by default
         and is unauthenticated. If you change <code>DASHBOARD_HOST</code> to bind
         to your LAN, anyone on that network can read masked previews and

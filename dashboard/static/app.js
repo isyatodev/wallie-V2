@@ -35,6 +35,10 @@ const HUMOR_OPTIONS = [
   "self_deprecating", "roast", "wholesome", "chaotic",
 ];
 
+// Dashboard accent themes (body[data-theme]) — kept in sync with the option
+// list in index.html's theme picker and AppConfig.dashboard_theme.
+const THEME_OPTIONS = ["cyan", "amber", "rose"];
+
 const EMOTION_SLOTS = [
   "happy", "surprised", "laughing", "angry", "sad",
   "thinking", "smug", "eyeroll", "confused", "hype", "deadpan",
@@ -96,6 +100,7 @@ const WIZARD_KEYMETA = {
 function emptyCfg() {
   return {
     profile_name: "default",
+    dashboard_theme: "cyan",
     persona: {
       name: "", handle: "", language: "en", pronouns: "", age_range: "", origin: "", archetype: "",
       backstory: "",
@@ -982,9 +987,35 @@ function app() {
       // Merge into empty to ensure newly added fields exist.
       const base = emptyCfg();
       this.cfg = deepMerge(base, fetched);
+      // Theme rides on the profile: each persona keeps its own accent.
+      this.applyTheme(this.cfg.dashboard_theme);
       // Textarea <-> list bridge for the thought seed pool.
       this.cfg.random_thoughts.seed_topics_text =
         (this.cfg.random_thoughts.seed_topics || []).join("\n");
+    },
+
+    // ----- dashboard accent theme (saved per profile) -----
+    applyTheme(theme) {
+      const t = THEME_OPTIONS.includes(theme) ? theme : "cyan";
+      document.body.dataset.theme = t;
+    },
+
+    async setTheme(theme) {
+      this.cfg.dashboard_theme = theme;
+      this.applyTheme(theme);
+      // Persist immediately onto the ACTIVE profile (the server merges this
+      // single key into the saved config) — a theme pick shouldn't require
+      // hitting Save, nor persist unrelated unsaved edits.
+      try {
+        const r = await fetch("/api/config", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ dashboard_theme: theme }),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      } catch (e) {
+        console.warn("setTheme:", e);
+      }
     },
 
     dismissHealed() {

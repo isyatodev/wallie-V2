@@ -709,6 +709,11 @@ class CaptionsConfig(BaseModel):
 
 class AppConfig(BaseModel):
     profile_name: str = "default"
+    # Dashboard accent theme: "cyan" | "amber" | "rose". Stored per profile so
+    # each persona gets its own control-room look. Plain str (not Literal) on
+    # purpose: a hand-edited YAML with a bogus theme must never block profile
+    # loading — the UI falls back to cyan for unknown values.
+    dashboard_theme: str = "cyan"
     # --- Dynamic provider blocks (managed on the API Keys page) ---
     # Named OpenAI-compatible endpoints; subsystems point at one by name.
     providers: list[ProviderBlock] = Field(default_factory=list[ProviderBlock])
