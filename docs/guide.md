@@ -33,7 +33,9 @@ Everything you need to set up, configure, and run Wallie. If something isn't cov
 
 [Download the ZIP](https://github.com/Alradyin/wallie-V2/archive/refs/heads/main.zip) and unzip it (or `git clone https://github.com/Alradyin/wallie-V2.git`), then **double-click `start.bat`**.
 
-That's it. The first run installs everything it needs (Python included, if missing), then opens the dashboard at `http://127.0.0.1:8765`. Paste your API key there and hit Start.
+That's it. The first run installs everything it needs (Python included, if missing), sets up the free local voice (**Kokoro**, English US by default — pt-BR and 7 more languages included), then opens the dashboard at `http://127.0.0.1:8765`. Paste your API key there and hit Start.
+
+Want to skip the voice download, or pre-load a different language? Set the setup variables below (`WALLIE_SKIP_KOKORO=1`, `WALLIE_KOKORO_LANG=p WALLIE_KOKORO_VOICE=pf_dora`) and double-click `install.bat`.
 
 ### macOS / Linux
 
@@ -50,7 +52,8 @@ Nothing to install by hand — `start.bat` handles it. For reference:
 
 - **Python 3.11+** (auto-installed on Windows if missing)
 - No GPU required — everything runs on CPU + external APIs
-- ~200 MB disk space (excluding Python/venv)
+- ~200 MB disk space (excluding Python/venv and the local voice)
+- The free local voice the Windows setup pre-installs (Kokoro) adds ~500 MB — skip it with `WALLIE_SKIP_KOKORO=1` if that matters
 - Internet connection (unless using Piper + Ollama for a fully offline setup)
 
 ### Manual Install (if the scripts don't work)
@@ -237,12 +240,14 @@ In the dashboard, vision-capable models are labeled with `· vision` in the drop
 | **Fish Audio** | Natural | Low (~200ms) | Yes (upload samples) | ~$15/M chars |
 | **ElevenLabs** | Most natural | Low (~300ms) | Yes (best in class) | ~$30/M chars |
 | **Piper** | Robotic but clear | Instant (local) | No | Free |
+| **Kokoro** | Natural (local) | Instant (local) | No | Free |
 
 ### Recommendations
 
 - **Budget** → Fish Audio (half the price of ElevenLabs, nearly as good)
 - **Best quality** → ElevenLabs (most natural, best cloning)
 - **Free** → Piper (sounds robotic but perfectly functional)
+- **Free, better voice** → Kokoro (local and natural, also speaks pt-BR — the Windows setup installs and pre-downloads it for you; see the local voice setup variables above)
 
 ### Finding a Voice ID
 
@@ -697,6 +702,16 @@ All set via the dashboard **API Keys** tab or manually in `.env`:
 | `DASHBOARD_HOST` | `0.0.0.0` | Bind address. Set to `127.0.0.1` to disable remote access. |
 | `DASHBOARD_PORT` | `8765` | Dashboard port |
 | `DASHBOARD_PIN` | (auto) | PIN for remote access. Auto-generated if not set. |
+
+### Local Voice Setup (Windows)
+
+Read by `install.bat` / the Kokoro installer — set them in the shell you run the setup from (not in `.env`):
+
+| Variable | Default | What |
+|---|---|---|
+| `WALLIE_SKIP_KOKORO` | (unset) | Set to `1` to skip installing and pre-downloading the free local voice. |
+| `WALLIE_KOKORO_LANG` | `a` | Kokoro language the setup pre-downloads — `p` for Portuguese (Brazil). |
+| `WALLIE_KOKORO_VOICE` | (language default) | Voice id to pre-download, e.g. `pf_dora`. |
 
 ---
 

@@ -8,6 +8,8 @@ import random
 import secrets
 import socket
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -19,6 +21,7 @@ from loguru import logger
 from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.responses import Response
+from starlette.types import Scope
 
 from audio.player import check_output_device, list_output_devices, play_test_beep
 from hearing.capture import list_loopback_devices, resolve_loopback_device
@@ -41,6 +44,28 @@ from llm import build_provider
 from tts import build_tts
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+class _NoCacheStatic(StaticFiles):
+    """Static assets, revalidated on every load.
+
+    ``/static`` URLs are not versioned, and the browser's heuristic freshness
+    (10% of the file's age) is enough to keep serving a stylesheet from cache
+    for minutes after it changed — you edit the UI, reload, and the browser
+    shows the old design. ``no-cache`` means "revalidate", not "don't store":
+    the ETag makes each check a cheap 304, so we get fresh assets for free.
+    """
+
+    def file_response(
+        self,
+        full_path: os.PathLike,
+        stat_result: os.stat_result,
+        scope: Scope,
+        status_code: int = 200,   # noqa: ARG002 — signature fixed by StaticFiles
+    ) -> Response:
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 # -------------------------------------------------------------------
@@ -66,7 +91,7 @@ _DEFAULT_TEST_MODELS = {
     "groq": "llama-3.1-8b-instant",
     "openrouter": "openai/gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.8-flash",
     "ollama": "llama3.2",
 }
 
@@ -107,6 +132,16 @@ class DashboardState:
         self.orchestrator: Optional[Orchestrator] = None
         self.clients: set[WebSocket] = set()
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1000)
+        # Kokoro one-click install job (Voice-tab badge). Read by
+        # GET /api/tts/kokoro/status; updated by the background installer task.
+        self.kokoro_install: dict[str, Any] = {
+            "running": False,
+            "lang": None,
+            "started_at": None,
+            "finished_at": None,
+            "returncode": None,
+            "log": "",
+        }
 
     def emit_memory_event(self, payload: dict[str, Any]) -> None:
         """Sink for MemoryCapture.on_captured — pushes each AI-captured fact
@@ -222,6 +257,70 @@ class VisionModelsBody(BaseModel):
     provider_ref: str = ""
 
 
+class TestVisionBody(BaseModel):
+    """Optional overrides for POST /api/test/vision.
+
+    Blank = behave exactly like a live session (resolved dedicated vision block,
+    else the main engine). Filling any field builds a THROWAWAY provider so a
+    candidate model can be smoked-tested before it is saved into the profile —
+    the fix for a retired model (e.g. gemini-2.5-flash returning 404)."""
+
+    provider: str = ""      # "" = configured engine provider
+    model: str = ""         # "" = configured model (vision block, else engine)
+    base_url: str = ""      # "" = configured endpoint (openai_compatible / ollama)
+    provider_ref: str = ""  # "" = configured vision block
+
+    def has_override(self) -> bool:
+        return bool(
+            (self.provider or self.model or self.base_url).strip()
+        )
+
+
+class VoiceSampleBody(BaseModel):
+    filename: str = ""
+    data: str = ""   # base64 (a data: URL prefix is tolerated)
+
+
+class VoicePresetBody(BaseModel):
+    name: str
+    provider: str = ""
+    voice_id: str = ""
+    notes: str = ""
+    tts: dict[str, Any] = {}
+    source: str = "manual"
+
+
+class VoiceCloneBody(BaseModel):
+    provider: str                  # "elevenlabs" | "fish"
+    name: str
+    description: str = ""
+    samples: list[VoiceSampleBody] = []
+    save_preset: bool = True
+
+
+class VoiceRecordBody(BaseModel):
+    seconds: float = 8.0
+
+
+class VoicePreviewBody(BaseModel):
+    """One line, one voice, audio back to the caller (no playback).
+
+    ``name`` resolves a SAVED voice from the profile's library; when it is blank
+    the inline provider/voice/tts fields win; when those are blank too the saved
+    config is used."""
+
+    text: str
+    name: str = ""
+    provider: str = ""
+    voice_id: str = ""
+    tts: dict[str, Any] = {}
+
+
+class KokoroInstallBody(BaseModel):
+    lang: str = "a"     # Kokoro lang_code — picks which language extra (misaki) to pull in
+    voice: str = ""     # optional voice to pre-download (defaults to the language's first)
+
+
 class TestProviderBody(BaseModel):
     # "openai" | "groq" | "openrouter" | "anthropic" | "gemini" | "fish" | "elevenlabs" | "piper"
     provider: str
@@ -288,6 +387,109 @@ def _record_mic(seconds: float) -> Any:
             except Exception:  # noqa: BLE001
                 pass
     return np.concatenate(frames) if frames else np.zeros(0, dtype="float32")
+
+
+@dataclass
+class _SynthResult:
+    """One TTS synthesis plus how it was obtained — raw PCM16 on success, an
+    actionable message on failure. Exactly one of ``pcm``/``error`` is set."""
+
+    pcm: bytes = b""
+    decoded: bool = False        # the payload needed the ffmpeg fallback
+    sample_rate: int = 24000
+    channels: int = 1
+    error: str = ""
+
+
+async def _synthesize_pcm(tts_cfg: Any, tts_secrets: Any, text: str) -> _SynthResult:
+    """Build the TTS provider, synthesize ``text`` and normalize the answer to
+    raw PCM16 (including the gateway-answered-MP3 fallback).
+
+    Module level on purpose: the Voice page's ▶ test and the Voice Lab A/B share
+    exactly one decode path, and tests can patch ``build_tts`` /
+    ``tts.decode.find_ffmpeg`` and exercise either route through it.
+    """
+    from tts.base import TTSError
+    # Imported HERE, not at module scope: tests patch tts.decode.find_ffmpeg and
+    # the patch has to be visible from this call site.
+    from tts.decode import find_ffmpeg, sniff_compressed
+
+    try:
+        tts = build_tts(tts_cfg, tts_secrets)
+    except TTSError as e:
+        return _SynthResult(error=str(e))
+    res = _SynthResult(
+        sample_rate=int(getattr(tts, "sample_rate", 24000) or 24000),
+        channels=int(getattr(tts, "channels", 1) or 1),
+    )
+    chunks: list[bytes] = []
+    try:
+        async for pcm in tts.synthesize(text):
+            chunks.append(pcm)
+    except TTSError as e:
+        res.error = str(e)
+        return res
+    except Exception as e:
+        logger.exception("dashboard: tts synthesis failed")
+        res.error = f"synthesis failed: {e}"
+        return res
+    finally:
+        await tts.aclose()
+
+    raw = b"".join(chunks)
+    if not raw:
+        res.error = (
+            "endpoint returned no audio — check the model/voice names and "
+            "that the key has TTS access"
+        )
+        return res
+
+    label = sniff_compressed(raw[:12])
+    if label == "json-or-xml":
+        # A gateway that hid its error inside an HTTP 200. Decoding it with ffmpeg
+        # would only produce "invalid data"; show the endpoint's own message.
+        res.error = (
+            "endpoint answered an error body instead of audio: "
+            f"{_scrub_error(raw.decode('utf-8', 'replace'), 200)}"
+        )
+        return res
+    if label:
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            res.error = (
+                "endpoint answered a compressed format (MP3/OGG) and ffmpeg "
+                "is unavailable — install ffmpeg, `pip install imageio-ffmpeg`, "
+                "or set WALLIE_FFMPEG"
+            )
+            return res
+        from tts.decode import decode_to_pcm16, looks_like_mp3_frame_sync
+        try:
+            raw = await decode_to_pcm16(raw, ffmpeg, res.sample_rate)
+        except RuntimeError as e:
+            # Raw PCM16 whose first sample is -1 starts with FF FF, which is
+            # byte-for-byte the MP3 sync word — and a leading silence ramp (how
+            # TTS clips usually begin) makes that first sample common. ffmpeg
+            # failing on a payload that matches ONLY that ambiguous signature
+            # means it was PCM all along; failing the whole clip over it would
+            # be a false alarm. Genuine containers (RIFF/OggS/ID3) still error.
+            if not looks_like_mp3_frame_sync(raw[:12]):
+                res.error = str(e)
+                return res
+            logger.info(
+                "tts: payload matched the MP3 sync word but ffmpeg could not "
+                "decode it — treating it as raw PCM (first sample is 0x%s)",
+                raw[:2].hex(),
+            )
+        else:
+            res.decoded = True
+
+    if len(raw) < 64:  # plausible audio of a sentence is way longer
+        res.error = f"audio too short ({len(raw)} bytes) — endpoint likely rejected the request"
+        return res
+    if len(raw) % 2:
+        raw = raw[:-1]
+    res.pcm = raw
+    return res
 
 
 def _build_app(
@@ -511,6 +713,255 @@ def _build_app(
         except Exception as e:
             logger.exception("dashboard: tts voices fetch failed")
             raise HTTPException(status_code=500, detail=str(e)[:220])
+
+    # ---------- Kokoro (optional local TTS) — status + one-click install ----------
+    from tts import kokoro_setup as _kokoro
+
+    _KOKORO_INSTALL_TIMEOUT = 1800.0
+
+    async def _run_kokoro_install(lang: str, voice: str) -> None:
+        """Run `install_kokoro.py --install` off the event loop and record the
+        outcome on state.kokoro_install so the Voice-tab badge can poll it."""
+        job = state.kokoro_install
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *_kokoro.install_argv(lang, voice),
+                cwd=str(_kokoro.REPO_ROOT),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except Exception as e:
+            job.update(running=False, returncode=-1, finished_at=time.time(),
+                       log=f"could not start the installer: {_scrub_error(str(e))}")
+            return
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=_KOKORO_INSTALL_TIMEOUT)
+        except asyncio.TimeoutError:
+            proc.kill()
+            job.update(running=False, returncode=-1, finished_at=time.time(),
+                       log="install timed out — check your connection and try again")
+            return
+        job.update(
+            running=False,
+            returncode=proc.returncode,
+            finished_at=time.time(),
+            log=(out or b"").decode("utf-8", "ignore")[-4000:],
+        )
+
+    @app.get("/api/tts/kokoro/status")
+    def api_kokoro_status() -> dict[str, Any]:
+        """Is the local Kokoro voice installed? Cheap metadata probe + install job."""
+        return {"ok": True, **_kokoro.detect(), "install": dict(state.kokoro_install)}
+
+    @app.post("/api/tts/kokoro/install")
+    async def api_kokoro_install(body: KokoroInstallBody) -> dict[str, Any]:
+        """Start a background pip install of the project-compatible Kokoro packages."""
+        if not _kokoro.INSTALL_SCRIPT.is_file():
+            raise HTTPException(400, "installer script missing: scripts/install_kokoro.py")
+        lang = (body.lang or "a").strip().lower()
+        if lang not in _kokoro.LANG_CODES:
+            raise HTTPException(400, f"unknown Kokoro language {lang!r}")
+        if state.kokoro_install["running"]:
+            raise HTTPException(409, "a Kokoro install is already running")
+        voice = (body.voice or "").strip()
+        state.kokoro_install.update(
+            running=True, lang=lang, started_at=time.time(),
+            finished_at=None, returncode=None, log="installing…",
+        )
+        asyncio.create_task(_run_kokoro_install(lang, voice), name="kokoro-install")
+        return {"ok": True, "started": True, "lang": lang}
+
+    # ---------- Voice Lab — saved voices + voice cloning ----------
+    from tts import voice_lab as _vlab
+
+    def _voice_library_payload(profile: str) -> dict[str, Any]:
+        from config import get_runtime
+        secrets_obj = get_runtime().secrets
+        ready = {
+            "elevenlabs": bool((secrets_obj.elevenlabs_api_key or "").strip()),
+            "fish": bool((secrets_obj.fish_api_key or "").strip()),
+        }
+        return {
+            "profile": profile,
+            "presets": [p.to_dict() for p in _vlab.load_library(profile)],
+            "providers": [
+                {**spec, "ready": bool(ready.get(spec["id"]))}
+                for spec in _vlab.CLONE_PROVIDERS
+            ],
+        }
+
+    @app.get("/api/voices/library")
+    def api_voices_library() -> dict[str, Any]:
+        """Saved voices for the active profile + which cloning backends have a key."""
+        cfg = load_profile()
+        return _voice_library_payload(cfg.profile_name)
+
+    @app.post("/api/voices/library")
+    def api_voices_library_add(body: VoicePresetBody) -> dict[str, Any]:
+        cfg = load_profile()
+        try:
+            preset = _vlab.add_preset(cfg.profile_name, body.model_dump())
+        except _vlab.VoiceLabError as e:
+            raise HTTPException(400, str(e))
+        return {"ok": True, "preset": preset.to_dict(),
+                **_voice_library_payload(cfg.profile_name)}
+
+    @app.delete("/api/voices/library/{name}")
+    def api_voices_library_delete(name: str) -> dict[str, Any]:
+        cfg = load_profile()
+        if not _vlab.remove_preset(cfg.profile_name, name):
+            raise HTTPException(404, f"no saved voice named {name}")
+        return {"ok": True, **_voice_library_payload(cfg.profile_name)}
+
+    @app.post("/api/voices/clone")
+    async def api_voices_clone(body: VoiceCloneBody) -> dict[str, Any]:
+        """Create a real voice at ElevenLabs / Fish Audio from reference audio.
+
+        The dashboard posts base64 samples (it has no multipart parser installed),
+        which are decoded here and uploaded as multipart to the provider."""
+        import base64 as _b64
+
+        from config import get_runtime
+        cfg = load_profile()
+        runtime = get_runtime()
+        samples: list[tuple[str, bytes]] = []
+        for i, s in enumerate(body.samples, 1):
+            raw = (s.data or "").split(",", 1)[-1]      # tolerate a data: URL prefix
+            try:
+                blob = _b64.b64decode(raw, validate=False)
+            except Exception:
+                raise HTTPException(400, f"sample {s.filename or i} is not valid base64")
+            samples.append((s.filename or f"sample{i}.wav", blob))
+        try:
+            voice_id = await _vlab.clone_voice(
+                provider=body.provider,
+                name=body.name,
+                description=body.description,
+                samples=samples,
+                secrets=runtime.secrets,
+            )
+        except _vlab.VoiceLabError as e:
+            raise HTTPException(400, str(e))
+        preset = None
+        if body.save_preset:
+            try:
+                preset = _vlab.add_preset(cfg.profile_name, {
+                    "name": body.name,
+                    "provider": body.provider,
+                    "voice_id": voice_id,
+                    "source": f"clone:{body.provider}",
+                    "notes": body.description,
+                })
+            except _vlab.VoiceLabError as e:
+                # The voice EXISTS at the provider — report it, don't fail the call.
+                logger.warning(f"voice lab: clone succeeded but preset save failed: {e}")
+        return {
+            "ok": True,
+            "provider": body.provider,
+            "voice_id": voice_id,
+            "preset": preset.to_dict() if preset else None,
+            **_voice_library_payload(cfg.profile_name),
+        }
+
+    @app.post("/api/voices/record")
+    async def api_voices_record(body: VoiceRecordBody) -> dict[str, Any]:
+        """Record a reference sample from the default microphone.
+
+        Returns a WAV the browser can play back and feed straight into a clone,
+        so a voice can be built without leaving the dashboard."""
+        import base64 as _b64
+
+        seconds = max(1.0, min(30.0, float(body.seconds or 8.0)))
+        try:
+            pcm = await asyncio.to_thread(_record_mic, seconds)
+        except Exception as e:  # noqa: BLE001 — soundcard/COM failures are expected
+            raise HTTPException(400, f"recording failed: {str(e)[:200]}")
+        if getattr(pcm, "size", 0) == 0:
+            raise HTTPException(400, "nothing was recorded — check the default microphone")
+        wav = _vlab.pcm16_wav_bytes(pcm, 16000)
+        return {
+            "ok": True,
+            "sample_rate": 16000,
+            "seconds": round(len(pcm) / 16000.0, 2),
+            "wav_b64": _b64.b64encode(wav).decode("ascii"),
+        }
+
+    @app.post("/api/voices/preview")
+    async def api_voices_preview(body: VoicePreviewBody) -> dict[str, Any]:
+        """Synthesize one line with a chosen voice and return it as a playable WAV.
+
+        Unlike /api/test/voice this deliberately does NOT play anything: the Voice
+        Lab A/B calls it once per voice and puts the two clips side by side in the
+        browser, so nothing is routed through the live output device and the user
+        can replay both. Nothing is written to the profile either.
+        """
+        import base64 as _b64
+
+        from config import Runtime, get_runtime
+        from wallie import _effective_tts
+
+        text = (body.text or "").strip()
+        if not text:
+            raise HTTPException(400, "empty text")
+        if len(text) > 600:
+            raise HTTPException(400, "text too long (max 600 chars)")
+
+        runtime = get_runtime()
+        requested = body.name.strip()
+        updates: dict[str, Any] = {}
+        if requested:
+            preset = next(
+                (p for p in _vlab.load_library(runtime.config.profile_name)
+                 if p.name.lower() == requested.lower()),
+                None,
+            )
+            if preset is None:
+                raise HTTPException(404, f"no saved voice named {requested}")
+            updates = _vlab.tts_updates(preset)
+            source = f"saved voice · {preset.name}"
+        elif body.provider or body.voice_id or body.tts:
+            updates = _vlab.sanitize_tts(body.tts)
+            if body.provider:
+                updates["provider"] = body.provider
+            if body.voice_id:
+                updates["voice_id"] = body.voice_id
+            source = "unsaved Voice page settings"
+        else:
+            source = "saved config"
+
+        if updates:
+            tts_cfg = runtime.config.tts.model_copy(update=updates)
+            # Re-resolve through the live build's OWN resolution: a preset may
+            # switch the provider TO openai_compatible, and only that path knows
+            # how to find the block's endpoint and key.
+            runtime = Runtime(
+                config=runtime.config.model_copy(update={"tts": tts_cfg}),
+                secrets=runtime.secrets,
+            )
+        try:
+            tts_cfg, tts_secrets = _effective_tts(runtime)
+        except (ValueError, RuntimeError) as e:
+            raise HTTPException(400, str(e)[:220])
+
+        res = await _synthesize_pcm(tts_cfg, tts_secrets, text)
+        if res.error:
+            raise HTTPException(400, res.error[:300])
+
+        seconds = len(res.pcm) / float(res.sample_rate * res.channels * 2)
+        wav = _vlab.pcm16_bytes_to_wav(res.pcm, res.sample_rate, res.channels)
+        return {
+            "ok": True,
+            "source": source,
+            "provider": tts_cfg.provider,
+            "voice_id": tts_cfg.voice_id,
+            "voice_ref": tts_cfg.provider_ref,
+            "sample_rate": res.sample_rate,
+            "channels": res.channels,
+            "bytes": len(res.pcm),
+            "seconds": round(seconds, 2),
+            "decoded": res.decoded,
+            "wav_b64": _b64.b64encode(wav).decode("ascii"),
+        }
 
     @app.post("/api/vision/models")
     async def api_vision_models(body: VisionModelsBody) -> dict[str, Any]:
@@ -1243,17 +1694,73 @@ def _build_app(
         return {"ok": True}
 
     @app.post("/api/test/vision")
-    async def test_vision() -> dict[str, Any]:
+    async def test_vision(body: Optional[TestVisionBody] = None) -> dict[str, Any]:
         """Capture + ask, using the SAME vision provider a live session uses:
         a resolved dedicated vision block when one exists, otherwise the main
-        engine. Mirrors build_orchestrator's resolution and gate."""
+        engine. Mirrors build_orchestrator's resolution and gate.
+
+        Optional {provider, model, base_url} overrides build a THROWAWAY
+        provider, so a candidate vision model can be tried out from the UI
+        without saving it into the profile — the way to recover when a model
+        gets retired (e.g. gemini-2.5-flash answering 404)."""
         from config import get_runtime
         from wallie import effective_compat
         from llm.factory import build_provider
         runtime = get_runtime()
         cfg = runtime.config
+        ov = body or TestVisionBody()
+        ov_model = (ov.model or "").strip()
+        ov_url = (ov.base_url or "").strip()
+        provider = (ov.provider or "").strip() or cfg.llm.provider
         dedicated = None
-        if cfg.llm.vision_provider == "openai_compatible":
+        if ov.has_override():
+            # ---- override: probe a model/provider WITHOUT touching the profile ----
+            if provider == "openai_compatible":
+                try:
+                    vis_cfg, vis_sec = effective_compat(
+                        cfg, runtime.secrets, "vision", cfg.llm,
+                        ref=(ov.provider_ref or cfg.llm.vision_provider_ref),
+                        allow_default=False,
+                    )
+                except RuntimeError as e:  # e.g. remote block without an API key
+                    raise HTTPException(400, str(e)[:300])
+                updates: dict[str, Any] = {"vision_provider": "openai_compatible"}
+                if ov_model:
+                    updates["vision_model"] = ov_model
+                if ov_url:
+                    updates["vision_openai_compatible_base_url"] = ov_url
+                vis_cfg = vis_cfg.model_copy(update=updates)
+                if not (vis_cfg.vision_model or "").strip():
+                    raise HTTPException(
+                        400, "pick a model for the OpenAI-compatible vision test"
+                    )
+                try:
+                    from wallie import _build_vision_llm
+                    dedicated = _build_vision_llm(vis_cfg, vis_sec)
+                except RuntimeError as e:
+                    raise HTTPException(400, str(e)[:300])
+            else:
+                test_model = ov_model or cfg.llm.model
+                if not test_model:
+                    raise HTTPException(400, f"pick a model to test {provider}")
+                # vision_capable is forced ON: the user explicitly named the
+                # model, and the request itself is the test of whether it
+                # really accepts images.
+                fields: dict[str, Any] = {
+                    "provider": provider, "model": test_model, "vision_capable": True,
+                }
+                if ov_url:
+                    # Ollama carries its own base-URL field; every other
+                    # provider here reaches its endpoint through the generic one.
+                    fields["ollama_base_url" if provider == "ollama"
+                           else "openai_compatible_base_url"] = ov_url
+                try:
+                    dedicated = build_provider(
+                        cfg.llm.model_copy(update=fields), runtime.secrets
+                    )
+                except Exception as e:  # unknown provider / missing key / bad URL
+                    raise HTTPException(400, f"could not build {provider}: {e}"[:300])
+        elif cfg.llm.vision_provider == "openai_compatible":
             try:
                 vis_cfg, vis_sec = effective_compat(
                     cfg, runtime.secrets, "vision", cfg.llm,
@@ -1323,7 +1830,9 @@ def _build_app(
                 tokens.append(tok)
         except Exception as e:
             await llm.aclose()
-            raise HTTPException(500, f"LLM error: {e}")
+            # 400, not 500: a retired model / rejected key is a configuration
+            # problem the user fixes by picking another model in the test strip.
+            raise HTTPException(400, f"LLM error: {_scrub_error(str(e), 400)}")
         finally:
             await llm.aclose()
         text = "".join(tokens).strip()
@@ -1334,6 +1843,7 @@ def _build_app(
             "model": getattr(llm, "model", "") or cfg.llm.model,
             "provider": getattr(llm, "name", "") or cfg.llm.provider,
             "dedicated": dedicated is not None,
+            "override": ov.has_override(),
             "text": text,
         }
 
@@ -1402,8 +1912,6 @@ def _build_app(
         failure (empty synthesis, non-PCM without ffmpeg, bad config…).
         """
         from wallie import _effective_tts
-        from tts.decode import sniff_compressed, find_ffmpeg
-        from tts.base import TTSError
         from config import get_runtime
 
         text = (body.text or "").strip()
@@ -1425,51 +1933,10 @@ def _build_app(
         orch = state.orchestrator
         live = bool(orch and orch.status().get("running"))
 
-        try:
-            tts = build_tts(tts_cfg, tts_secrets)
-        except TTSError as e:
-            return _fail(str(e))
-
-        routed = "live-player" if live else "preview-player"
-        chunks: list[bytes] = []
-        try:
-            async for pcm in tts.synthesize(text):
-                chunks.append(pcm)
-        except TTSError as e:
-            return _fail(str(e))
-        except Exception as e:
-            logger.exception("dashboard: tts test synthesis failed")
-            return _fail(f"synthesis failed: {e}")
-        finally:
-            await tts.aclose()
-
-        raw = b"".join(chunks)
-        if not raw:
-            return _fail(
-                "endpoint returned no audio — check the model/voice names and "
-                "that the key has TTS access"
-            )
-
-        decoded = False
-        if sniff_compressed(raw[:12]):
-            ffmpeg = find_ffmpeg()
-            if not ffmpeg:
-                return _fail(
-                    "endpoint answered a compressed format (MP3/OGG) and ffmpeg "
-                    "is unavailable — install ffmpeg, `pip install imageio-ffmpeg`, "
-                    "or set WALLIE_FFMPEG"
-                )
-            from tts.decode import decode_to_pcm16
-            try:
-                raw = await decode_to_pcm16(raw, ffmpeg, tts.sample_rate)
-            except RuntimeError as e:
-                return _fail(f"ffmpeg decode failed: {e}")
-            decoded = True
-
-        if len(raw) < 64:  # plausible audio of a sentence is way longer
-            return _fail(f"audio too short ({len(raw)} bytes) — endpoint likely rejected the request")
-        if len(raw) % 2:
-            raw = raw[:-1]
+        res = await _synthesize_pcm(tts_cfg, tts_secrets, text)
+        if res.error:
+            return _fail(res.error)
+        raw = res.pcm
 
         # ---- playback ----
         if live:
@@ -1477,7 +1944,7 @@ def _build_app(
             await player.write(raw)
         else:
             from audio import AudioPlayer
-            player = AudioPlayer(sample_rate=tts.sample_rate, channels=tts.channels,
+            player = AudioPlayer(sample_rate=res.sample_rate, channels=res.channels,
                                  device=(cfg.tts.output_device or None))
             player.start()
             try:
@@ -1487,11 +1954,12 @@ def _build_app(
             finally:
                 player.close()
 
-        dur = len(raw) / (tts.sample_rate * tts.channels * 2)
+        routed = "live-player" if live else "preview-player"
+        dur = len(raw) / (res.sample_rate * res.channels * 2)
         note = f"{len(raw)} bytes · {dur:.1f}s"
-        if decoded:
+        if res.decoded:
             note += " · decoded via ffmpeg (gateway ignored pcm)"
-        return {"ok": True, "routed": routed, "decoded": decoded,
+        return {"ok": True, "routed": routed, "decoded": res.decoded,
                 "bytes": len(raw), "duration_sec": round(dur, 2), "note": note}
 
     @app.post("/api/test/hearing")
@@ -1696,11 +2164,13 @@ def _build_app(
 
     # ---------- static UI ----------
     if STATIC_DIR.exists():
-        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+        app.mount("/static", _NoCacheStatic(directory=str(STATIC_DIR)), name="static")
 
     @app.get("/")
     def index() -> FileResponse:
-        return FileResponse(str(STATIC_DIR / "index.html"))
+        # Same reasoning as _NoCacheStatic: a stale index.html would keep
+        # pointing the browser at an old app.js.
+        return FileResponse(str(STATIC_DIR / "index.html"), headers={"Cache-Control": "no-cache"})
 
     return app
 

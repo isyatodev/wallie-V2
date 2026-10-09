@@ -6,7 +6,9 @@
 // ASCII-normalizes ids ("Visão" → "visao") so the browser and the server
 // always agree on the PROVIDER_<SLUG>_API_KEY name.
 function _providerSlugJs(pid) {
-  const d = String(pid || "").normalize("NFD").replace(/\p{Diacritic}/gu, "");
+  // NFKD, not NFD: the Python side normalizes compatibility forms too (a
+  // ligature id like "Ofﬁce" must slug to "office_provider" on BOTH sides).
+  const d = String(pid || "").normalize("NFKD").replace(/\p{Diacritic}/gu, "");
   return (d.toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40)) || "provider";
 }
 function _providerKeyEnvJs(pid) {
@@ -17,6 +19,7 @@ const SECTIONS = [
   { id: "identity",    label: "Identity",     ico: "🪪" },
   { id: "personality", label: "Personality",  ico: "🎭" },
   { id: "voice",       label: "Voice",        ico: "🎙" },
+  { id: "voicelab",    label: "Voice Lab",    ico: "🧪" },
   { id: "topics",      label: "Topics",       ico: "📝" },
   { id: "vision",      label: "Vision",       ico: "👁" },
   { id: "play",        label: "Play (MC)",    ico: "🎮" },
@@ -38,6 +41,37 @@ const HUMOR_OPTIONS = [
 // Dashboard accent themes (body[data-theme]) — kept in sync with the option
 // list in index.html's theme picker and AppConfig.dashboard_theme.
 const THEME_OPTIONS = ["cyan", "amber", "rose"];
+
+// Kokoro v1.0 languages. The voice id's FIRST letter is the lang_code the
+// pipeline must be initialised with, so the Voice section keeps the two in
+// sync (kokoroLangs / kokoroVoiceOptions / onKokoroLangChange).
+const KOKORO_LANGS = [
+  { code: "a", label: "English (US)" },
+  { code: "b", label: "English (UK)" },
+  { code: "p", label: "Portuguese (Brazil)" },
+  { code: "e", label: "Spanish" },
+  { code: "f", label: "French" },
+  { code: "h", label: "Hindi" },
+  { code: "i", label: "Italian" },
+  { code: "j", label: "Japanese" },
+  { code: "z", label: "Chinese (Mandarin)" },
+];
+
+const KOKORO_VOICES = {
+  a: ["af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica", "af_kore", "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky", "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam", "am_michael", "am_onyx", "am_puck"],
+  b: ["bf_alice", "bf_emma", "bf_isabella", "bf_lily", "bm_daniel", "bm_fable", "bm_george", "bm_lewis"],
+  p: ["pf_dora", "pm_alex", "pm_santa"],
+  e: ["ef_dora", "em_alex", "em_santa"],
+  f: ["ff_siwis"],
+  h: ["hf_alpha", "hf_beta", "hm_omega", "hm_psi"],
+  i: ["if_sara", "im_nicola"],
+  j: ["jf_alpha", "jf_gongitsune", "jf_nezumi", "jf_tebukuro", "jm_kumo"],
+  z: ["zf_xiaobei", "zf_xiaoni", "zf_xiaoxiao", "zf_xiaoyi", "zm_yunjian", "zm_yunxi", "zm_yunxia", "zm_yunyang"],
+};
+
+// Voice Lab A/B: the line both voices read when the box is left empty. Long
+// enough to expose prosody, short enough not to burn TTS credits.
+const AB_DEFAULT_TEXT = "Testing this voice — one, two, three. Is this the one you want?";
 
 const EMOTION_SLOTS = [
   "happy", "surprised", "laughing", "angry", "sad",
@@ -76,16 +110,19 @@ const MODEL_OPTIONS = {
     { id: "claude-haiku-4-5", label: "Claude Haiku 4.5", vision: true },
   ],
   gemini: [
-    { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", vision: true },
-    { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", vision: true },
-    { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash", vision: true },
+    { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", vision: true },
+    // The 2.5 family is restricted to accounts that already used it — new keys
+    // get a 404 telling them to move to gemini-3.8-flash. Kept so existing
+    // setups can still pick them; the Vision test strip can probe either.
+    { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro (restricted)", vision: true },
+    { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash (restricted)", vision: true },
   ],
   ollama: [],
 };
 
 // First-run wizard: budget path -> provider config + required keys.
 const WIZARD_PATHS = {
-  free:    { llm: "gemini",    model: "gemini-2.5-flash",                            tts: "piper",      keys: ["GEMINI_API_KEY"] },
+  free:    { llm: "gemini",    model: "gemini-3.8-flash",                            tts: "piper",      keys: ["GEMINI_API_KEY"] },
   cheap:   { llm: "groq",      model: "meta-llama/llama-4-scout-17b-16e-instruct",   tts: "fish",       keys: ["GROQ_API_KEY", "FISH_API_KEY"] },
   premium: { llm: "anthropic", model: "claude-sonnet-4-6",                           tts: "elevenlabs", keys: ["ANTHROPIC_API_KEY", "ELEVENLABS_API_KEY"] },
 };
@@ -215,6 +252,10 @@ function app() {
     logs: [],
     playLog: "",
     playBusy: false,
+    // Kokoro one-click install badge (Voice tab + setup wizard panels).
+    kokoro: { installed: false, kokoro_version: "", missing: [], installer_present: true, python_ok: true, python_version: "", python_range: "3.10–3.12", can_install: true, running: false, log: "" },
+    kokoroBusy: false,
+    _kokoroPoll: null,
     _nextLogId: 1,
     _ws: null,
 
@@ -242,6 +283,20 @@ function app() {
     donationTest: { donor: "TestDonor", amount: 10, message: "manda o salve", msg: "" },
     voiceTestText: "",
     voiceTestMsg: "",
+    // Voice Lab — saved voices (per profile) + provider-side cloning.
+    voiceLab: { presets: [], providers: [] },
+    voiceLabClone: { provider: "elevenlabs", name: "", description: "", samples: [] },
+    voiceLabBusy: "",
+    voiceLabMsg: "",
+    voiceLabCloneMsg: "",
+    voiceLabSaveName: "",
+    voiceLabRecordSeconds: 8,
+    voiceLabRecording: false,
+    // A/B: two voices, one line, audio returned to this page only.
+    voiceAb: { a: "", b: "", text: "", msg: "", busy: false },
+    abClips: { a: null, b: null },
+    abErrors: { a: "", b: "" },
+    abDefaultText: AB_DEFAULT_TEXT,
     hearingTestBusy: false,
     hearingTestMsg: "",
     hearingTestResult: "",
@@ -250,6 +305,11 @@ function app() {
     avatarTestMsg: "",
     visionTestResult: "",
     visionTestMeta: "",
+    // Vision-test overrides (blank = use the saved config). Lets a candidate
+    // model be probed without committing it to the profile.
+    visionTestProvider: "",
+    visionTestModel: "",
+    visionTestUrl: "",
     emotionSlots: EMOTION_SLOTS,
     avatarStatus: { enabled: false, connected: false },
     avatarHotkeys: [],
@@ -312,7 +372,7 @@ function app() {
     vlModelsMsg: "",
 
     // First-run setup wizard (additive — reuses config/secrets/start APIs, breaks nothing).
-    wizard: { open: false, step: 1, path: "", busy: false, keyDrafts: {}, keyMsg: {}, keyBusy: {} },
+    wizard: { open: false, step: 1, path: "", busy: false, pickedKokoro: false, keyDrafts: {}, keyMsg: {}, keyBusy: {} },
 
     async init() {
       await this.loadProfiles();
@@ -325,6 +385,9 @@ function app() {
       await this.loadProviders();
       await this.loadSpeakers();
       await this.loadLtm();
+      await this.loadVoiceLibrary();
+      // Kokoro badge: probe now, and keep polling if an install is mid-flight.
+      this.loadKokoroStatus().then(s => { if (s && s.running) this._pollKokoroInstall(); });
       this.wizardMaybeOpen();
       this.connectWs();
       setInterval(() => { this.refreshStatus(); this.loadSpeakers(); }, 2000);
@@ -894,18 +957,42 @@ function app() {
       } catch {}
     },
 
+    // Model suggestions for the vision-test override: the known vision-capable
+    // models of the chosen provider ([] for endpoints we can't enumerate — the
+    // field stays free-form so any model id can be typed in).
+    visionTestModelOptions() {
+      const provider = this.visionTestProvider || this.cfg.llm.provider;
+      return (MODEL_OPTIONS[provider] || []).filter(m => m.vision);
+    },
+
     async testVision() {
-      await this.save();
+      const overrideBody = {
+        provider: this.visionTestProvider,
+        model: this.visionTestModel,
+        base_url: this.visionTestUrl,
+      };
+      const usingOverride = !!(this.visionTestProvider || this.visionTestModel || this.visionTestUrl);
+      // Only persist pending edits when testing the SAVED config — an override
+      // probe must never write the candidate model into the profile.
+      if (!usingOverride) await this.save();
       this.testing = true;
-      this.visionTestResult = "capturing screen + sending to model...";
+      this.visionTestResult = usingOverride
+        ? `capturing screen + testing ${this.visionTestProvider || this.cfg.llm.provider}`
+          + (this.visionTestModel ? `:${this.visionTestModel}` : "") + "..."
+        : "capturing screen + sending to model...";
       this.visionTestMeta = "";
       try {
-        const r = await fetch("/api/test/vision", { method: "POST" });
+        const r = await fetch("/api/test/vision", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(usingOverride ? overrideBody : {}),
+        });
         const data = await r.json();
         if (r.ok) {
           this.visionTestResult = data.text || "(empty response)";
           this.visionTestMeta =
-            `${data.provider}:${data.model} · frame ${data.frame_size?.join("×")} · ${(data.frame_bytes/1024).toFixed(1)} KB`;
+            `${data.provider}:${data.model}${data.override ? " · override (not saved)" : ""}`
+            + ` · frame ${data.frame_size?.join("×")} · ${(data.frame_bytes/1024).toFixed(1)} KB`;
         } else {
           this.visionTestResult = "ERROR: " + (data.detail || JSON.stringify(data));
         }
@@ -928,6 +1015,7 @@ function app() {
       await fetch(`/api/profiles/${encodeURIComponent(name)}/activate`, { method: "PUT" });
       await this.loadConfig();
       await this.loadProfiles();
+      await this.loadVoiceLibrary();   // saved voices are per profile
     },
 
     async promptNewProfile() {
@@ -1377,6 +1465,69 @@ function app() {
       this.playBusy = false;
     },
 
+    async loadKokoroStatus() {
+      try {
+        const r = await fetch("/api/tts/kokoro/status");
+        if (!r.ok) return null;
+        const d = await r.json();
+        const job = d.install || {};
+        this.kokoro = {
+          installed: !!d.installed,
+          kokoro_version: d.kokoro_version || "",
+          missing: d.missing || [],
+          installer_present: d.installer_present !== false,
+          min_version: d.min_version || "",
+          python_ok: d.python_ok !== false,
+          python_version: d.python_version || "",
+          python_range: d.python_range || "3.10–3.12",
+          can_install: d.can_install !== false,
+          running: !!job.running,
+          returncode: job.returncode ?? null,
+          log: job.log || "",
+        };
+        return this.kokoro;
+      } catch (e) {
+        return null;
+      }
+    },
+    async installKokoro() {
+      if (this.kokoroBusy) return;
+      this.kokoroBusy = true;
+      this.kokoro.log = "starting install…";
+      try {
+        const r = await fetch("/api/tts/kokoro/install", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            lang: this.cfg.tts.kokoro_lang_code || "a",
+            voice: this.cfg.tts.kokoro_voice || "",
+          }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok && r.status !== 409) {
+          this.kokoro.log = "install failed: " + (d.detail || ("HTTP " + r.status));
+          this.kokoroBusy = false;
+          return;
+        }
+        await this.loadKokoroStatus();
+        this._pollKokoroInstall();
+      } catch (e) {
+        this.kokoro.log = "install failed: " + e;
+        this.kokoroBusy = false;
+      }
+    },
+    _pollKokoroInstall() {
+      if (this._kokoroPoll) clearInterval(this._kokoroPoll);
+      this.kokoroBusy = true;
+      this._kokoroPoll = setInterval(async () => {
+        const s = await this.loadKokoroStatus();
+        if (!s || !s.running) {
+          clearInterval(this._kokoroPoll);
+          this._kokoroPoll = null;
+          this.kokoroBusy = false;
+        }
+      }, 2000);
+    },
+
     async resetAudio() {
       try {
         await fetch("/api/audio/reset", { method: "POST" });
@@ -1592,11 +1743,325 @@ function app() {
       }
     },
 
+    // ----- Voice Lab — saved voices + cloning -----
+    cloneProvider() {
+      return this.voiceLab.providers.find(p => p.id === this.voiceLabClone.provider) || null;
+    },
+
+    async loadVoiceLibrary() {
+      try {
+        const r = await fetch("/api/voices/library");
+        if (!r.ok) return;
+        const data = await r.json();
+        this.voiceLab.presets = data.presets || [];
+        this.voiceLab.providers = data.providers || [];
+        // Preselect a provider the account can actually clone with.
+        const current = this.cloneProvider();
+        if (!current || !current.ready) {
+          const usable = this.voiceLab.providers.find(p => p.ready);
+          if (usable) this.voiceLabClone.provider = usable.id;
+        }
+      } catch {}
+    },
+
+    // Snapshot what the Voice page currently uses as a named, reusable voice.
+    async saveCurrentVoice() {
+      const name = (this.voiceLabSaveName || "").trim();
+      if (!name || this.voiceLabBusy) return;
+      const tts = { ...this.cfg.tts };
+      delete tts.output_device;   // routes audio — not a property of a voice
+      this.voiceLabBusy = "save";
+      this.voiceLabMsg = "";
+      try {
+        const r = await fetch("/api/voices/library", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name,
+            provider: this.cfg.tts.provider,
+            voice_id: this.cfg.tts.voice_id || "",
+            tts,
+          }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceLabMsg = "✗ " + (data.detail || `HTTP ${r.status}`);
+          return;
+        }
+        this.voiceLab.presets = data.presets || this.voiceLab.presets;
+        this.voiceLabSaveName = "";
+        this.voiceLabMsg = `✓ saved “${name}”`;
+      } catch (e) {
+        this.voiceLabMsg = "✗ " + e;
+      } finally {
+        this.voiceLabBusy = "";
+        setTimeout(() => (this.voiceLabMsg = ""), 6000);
+      }
+    },
+
+    // Writes the preset's settings into the config and persists them.
+    async applyVoice(preset) {
+      Object.assign(this.cfg.tts, preset.tts || {});
+      if (preset.provider) this.cfg.tts.provider = preset.provider;
+      if (preset.voice_id) this.cfg.tts.voice_id = preset.voice_id;
+      await this.save();
+    },
+
+    async testVoicePreset(preset) {
+      await this.applyVoice(preset);
+      const text = (this.voiceTestText || "").trim()
+        || "testing this voice — one, two, three.";
+      this.voiceLabBusy = "test";
+      this.voiceLabMsg = "… synthesizing with the saved voice";
+      try {
+        const r = await fetch("/api/test/voice", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        const data = await r.json().catch(() => ({}));
+        this.voiceLabMsg = r.ok
+          ? "✓ " + (data.note || "playing")
+          : "✗ " + (data.detail || `HTTP ${r.status}`);
+      } catch (e) {
+        this.voiceLabMsg = "✗ " + e;
+      } finally {
+        this.voiceLabBusy = "";
+        setTimeout(() => (this.voiceLabMsg = ""), 8000);
+      }
+    },
+
+    async deleteVoice(name) {
+      if (!confirm(`Delete the saved voice “${name}”?\n\nThe voice itself stays on the provider.`)) return;
+      try {
+        const r = await fetch(`/api/voices/library/${encodeURIComponent(name)}`, { method: "DELETE" });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceLabMsg = "✗ " + (data.detail || `HTTP ${r.status}`);
+          return;
+        }
+        this.voiceLab.presets = data.presets || [];
+        this.voiceLabMsg = `✓ deleted “${name}”`;
+      } catch (e) {
+        this.voiceLabMsg = "✗ " + e;
+      } finally {
+        setTimeout(() => (this.voiceLabMsg = ""), 6000);
+      }
+    },
+
+    // Reference clips are read in the browser and posted as base64 — the
+    // dashboard has no multipart parser, and the server builds the provider's
+    // multipart upload itself.
+    _readBase64(file) {
+      return new Promise((resolve, reject) => {
+        const rd = new FileReader();
+        rd.onload = () => resolve(String(rd.result).split(",", 2)[1] || "");
+        rd.onerror = () => reject(new Error("could not read " + file.name));
+        rd.readAsDataURL(file);
+      });
+    },
+
+    async onCloneFiles(event) {
+      const files = Array.from(event.target.files || []);
+      event.target.value = "";   // same file can be re-picked
+      this.voiceLabCloneMsg = "";
+      for (const f of files) {
+        if (this.voiceLabClone.samples.length >= 5) {
+          this.voiceLabCloneMsg = "✗ at most 5 samples";
+          break;
+        }
+        if (f.size > 12 * 1024 * 1024) {
+          this.voiceLabCloneMsg = `✗ ${f.name} is larger than 12 MB`;
+          continue;
+        }
+        try {
+          const data = await this._readBase64(f);
+          this.voiceLabClone.samples.push({ filename: f.name, data });
+        } catch (e) {
+          this.voiceLabCloneMsg = "✗ " + e;
+        }
+      }
+    },
+
+    async recordCloneSample() {
+      if (this.voiceLabRecording) return;
+      if (this.voiceLabClone.samples.length >= 5) {
+        this.voiceLabCloneMsg = "✗ at most 5 samples — remove one first";
+        return;
+      }
+      const seconds = Math.max(2, Math.min(30, Number(this.voiceLabRecordSeconds) || 8));
+      this.voiceLabRecording = true;
+      this.voiceLabCloneMsg = `🎙 recording ${seconds}s — speak clearly into the default mic…`;
+      try {
+        const r = await fetch("/api/voices/record", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ seconds }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceLabCloneMsg = "✗ " + (data.detail || `HTTP ${r.status}`);
+          return;
+        }
+        this.voiceLabClone.samples.push({ filename: `mic-${data.seconds}s.wav`, data: data.wav_b64 });
+        this.voiceLabCloneMsg = `✓ recorded ${data.seconds}s — audition it below`;
+      } catch (e) {
+        this.voiceLabCloneMsg = "✗ " + e;
+      } finally {
+        this.voiceLabRecording = false;
+      }
+    },
+
+    async createClonedVoice() {
+      const { provider, name, description, samples } = this.voiceLabClone;
+      if (!name.trim() || !samples.length || this.voiceLabBusy) return;
+      this.voiceLabBusy = "clone";
+      this.voiceLabCloneMsg = `🧬 creating “${name.trim()}” at ${provider} — this can take a moment…`;
+      try {
+        const r = await fetch("/api/voices/clone", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider, name: name.trim(), description, samples }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceLabCloneMsg = "✗ " + (data.detail || `HTTP ${r.status}`);
+          return;
+        }
+        this.voiceLab.presets = data.presets || this.voiceLab.presets;
+        this.voiceLabCloneMsg =
+          `✓ voice created · ${data.provider} : ${data.voice_id} — saved to the library above`;
+        this.voiceLabClone.samples = [];
+        this.voiceLabClone.name = "";
+        this.voiceLabClone.description = "";
+      } catch (e) {
+        this.voiceLabCloneMsg = "✗ " + e;
+      } finally {
+        this.voiceLabBusy = "";
+      }
+    },
+
+    // ----- Voice Lab A/B — same line, two voices, clips side by side -----
+    abLabel(side) {
+      return (side === "a" ? this.voiceAb.a : this.voiceAb.b) || "current Voice page settings";
+    },
+
+    // Nothing is saved and nothing plays through the output device: the route
+    // hands the audio back so two clips can be compared (and replayed).
+    async _previewVoice(name) {
+      const text = (this.voiceAb.text || "").trim() || AB_DEFAULT_TEXT;
+      let body = { text };
+      if (name) {
+        body.name = name;
+      } else {
+        // Compare against what the Voice page currently shows — including
+        // edits that haven't been saved yet.
+        const tts = { ...this.cfg.tts };
+        delete tts.output_device;
+        body = {
+          ...body,
+          provider: this.cfg.tts.provider,
+          voice_id: this.cfg.tts.voice_id || "",
+          tts,
+        };
+      }
+      const r = await fetch("/api/voices/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        throw new Error(`${name || "current settings"}: ` + (data.detail || `HTTP ${r.status}`));
+      }
+      return {
+        url: "data:audio/wav;base64," + data.wav_b64,
+        source: name || "current Voice page settings",
+        provider: data.provider,
+        voice_id: data.voice_id,
+        bytes: data.bytes,
+        seconds: data.seconds,
+        decoded: data.decoded,
+      };
+    },
+
+    async compareVoices() {
+      if (this.voiceAb.busy) return;
+      this.voiceAb.busy = true;
+      this.voiceAb.msg = "synthesizing both voices…";
+      this.abClips = { a: null, b: null };
+      this.abErrors = { a: "", b: "" };
+      try {
+        // allSettled, not all: a voice the provider refuses (missing key, plan
+        // limits) must not throw away the clip that DID synthesize — it was
+        // already billed, and half a comparison still tells you something.
+        const res = await Promise.allSettled([
+          this._previewVoice(this.voiceAb.a),
+          this._previewVoice(this.voiceAb.b),
+        ]);
+        const sides = ["a", "b"];
+        res.forEach((r, i) => {
+          const side = sides[i];
+          if (r.status === "fulfilled") this.abClips[side] = r.value;
+          else this.abErrors[side] = r.reason?.message || String(r.reason);
+        });
+        const ok = sides.filter(s => this.abClips[s]).length;
+        const failed = sides.filter(s => this.abErrors[s]);
+        this.voiceAb.msg = ok === 2
+          ? "✓ both clips ready — play A → B, or listen side by side"
+          : failed.length
+            ? `✗ ${failed.join(" and ").toUpperCase()} failed — see the card below`
+            : "✗ no clip could be synthesized";
+      } finally {
+        this.voiceAb.busy = false;
+      }
+    },
+
+    async playAbClip(side) {
+      const el = this.$refs[side === "a" ? "abAudioA" : "abAudioB"];
+      if (!el) return;
+      el.currentTime = 0;
+      try { await el.play(); } catch {}
+    },
+
+    // Back-to-back playback is what makes the choice obvious — one click, A then B.
+    async playAbSequence() {
+      const a = this.$refs.abAudioA;
+      const b = this.$refs.abAudioB;
+      if (!a) return;
+      if (b) {
+        a.onended = () => {
+          a.onended = null;
+          b.currentTime = 0;
+          b.play().catch(() => {});
+        };
+      }
+      a.currentTime = 0;
+      try { await a.play(); } catch {}
+    },
+
     // ----- helpers -----
     toggleInList(list, value) {
       const i = list.indexOf(value);
       if (i >= 0) list.splice(i, 1);
       else list.push(value);
+    },
+
+    kokoroLangs: KOKORO_LANGS,
+
+    // Voice ids valid for the currently selected Kokoro language.
+    kokoroVoiceOptions() {
+      return KOKORO_VOICES[this.cfg.tts.kokoro_lang_code] || [];
+    },
+
+    // A voice id from another language silently mispronounces (or fails at
+    // synth time), so switching language moves the pick onto that language's
+    // default voice.
+    onKokoroLangChange() {
+      const voices = this.kokoroVoiceOptions();
+      if (voices.length && !voices.includes(this.cfg.tts.kokoro_voice)) {
+        this.cfg.tts.kokoro_voice = voices[0];
+      }
     },
 
     modelOptions() {
@@ -1651,7 +2116,15 @@ function app() {
       this.cfg.llm.provider = P.llm;
       this.cfg.llm.model = P.model;
       this.cfg.llm.vision_capable = true;
-      this.cfg.tts.provider = P.tts;
+      let tts = P.tts;
+      // Free path default is Piper, but if Kokoro is already installed use the
+      // better local voice instead of leaving it on the manual-download one.
+      if (path === "free") {
+        const s = this.kokoro.installed ? this.kokoro : await this.loadKokoroStatus();
+        if (s && s.installed) tts = "kokoro";
+      }
+      this.wizard.pickedKokoro = tts === "kokoro";
+      this.cfg.tts.provider = tts;
       this.wizard.busy = true;
       try { await this.save(); } finally { this.wizard.busy = false; }
       this.wizard.step = 3;

@@ -17,12 +17,29 @@ import asyncio
 import os
 import shutil
 
-__all__ = ["sniff_compressed", "find_ffmpeg", "decode_to_pcm16"]
+__all__ = ["sniff_compressed", "looks_like_mp3_frame_sync", "find_ffmpeg", "decode_to_pcm16"]
 
 
 # ---------------------------------------------------------------------------
 # Sniffing
 # ---------------------------------------------------------------------------
+
+def looks_like_mp3_frame_sync(head: bytes) -> bool:
+    """True when `head` starts with the 2-byte MP3 frame sync word.
+
+    Exposed because this particular signature is NOT conclusive: raw PCM16 whose
+    first sample is -1 is `FF FF` and matches it exactly, and a leading silence
+    ramp makes that first sample surprisingly common. Callers that just tried an
+    ffmpeg decode must therefore treat a decode failure on a payload matching
+    this (and nothing stronger) as "it was PCM after all" instead of an error.
+    """
+    return (
+        len(head) >= 2
+        and head[0] == 0xFF
+        and (head[1] & 0xE0) == 0xE0
+        and (head[1] & 0x06) != 0
+    )
+
 
 def sniff_compressed(head: bytes) -> str | None:
     """Return a format label when `head` clearly isn't raw PCM16.
@@ -40,9 +57,10 @@ def sniff_compressed(head: bytes) -> str | None:
         return "ogg"
     if h[:3] == b"ID3":           # MP3 with tag
         return "mp3"
-    if len(h) >= 2 and h[0] == 0xFF and (h[1] & 0xE0) == 0xE0 and (h[1] & 0x06) != 0:
+    if looks_like_mp3_frame_sync(h):
         # MP3 sync word with valid layer bits (layer bits == 0 are reserved,
         # so 0xFF 0x0E is not a frame) — mirrors the orchestrator's heuristic.
+        # Ambiguous on purpose: see looks_like_mp3_frame_sync's docstring.
         return "mp3"
     if h[:1] in (b"{", b"<"):     # JSON error body / XML — decode will fail
         return "json-or-xml"

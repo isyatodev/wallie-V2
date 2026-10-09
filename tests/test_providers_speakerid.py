@@ -604,6 +604,60 @@ def test_provider_slug_ascii_normalization():
     assert provider_key_env("") == "PROVIDER_PROVIDER_API_KEY"
 
 
+# ---------------------------------------------------------------------------
+# The JS port in dashboard/static/app.js must agree with config.provider_slug
+# ---------------------------------------------------------------------------
+# config.provider_slug is the single source of truth (it names
+# PROVIDER_<SLUG>_API_KEY), and app.js ships a JS port of it. Nothing compared
+# the two, so the browser could key a provider off a different env name than the
+# server — the exact failure that split keys before the implementations were
+# unified. The ligature + non-ASCII cases are what a hand-written port gets
+# wrong: Python normalizes NFKD (compatibility forms too), not just NFD.
+_PROVIDER_SLUG_CASES: list = [
+    "", "visao", "MAIN_LLM", "ghost_stt", "  Main LLM ", "_leading_", "___",
+    "a__b", "a-b.c", "!!!", "Visão", "Com Acentuação", "Ünïcödé", "e\u0301",
+    "日本語", "emoji 🎙", "Ofﬁce Provider", "ﬁt", "a" * 39, "b" * 40, "c" * 41,
+    112, 0,
+]
+
+
+def _js_slug(ids: list) -> list:
+    """Run app.js's _providerSlugJs on `ids` (skips when node is unavailable)."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available on this machine")
+    app_js = Path(__file__).parent.parent / "dashboard" / "static" / "app.js"
+    body = re.search(r"function _providerSlugJs\(pid\) \{(.*?)\n\}",
+                     app_js.read_text(encoding="utf-8"), re.S)
+    assert body, "_providerSlugJs not found in app.js — the JS port moved or was renamed"
+    script = (
+        "function _providerSlugJs(pid) {" + body.group(1) + "\n}\n"
+        'const ids = JSON.parse(require("fs").readFileSync(0, "utf8"));\n'
+        "process.stdout.write(JSON.stringify(ids.map(_providerSlugJs)));\n"
+    )
+    out = subprocess.run([node, "-e", script], input=json.dumps(ids),
+                         capture_output=True, text=True, encoding="utf-8", check=True)
+    return json.loads(out.stdout)
+
+
+def test_provider_slug_js_port_matches_python():
+    """Drift guard: id → slug must be identical on both sides."""
+    from config import provider_slug
+
+    js_slugs = _js_slug(_PROVIDER_SLUG_CASES)
+    mismatches = [
+        (repr(case), provider_slug(case), got)
+        for case, got in zip(_PROVIDER_SLUG_CASES, js_slugs)
+        if provider_slug(case) != got
+    ]
+    assert not mismatches, f"JS/Python provider-slug drift (id, python, js): {mismatches}"
+
+
 def test_provider_block_validator_uses_canonical_slug():
     """AppConfig's validator must route through the canonical slug."""
     cfg = AppConfig(providers=[{"id": "Visão", "name": "V", "category": "vision"}])

@@ -361,7 +361,10 @@ class TTSConfig(BaseModel):
     piper_model_path: str = ""
     piper_length_scale: float = 1.0
     # Kokoro — local, high-quality neural TTS (free, runs on CPU/GPU). voice e.g.
-    # af_heart / am_adam / bf_emma; lang_code 'a'=US English, 'b'=UK. speed 0.5-2.0.
+    # af_heart / am_adam / bf_emma / pf_dora. The voice id's first letter IS the
+    # lang_code: 'a'=US English, 'b'=UK, 'e'=Spanish, 'f'=French, 'h'=Hindi,
+    # 'i'=Italian, 'j'=Japanese, 'p'=Brazilian Portuguese, 'z'=Mandarin.
+    # speed 0.5-2.0.
     kokoro_voice: str = "af_heart"
     kokoro_lang_code: str = "a"
     kokoro_speed: float = 1.0
