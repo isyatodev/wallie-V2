@@ -70,6 +70,12 @@ Everything below is fork-specific. If a feature is not listed here, assume it ca
 | **Voice Lab** | A second voice page: build a **cloned voice** on ElevenLabs or Fish Audio from reference audio, plus a **per-profile library of saved voices** (provider + voice id + tuning) you can recall in one click | Dashboard → **Voice Lab** |
 | **Voice cloning** | Upload up to 5 clips **or record straight from the default mic** (WAV is wrapped with stdlib only — no extra dependency), then create the voice at the provider without leaving the dashboard | Dashboard → **Voice Lab** |
 | **Voice A/B** | Read the *same line* with two voice configurations and hear them back to back (`play A → B`) or side by side. The audio is returned to the page — it never touches the live output device, and nothing is saved | Dashboard → **Voice Lab** |
+| **Voice library portability** | **⇪ copy** one voice, a ticked selection or the whole library into another profile; **⇩ pull** the same way back; **⤓ export / ⤒ import** the library as one small `.json` file you can keep in git, mail to someone or restore after a reinstall | Dashboard → **Voice Lab** |
+| **Voice mirroring** | **⇄ mirror** makes two profiles hold the same saved voices, **both ways**, showing the diff first. Same-named voices that differ are left alone by default — or you pick which side wins — and any overwrite asks before replacing | Dashboard → **Voice Lab** |
+| **Voice partner badge** | Mark a profile as another one's **voice partner** and the profile picker shows a **⇄ badge** whenever the two libraries drift apart (with the counts in the tooltip); click it to land in the Voice Lab with the diff already loaded. A **⇄** also marks the profile in the dropdown itself, and switching to a partnered profile syncs the missing voices both ways, saying what it copied | Dashboard → **Voice Lab** |
+| **Local voices in the library** | Piper/Kokoro voices saved on the **Voice** page live in the same per-profile library as the Voice Lab presets, so they show up in the A/B and travel with every copy, pull, backup and mirror | Dashboard → **Voice** / **Voice Lab** |
+| **Piper voice catalogue** | Browse the official `rhasspy/piper-voices` catalogue **inside the dashboard** — search by name, filter by language, see speakers/quality/size per voice — and download any of them with a live progress bar. No CLI needed | Dashboard → **Voice** |
+| **Piper tuning** | Speed (`length_scale`), **Expressiveness** (`noise_scale`) and **Pacing variety** (`noise_w`) as sliders, so a local voice can be tuned to taste instead of taking Piper's defaults | Dashboard → **Voice** |
 | **Kokoro languages** | A real language picker instead of US/UK only — including **Portuguese (Brazil)** (`pf_dora` / `pm_alex` / `pm_santa`), plus Spanish, French, Hindi, Italian, Japanese and Mandarin. Voice ids stay in sync with the language, and the voice field autocompletes per language | Dashboard → **Voice** |
 | **Vision test with any model** | The Vision test strip can probe **any provider + model** (and base URL) *without saving it* — the escape hatch when a provider retires a model mid-stream | Dashboard → **Vision** |
 | **Current Gemini defaults** | New profiles and the setup wizard now point at `gemini-3.8-flash`; the deprecated `gemini-2.0-flash` entry is gone and the restricted 2.5 family is labelled as such | Dashboard → **Engine** / setup wizard |
@@ -120,6 +126,74 @@ through the output device — comparing a voice must not talk over the stream �
 If one side fails (provider plan limits, a bad voice id), its own message is shown on its card and the
 clip that *did* synthesize is kept, since it was already billed.
 
+**4. Moving voices around.** The library is per profile, so there are four ways to move voices —
+between profiles on this machine, or out of it entirely. Tick rows with the checkboxes on the left
+(**select all** / **clear** sit next to the list) to act on several voices at once:
+
+| Move | What it does |
+|---|---|
+| **⇪ / ⇪ copy** | pushes voices **into** another profile: a single row's **⇪**, the ticked selection, or the whole list |
+| **⇩ pull** | the inverse — reads *another* profile's library, you tick what you want, and it lands here |
+| **⤓ / ⤒ `.json`** | exports the library (or just the ticked voices) as a portable file and merges one back in |
+| **⇄ mirror** | makes this profile and another one hold the same voices, **both ways**, after showing the diff |
+
+Beside the ⇄ button, **☆ set as voice partner** records one of those profiles as this
+profile's *partner* — the one it is meant to stay identical to. That only stores the choice
+(nothing is copied) and switches on **automatic syncing**: whenever you switch to a profile
+that has a partner and the two libraries differ, the voices each side is missing are copied
+both ways as part of the switch, with a short toast saying what moved. The policy is always
+*leave differing voices alone* — you can pick a winner with ⇄ mirror, but the server never does
+it for you — and a library too full to take them reports the refusal instead of failing the
+switch. From then on the **profile picker in the top bar shows a ⇄ badge** while the two
+libraries differ, with the counts in its tooltip, and a ⇄ next to that profile's name in the
+dropdown. **Click the badge** and the Voice Lab opens with the partner already chosen as the
+mirror target, the diff loaded and the ⇄ mirror button waiting — the shortcut when you want to
+see exactly what differs before evening them out. A partner that was since deleted is reported as *partner missing* rather than
+silently forgotten, and the same button — now **★ voice partner** — clears the partnership
+(and stops the auto-sync).
+
+The export is a small, plain JSON file — good for backups, for versioning next to the profile, or
+for handing a voice to someone else:
+
+```json
+{
+  "format": "wallie.voices",
+  "version": 1,
+  "exported_at": "2026-10-10T01:00:00+00:00",
+  "source_profile": "default",
+  "count": 1,
+  "presets": [
+    {
+      "name": "Wallie BR",
+      "provider": "kokoro",
+      "voice_id": "pf_dora",
+      "notes": "",
+      "source": "local:kokoro",
+      "created_at": "2026-10-09T23:58:14+00:00",
+      "tts": { "kokoro_lang_code": "p" }
+    }
+  ]
+}
+```
+
+What every move has in common:
+
+- **Upsert by name.** A voice with the same name (case-insensitive) is *replaced*, never duplicated,
+  so re-importing the same file or mirroring twice is a harmless no-op.
+- **Overwriting asks first.** If that name already exists **with different settings**, the server
+  refuses with a `409` carrying the exact diff — `Wallie BR: kokoro : pf_dora → elevenlabs : v-9` —
+  and the dashboard asks before replacing anything; declining writes nothing. Mirroring is explicit
+  instead: the diff lists the clashing voices and you pick *leave them alone* (the default), *keep
+  this profile's version* or *use the other profile's version*.
+- **No pointless writes.** Voices that are already identical are left untouched, and a move that
+  would overflow a profile's 60-voice cap is refused *before* anything is written.
+- **A bad file fails loudly, not halfway.** An entry with no name is skipped, but a file that is not
+  a voice backup, is empty, is over ~2 MB or was written by a newer version is refused with a
+  message that says why.
+- **Local voices stay local to their engine.** A Piper preset carries only `piper_*` tuning, a
+  Kokoro one only `kokoro_*`, and neither can bring in the other engine's settings — nor the output
+  device, which routes audio and is not part of a voice.
+
 A few honest notes:
 
 - Cloning is **provider-side**. The audio is uploaded to ElevenLabs/Fish Audio under *your* account
@@ -128,6 +202,9 @@ A few honest notes:
   instead of failing silently. Kokoro's language picker is the closest equivalent for local voices.
 - Malformed or too-short samples are rejected by the provider; the provider's own message is shown
   so you can fix it rather than guess.
+- Piper/Kokoro voices saved on the **Voice** page live in this same library — that is what makes them
+  appear in the A/B and travel with every copy, pull, backup and mirror. (A pre-unification
+  `profiles/<profile>.localvoices.json` is imported into it once and then removed.)
 
 ---
 
@@ -245,7 +322,16 @@ pip install piper-tts onnxruntime
 python scripts/download_piper_voice.py en_US-amy-medium
 ```
 
-Then in the dashboard: **Voice** → provider `piper`, path `voices/en_US-amy-medium.onnx`.
+Or skip the terminal entirely: on the **Voice** page with `piper` selected, **⬇ One-click install**
+installs the runtime and the **Download a voice** box — click **browse catalogue** — lists every
+published voice (search by name, filter by language, with speakers/quality/size) and downloads the
+one you pick with a progress bar. Files land in `voices/` either way — the CLI stays as the headless
+alternative.
+
+Then in the dashboard: **Voice** → provider `piper`, path `voices/en_US-amy-medium.onnx` — and tune it
+right there: **Speed** (`piper_length_scale`), **Expressiveness** (`piper_noise_scale`) and **Pacing
+variety** (`piper_noise_w`). Everything you set is part of a saved voice, so it comes back with one
+click from the library in the Voice Lab.
 </details>
 
 <details>
@@ -615,8 +701,8 @@ wallie-v2/
 |---|---|---|---|---|
 | **Fish Audio** | ✅ | ✅ **via Voice Lab** | ~$15/M chars | Creates a private model from your clips |
 | **ElevenLabs** | ✅ | ✅ **via Voice Lab** | ~$30/M chars | Instant voice cloning |
-| **Kokoro** | ✅ (local) | ❌ | $0 | 8 languages incl. **pt-BR**; pick voice + language in Voice |
-| **Piper** | ✅ (local) | ❌ | $0 | Fixed voices, fastest local option |
+| **Kokoro** | ✅ (local) | ❌ | $0 | 8 languages incl. **pt-BR**; pick voice + language in Voice — saved voices land in the Voice Lab library |
+| **Piper** | ✅ (local) | ❌ | $0 | Fixed voices, fastest local option. One-click runtime install, the whole official catalogue downloadable from the dashboard, plus speed/expressiveness/pacing sliders |
 | **OpenAI-Compatible (speech)** | ✅ | ❌ | any gateway | Depends on the gateway |
 
 ---
@@ -634,6 +720,10 @@ wallie-v2/
 clips and create the voice under your account; their terms and privacy policies apply to that
 audio. Reference clips are *not* stored by Wallie — only the returned voice id lands in
 `profiles/<profile>.voices.json`.
+
+**A voice backup exported from the dashboard carries no secrets.** The `.json` file holds names,
+provider/voice ids and tuning knobs only — no API keys and no audio — so it is safe to version or
+hand to someone else.
 
 **Do not expose the dashboard to a public network without a reverse proxy with authentication.**
 
@@ -711,6 +801,26 @@ parameter names are overridable. Expression slots must match VTS hotkey names or
 <summary><strong>TTS returns 401</strong></summary>
 
 Verify the key on the **API Keys** page — the masked preview should match your provider dashboard. Hit **test** to confirm.
+</details>
+
+<details>
+<summary><strong>Copying / pulling / importing a voice asks about a name that already exists</strong></summary>
+
+That is the overwrite guard, not an error. The destination profile already has a saved voice with
+that name **and different settings**, so the dashboard shows the diff (`name: current → incoming`)
+and asks before replacing it. Accept to overwrite, cancel to leave everything as it was — nothing is
+written until you answer. Mirroring never asks: its diff lists the clashing voices and you choose
+which side wins (or turn the difference into a no-op with *leave them alone*).
+</details>
+
+<details>
+<summary><strong>The Piper catalogue won't load, or a voice download fails</strong></summary>
+
+The catalogue is fetched live from `huggingface.co/rhasspy/piper-voices` (a few hundred KB, cached
+in-process for an hour), so it needs internet the first time — **refresh** retries. A failed
+download keeps its last progress and its message in the log under the box; the usual causes are no
+network, a proxy, or a wrong name. Names are `lang_REGION-voice-quality`
+(`pt_BR-faber-medium`), or just pick from the catalogue instead of typing.
 </details>
 
 ---

@@ -93,9 +93,9 @@ llm:
   vision_max_tokens: 200
 tts:
   provider: kokoro
-  voice_id: 4hhgiQJG3FMn8mWGAvkv
-  sample_rate: 24000
-  output_device: Output (Voicemeeter Point 1)
+  voice_id: ''
+  sample_rate: 44100
+  output_device: Alto-falantes (VB-Audio Virtual Cable)
   el_model_id: eleven_turbo_v2_5
   el_stability: 0.45
   el_similarity_boost: 0.75

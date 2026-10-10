@@ -14,6 +14,7 @@ voices/
 .wallie_vts_token
 .wallie_state.json
 profiles/*.memory.json
+profiles/*.localvoices.json
 install_log.txt
 .mypy_cache/
 .pytest_cache/

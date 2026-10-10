@@ -51,6 +51,8 @@ def build_tts(cfg: TTSConfig, secrets: Secrets) -> TTSProvider:
         return PiperTTS(
             model_path=cfg.piper_model_path,
             length_scale=cfg.piper_length_scale,
+            noise_scale=cfg.piper_noise_scale,
+            noise_w=cfg.piper_noise_w,
         )
 
     if cfg.provider == "kokoro":

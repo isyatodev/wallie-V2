@@ -32,6 +32,14 @@
     <button type="button" class="heal-toast-x" @click="deviceWarn = { tts_output: '', loopback: '' }" aria-label="Dismiss">✕</button>
   </div>
 
+  <!-- Switching to a profile that has a voice partner syncs the two libraries;
+       say so rather than writing voices silently on a profile switch. -->
+  <div class="heal-toast partner-sync-toast" :class="{ 'is-warn': partnerSyncMsg.startsWith('⚠') }"
+       x-show="partnerSyncMsg" x-cloak style="display:none" role="status">
+    <span x-text="partnerSyncMsg"></span>
+    <button type="button" class="heal-toast-x" @click="partnerSyncMsg = ''" aria-label="Dismiss">✕</button>
+  </div>
+
   <!-- ============ TOP BAR ============ -->
 <header class="topbar">
   <div class="brand">
@@ -46,8 +54,12 @@
     <div class="profile-picker">
       <label>Profile</label>
       <select x-model="activeProfile" @change="switchProfile($event.target.value)">
-        <template x-for="p in profiles" :key="p"><option :value="p" x-text="p"></option></template>
+        <template x-for="p in profiles" :key="p"><option :value="p" x-text="profileOptionLabel(p)"></option></template>
       </select>
+      <!-- Clicking the badge is the shortcut to the fix: it opens the Voice Lab
+           with this profile's partner already chosen as the mirror target. -->
+      <button type="button" class="sync-badge" x-show="partnerBadge().show" :class="partnerBadge().cls"
+              :title="partnerBadge().title" @click="openPartnerMirror()" x-text="partnerBadge().text"></button>
       <button class="icon-btn" title="New profile" @click="promptNewProfile()">＋</button>
       <button class="icon-btn" title="Clone current" @click="promptCloneProfile()">⎘</button>
       <button class="icon-btn danger" title="Delete current" @click="confirmDeleteProfile()" x-show="profiles.length > 1">🗑</button>
@@ -110,6 +122,12 @@
         <h2>Identity</h2>
         <p>Who is your streamer? These anchor every sentence they say.</p>
       </header>
+      <div class="info-box">
+        <b>Where this goes:</b> every field here is pasted into the system prompt, so the
+        streamer refers to itself exactly as you write it. Start with <b>name</b>,
+        <b>pronouns</b> and <b>language</b> — <b>backstory</b> and <b>archetype</b> then shape
+        how it sounds in every line.
+      </div>
       <div class="grid two">
         <div class="field">
           <label>Name</label>
@@ -169,6 +187,10 @@
         <h2>Personality</h2>
         <p>How they talk, not what they talk about.</p>
       </header>
+      <div class="info-box">
+        These knobs shape the <b>wording</b>, not the topics. If the streamer feels off, adjust
+        <b>energy</b> and <b>humor</b> first — they dominate the tone of every reply.
+      </div>
 
       <div class="field">
         <label>Energy</label>
@@ -314,6 +336,12 @@
         <h2>Voice</h2>
         <p>Synthesis provider, voice ID, and delivery knobs.</p>
       </header>
+      <div class="info-box">
+        Pick a <b>provider</b> and the controls below swap to that engine. Cloud engines
+        (Fish, ElevenLabs) need a key on the <b>API Keys</b> page; <b>Piper</b> and <b>Kokoro</b>
+        run locally for free. The <b>▶ Play</b> strip at the bottom tests the current settings
+        without saving them.
+      </div>
       <!-- Kokoro install helper (collapsible). Teaching copy is duplicated in the
            first-run setup wizard's free path — keep both in sync. -->
       <details class="install-help">
@@ -374,6 +402,65 @@
             Voices follow the language and the voice field autocompletes per language.
             Prefer a server? Run <b>Kokoro-FastAPI</b> and pick the <b>OpenAI-Compatible</b>
             provider with PCM rate 24000 instead.
+          </p>
+        </div>
+      </details>
+      <!-- Piper install helper (collapsible). Piper is the free local engine that
+           runs on CPU with one small downloaded voice file — no PyTorch. -->
+      <details class="install-help">
+        <summary>
+          🔧 Install Piper — free local voice (no API key)
+          <span class="ih-sum-badge" :class="piper.installed ? 'ok' : 'miss'"
+                x-text="piper.installed ? '✓ installed' : 'not installed'"></span>
+        </summary>
+        <div class="ih-body">
+          <div class="ih-status">
+            <span class="ih-badge" :class="piper.installed ? 'ok' : 'miss'"
+                  x-text="piper.installed ? ('✓ piper-tts ' + (piper.piper_tts_version || 'installed') + ' ready') : 'piper-tts not installed'"></span>
+            <span class="ih-status-note" x-text="(piper.voice_count || 0) + ' voice(s) in ' + (piper.voices_dir || 'voices/')"></span>
+            <button type="button" class="btn tiny" x-show="!piper.installed"
+                    :disabled="piperBusy || !piper.can_install"
+                    @click="installPiper()"
+                    x-text="piperBusy ? 'installing…' : '⬇ One-click install'"></button>
+            <button type="button" class="btn tiny ghost" @click="loadPiperStatus()"
+                    :disabled="piperBusy">refresh</button>
+          </div>
+          <pre class="ih-log" x-show="piper.job.log" x-text="piper.job.log"></pre>
+          <p class="ih-lead">
+            Piper is the lightest local voice: it runs on CPU, needs no API key and no
+            PyTorch — just the <code>piper-tts</code> runtime and one small voice file per
+            language. A great fallback when Kokoro's download is too heavy.
+          </p>
+          <ol class="ih-steps">
+            <li>
+              <b>1 · Install the runtime</b>
+              <code class="ih-cmd">python -m pip install piper-tts</code>
+              <span class="ih-alt">…or press <b>⬇ One-click install</b> above to run it for you.</span>
+            </li>
+            <li>
+              <b>2 · Download a voice</b> (each is ~20–60 MB and works offline afterwards)
+              <code class="ih-cmd">python scripts/download_piper_voice.py en_US-amy-medium</code>
+              <span class="ih-alt">
+                Names are <code>lang_REGION-voice-quality</code> — e.g.
+                <code>pt_BR-faber-medium</code>, <code>en_US-amy-medium</code>,
+                <code>es_ES-davefx-medium</code>. Use the <b>Download another voice</b> box
+                below instead. Browse the catalogue at
+                <a href="https://huggingface.co/rhasspy/piper-voices" target="_blank">huggingface.co/rhasspy/piper-voices</a>.
+              </span>
+            </li>
+            <li>
+              <b>3 · Configure it right here</b>
+              <span class="ih-alt">
+                Set <b>Provider → Piper (local · free)</b>, pick the model from the
+                <b>Voice model</b> menu (it scans <code>voices/</code>), then tune
+                <b>Speed</b>, <b>Expressiveness</b> and <b>Pacing variety</b>. Keep a
+                favourite under <b>Saved Piper voices</b>. Press <b>▶ Play</b> below to hear it.
+              </span>
+            </li>
+          </ol>
+          <p class="ih-foot">
+            Each voice is a pair of files: the <code>.onnx</code> weights and a matching
+            <code>.onnx.json</code> config — keep both together in <code>voices/</code>.
           </p>
         </div>
       </details>
@@ -443,12 +530,75 @@
         </template>
         <template x-if="cfg.tts.provider==='piper'">
           <div class="field wide">
-            <label>Piper voice model path</label>
+            <label>Voice model
+              <button type="button" class="mini-btn" style="float:right"
+                @click="loadPiperStatus()" :disabled="piperBusy"
+                x-text="piperBusy ? 'scanning…' : 'rescan voices'"></button>
+            </label>
+            <select x-model="cfg.tts.piper_model_path">
+              <option value="">— choose a downloaded voice —</option>
+              <template x-for="v in piper.voices" :key="v.path">
+                <option :value="v.path" x-text="v.name + (v.sample_rate ? ' · ' + v.sample_rate + ' Hz' : '') + (v.has_config ? '' : '  ⚠ missing .onnx.json')"></option>
+              </template>
+            </select>
             <input x-model="cfg.tts.piper_model_path" placeholder="voices/en_US-amy-medium.onnx" />
             <small class="hint">
-              Download with: <code>python scripts/download_piper_voice.py en_US-amy-medium</code>.
-              Browse voices at <a href="https://huggingface.co/rhasspy/piper-voices" target="_blank">huggingface.co/rhasspy/piper-voices</a>.
+              Pick a voice scanned from <code x-text="piper.voices_dir || 'voices/'"></code>, or paste the
+              <code>.onnx</code> path. Nothing downloaded yet? Use the box below, or the
+              <b>🔧 Install Piper</b> guide up top.
             </small>
+          </div>
+        </template>
+        <template x-if="cfg.tts.provider==='piper'">
+          <div class="field wide">
+            <label>Download a voice
+              <button type="button" class="mini-btn" style="float:right"
+                @click="piperCatalogPanel = !piperCatalogPanel; if (piperCatalogPanel && !piperCatalog.voices.length) loadPiperCatalog()"
+                x-text="piperCatalogPanel ? 'hide catalogue' : 'browse catalogue'"></button>
+            </label>
+            <div class="enroll-strip">
+              <input x-model="piperDownloadVoice" placeholder="en_US-amy-medium"
+                     @keydown.enter="downloadPiperVoice()" />
+              <button class="btn tiny" @click="downloadPiperVoice()"
+                      :disabled="piperBusy || !piperDownloadVoice.trim()"
+                      x-text="piperBusy && piper.job.kind==='download' ? 'downloading…' : '⬇ download'"></button>
+            </div>
+            <div class="dl-progress" x-show="piper.job.running && piper.job.kind==='download'">
+              <div class="dl-bar"><span :style="'width:' + (piper.job.progress || 0) + '%'"></span></div>
+              <small class="hint" x-text="(piper.job.voice || '') + ' — ' + (piper.job.progress || 0) + '%'"></small>
+            </div>
+            <small class="hint">
+              Type a name (<code>lang_REGION-voice-quality</code>), or open the <b>catalogue</b> to
+              search every published voice and download it here. Files land in <code>voices/</code>.
+            </small>
+
+            <div class="catalog" x-show="piperCatalogPanel">
+              <div class="catalog-bar">
+                <input x-model="piperCatalog.query" placeholder="search name / language…" />
+                <select x-model="piperCatalog.lang">
+                  <option value="">all languages</option>
+                  <template x-for="l in piperCatalogLangs()" :key="l.code">
+                    <option :value="l.code" x-text="l.label + ' (' + l.code + ')'"></option>
+                  </template>
+                </select>
+                <button type="button" class="btn tiny ghost" @click="loadPiperCatalog(true)"
+                        :disabled="piperCatalog.loading"
+                        x-text="piperCatalog.loading ? '…' : 'refresh'"></button>
+              </div>
+              <small class="hint" x-show="piperCatalog.msg" x-text="piperCatalog.msg"></small>
+              <div class="catalog-list">
+                <template x-for="v in piperCatalogResults()" :key="v.name">
+                  <div class="speaker-row">
+                    <span x-text="v.name"></span>
+                    <small class="hint" x-text="(v.language_name || v.language) + (v.speakers > 1 ? ' · ' + v.speakers + ' speakers' : '') + ' · ' + v.quality"></small>
+                    <small class="hint" x-text="fmtMB(v.size_bytes)"></small>
+                    <button class="btn tiny" @click="downloadPiperCatalogVoice(v)"
+                            :disabled="piperBusy">⬇</button>
+                  </div>
+                </template>
+              </div>
+              <small class="hint" x-show="piperCatalogPanel && !piperCatalog.loading && !piperCatalogResults().length">No voices match that filter.</small>
+            </div>
           </div>
         </template>
         <template x-if="cfg.tts.provider==='piper'">
@@ -456,6 +606,43 @@
             <label>Speed (length scale) <span class="slider-val" x-text="cfg.tts.piper_length_scale.toFixed(2)"></span></label>
             <input type="range" min="0.6" max="1.6" step="0.05" x-model.number="cfg.tts.piper_length_scale" />
             <small class="hint">1.0 = normal · &lt;1 faster · &gt;1 slower</small>
+          </div>
+        </template>
+        <template x-if="cfg.tts.provider==='piper'">
+          <div class="field">
+            <label>Expressiveness <span class="slider-val" x-text="cfg.tts.piper_noise_scale.toFixed(2)"></span></label>
+            <input type="range" min="0" max="1" step="0.05" x-model.number="cfg.tts.piper_noise_scale" />
+            <small class="hint">Piper's noise scale — higher is more animated and varied. Default 0.667.</small>
+          </div>
+        </template>
+        <template x-if="cfg.tts.provider==='piper'">
+          <div class="field">
+            <label>Pacing variety <span class="slider-val" x-text="cfg.tts.piper_noise_w.toFixed(2)"></span></label>
+            <input type="range" min="0" max="1.5" step="0.05" x-model.number="cfg.tts.piper_noise_w" />
+            <small class="hint">Phoneme-duration jitter — higher is more natural pacing, lower is flatter. Default 0.8.</small>
+          </div>
+        </template>
+        <template x-if="cfg.tts.provider==='piper'">
+          <div class="field wide">
+            <label>Saved Piper voices</label>
+            <div class="enroll-strip">
+              <input x-model="localVoiceName.piper" placeholder="name this Piper voice (e.g. Amy)"
+                     @keydown.enter="saveLocalVoice('piper')" />
+              <button class="btn tiny" @click="saveLocalVoice('piper')"
+                      :disabled="!!localVoiceBusy || !localVoiceName.piper.trim()">＋ save</button>
+            </div>
+            <div class="speakers-list voice-lab">
+              <template x-for="v in localVoices.piper" :key="v.name">
+                <div class="speaker-row">
+                  <span x-text="v.name"></span>
+                  <small class="hint" x-text="v.voice_id || '(no model path yet)'"></small>
+                  <button class="btn tiny primary" @click="applyLocalVoice('piper', v)">use</button>
+                  <button class="btn tiny danger" @click="deleteLocalVoice('piper', v.name)">✕</button>
+                </div>
+              </template>
+              <p class="hint" x-show="!localVoices.piper.length">No saved Piper voices yet — tune a voice above, name it and save.</p>
+            </div>
+            <small class="hint" x-show="localVoiceMsg" x-text="localVoiceMsg"></small>
           </div>
         </template>
         <template x-if="cfg.tts.provider==='kokoro'">
@@ -497,6 +684,29 @@
           <div class="field">
             <label>Speed <span class="slider-val" x-text="cfg.tts.kokoro_speed.toFixed(2)"></span></label>
             <input type="range" min="0.5" max="2.0" step="0.05" x-model.number="cfg.tts.kokoro_speed" />
+          </div>
+        </template>
+        <template x-if="cfg.tts.provider==='kokoro'">
+          <div class="field wide">
+            <label>Saved Kokoro voices</label>
+            <div class="enroll-strip">
+              <input x-model="localVoiceName.kokoro" placeholder="name this Kokoro voice (e.g. Dora BR)"
+                     @keydown.enter="saveLocalVoice('kokoro')" />
+              <button class="btn tiny" @click="saveLocalVoice('kokoro')"
+                      :disabled="!!localVoiceBusy || !localVoiceName.kokoro.trim()">＋ save</button>
+            </div>
+            <div class="speakers-list voice-lab">
+              <template x-for="v in localVoices.kokoro" :key="v.name">
+                <div class="speaker-row">
+                  <span x-text="v.name"></span>
+                  <small class="hint" x-text="(v.voice_id || '(default voice)') + (v.tts && v.tts.kokoro_lang_code ? ' · lang ' + v.tts.kokoro_lang_code : '')"></small>
+                  <button class="btn tiny primary" @click="applyLocalVoice('kokoro', v)">use</button>
+                  <button class="btn tiny danger" @click="deleteLocalVoice('kokoro', v.name)">✕</button>
+                </div>
+              </template>
+              <p class="hint" x-show="!localVoices.kokoro.length">No saved Kokoro voices yet — pick a language + voice above, name it and save.</p>
+            </div>
+            <small class="hint" x-show="localVoiceMsg" x-text="localVoiceMsg"></small>
           </div>
         </template>
         <div class="field wide">
@@ -688,11 +898,19 @@
           character's voice (and its delivery knobs) comes back with one click.
         </p>
       </header>
+      <div class="info-box">
+        Two independent tools: <b>Saved voices</b> snapshots a whole voice config per profile,
+        and <b>Clone a voice</b> builds a new voice at ElevenLabs / Fish Audio from reference
+        audio. Local engines (Piper, Kokoro) can't be cloned — they keep their own pickers on
+        the <b>Voice</b> page.
+      </div>
 
       <h3 class="subhead">Saved voices</h3>
       <p class="hint" style="margin:4px 0 10px;">
         A saved voice stores the provider, the voice id and this profile's delivery settings
         (speed, stability, per-language voice…). <b>use</b> writes them into the Voice page and saves.
+        Voices saved on the <b>Voice</b> page for the local engines (Piper, Kokoro) live in this same
+        library, so they also show up in the A/B below and copy with the button at the end of the list.
       </p>
       <div class="test-strip">
         <input class="test-input" x-model="voiceLabSaveName" placeholder="name this voice (e.g. Wallie BR)" />
@@ -702,18 +920,148 @@
 
       <div class="speakers-list voice-lab" style="margin-top:12px;">
         <template x-for="p in voiceLab.presets" :key="p.name">
-          <div class="speaker-row">
+          <div class="speaker-row" :class="{ picked: voicePicked(p.name) }">
+            <input type="checkbox" class="switch" :checked="voicePicked(p.name)"
+                   @change="toggleVoicePick(p.name, $event.target.checked)"
+                   :title="'tick “' + p.name + '” to copy or download several voices at once'" />
             <span x-text="p.name"></span>
             <small class="hint" x-text="(p.provider || '?') + (p.voice_id ? ' : ' + p.voice_id : '')"></small>
-            <small class="hint hint-ok" x-show="p.source && p.source !== 'manual'" x-text="'cloned via ' + p.source.replace('clone:', '')"></small>
+            <small class="hint hint-ok" x-show="p.source && p.source !== 'manual'"
+                   x-text="p.source.startsWith('clone:') ? ('cloned via ' + p.source.slice(6)) : (p.source.startsWith('local:') ? ('local · ' + p.source.slice(6)) : p.source)"></small>
             <small class="hint" x-show="p.notes" x-text="p.notes"></small>
             <button class="btn tiny primary" @click="applyVoice(p)">use</button>
             <button class="btn tiny ghost" @click="testVoicePreset(p)" :disabled="!!voiceLabBusy">▶ test</button>
+            <button class="btn tiny ghost" @click="exportVoices([p.name])" :disabled="!!voiceLabBusy"
+                    title="copy this voice to the destination profile below">⇪</button>
+            <button class="btn tiny ghost" @click="backupVoices([p.name])" :disabled="!!voiceLabBusy"
+                    title="download just this voice as a .json file">⤓</button>
             <button class="btn tiny danger" @click="deleteVoice(p.name)">✕</button>
           </div>
         </template>
         <p class="hint" x-show="!voiceLab.presets.length">Nothing saved for this profile yet.</p>
       </div>
+
+      <div class="test-strip" style="margin-top:10px;">
+        <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+          <input type="checkbox" class="switch" :checked="allVoicesPicked()"
+                 @change="pickAllVoices($event.target.checked)"
+                 :disabled="!voiceLab.presets.length" />
+          <span class="hint">select all</span>
+        </label>
+        <button class="btn tiny ghost" @click="pickAllVoices(false)"
+                :disabled="!voicePick.length">clear</button>
+        <small class="hint"
+               x-text="voicePick.length ? (voicePick.length + ' of ' + voiceLab.presets.length + ' selected') : 'tick the voices to copy or back up several at once'"></small>
+      </div>
+
+      <div class="test-strip" style="margin-top:10px;">
+        <select x-model="voiceExport.target">
+          <option value="">— copy saved voices to… —</option>
+          <template x-for="p in profiles" :key="p">
+            <option :value="p" x-text="p" :disabled="p === activeProfile"></option>
+          </template>
+        </select>
+        <button class="btn tiny primary" @click="exportVoices(voicePick)"
+                :disabled="!voicePick.length || !voiceExport.target || voiceExport.target === activeProfile || !!voiceLabBusy"
+                title="copy the ticked voices into the destination profile">⇪ copy selected<span x-text="voicePick.length ? ' (' + voicePick.length + ')' : ''"></span></button>
+        <button class="btn tiny" @click="exportVoices()"
+                :disabled="!voiceExport.target || voiceExport.target === activeProfile || !!voiceLabBusy">⇪ copy all</button>
+        <small class="hint" style="flex-basis:100%;">Pick a destination, then copy the <b>ticked</b> voices (or the whole list). A row's own <b>⇪</b> copies just that one. Same-named voices with different settings ask before being replaced.</small>
+        <small class="hint" x-show="voiceExport.msg" x-text="voiceExport.msg" style="flex-basis:100%;"></small>
+      </div>
+
+      <div class="test-strip" style="margin-top:10px;">
+        <button class="btn tiny" @click="backupVoices(voicePick)"
+                :disabled="!voicePick.length || !!voiceLabBusy"
+                title="download just the ticked voices as a .json file">⤓ selected .json</button>
+        <button class="btn tiny ghost" @click="backupVoices()"
+                :disabled="!!voiceLabBusy || !voiceLab.presets.length"
+                title="download every saved voice as a .json file">⤓ all .json</button>
+        <label class="btn tiny ghost" :class="{ 'is-disabled': !!voiceLabBusy }"
+               title="merge the saved voices from a .json backup into this profile">
+          ⤒ import .json
+          <input type="file" accept=".json,application/json" @change="importVoices($event)"
+                 :disabled="!!voiceLabBusy" style="display:none;" />
+        </label>
+        <small class="hint" style="flex-basis:100%;">
+          <b>⤓</b> downloads a backup file — the ticked voices, one voice (the row button) or the whole
+          list; <b>⤒</b> merges one back in, replacing same-named voices (you are asked first when the
+          settings differ). Good for backups and for handing a voice to someone else.
+        </small>
+        <small class="hint" x-show="voiceBackup.msg" x-text="voiceBackup.msg" style="flex-basis:100%;"></small>
+      </div>
+
+      <h3 class="subhead" style="margin-top:26px;">Pull from another profile</h3>
+      <p class="hint" style="margin:4px 0 10px;">
+        The inverse of <b>⇪</b>: read another profile's saved voices and bring the ones you tick
+        into this profile. Same-named voices with different settings ask before being replaced;
+        identical ones just re-save, so this is safe to repeat.
+      </p>
+      <div class="test-strip">
+        <select x-model="voicePull.source" @change="loadPullSource()">
+          <option value="">— pull voices from… —</option>
+          <template x-for="p in profiles" :key="p">
+            <option :value="p" x-text="p" :disabled="p === activeProfile"></option>
+          </template>
+        </select>
+        <button class="btn tiny" @click="pullVoices()"
+                :disabled="!voicePull.names.length || !!voiceLabBusy"
+                title="bring the ticked voices into this profile">⇩ pull<span x-text="voicePull.names.length ? ' (' + voicePull.names.length + ')' : ''"></span></button>
+        <button class="btn tiny ghost" @click="voicePull.names = voicePull.presets.map(p => p.name)"
+                :disabled="!voicePull.presets.length">all</button>
+        <button class="btn tiny ghost" @click="voicePull.names = []"
+                :disabled="!voicePull.names.length">none</button>
+        <small class="hint" x-show="voicePull.msg" x-text="voicePull.msg" style="flex-basis:100%;"></small>
+      </div>
+      <div class="speakers-list voice-lab" style="margin-top:10px;" x-show="voicePull.presets.length">
+        <template x-for="p in voicePull.presets" :key="p.name">
+          <div class="speaker-row" :class="{ picked: pullPicked(p.name) }">
+            <input type="checkbox" class="switch" :checked="pullPicked(p.name)"
+                   @change="togglePullPick(p.name, $event.target.checked)"
+                   :title="'tick “' + p.name + '” to bring it into this profile'" />
+            <span x-text="p.name"></span>
+            <small class="hint" x-text="(p.provider || '?') + (p.voice_id ? ' : ' + p.voice_id : '')"></small>
+            <small class="hint hint-ok" x-show="p.source && p.source !== 'manual'"
+                   x-text="p.source.startsWith('clone:') ? ('cloned via ' + p.source.slice(6)) : (p.source.startsWith('local:') ? ('local · ' + p.source.slice(6)) : p.source)"></small>
+          </div>
+        </template>
+      </div>
+
+      <h3 class="subhead" id="voice-mirror" style="margin-top:26px;">Mirror with another profile</h3>
+      <p class="hint" style="margin:4px 0 10px;">
+        Makes this profile and another one hold the same saved voices, copying the missing ones
+        <b>both ways</b>. The diff appears first — nothing is applied until you press <b>⇄ mirror</b>.
+      </p>
+      <div class="test-strip">
+        <select x-model="voiceMirror.other" @change="loadMirrorPlan()">
+          <option value="">— mirror voices with… —</option>
+          <template x-for="p in profiles" :key="p">
+            <option :value="p" x-text="p" :disabled="p === activeProfile"></option>
+          </template>
+        </select>
+        <select x-model="voiceMirror.policy">
+          <option value="skip">differing voices: leave them alone</option>
+          <option value="this">differing voices: keep this profile's</option>
+          <option value="other">differing voices: use the other profile's</option>
+        </select>
+        <button class="btn tiny primary" @click="mirrorVoices()"
+                :disabled="!mirrorPending() || !!voiceLabBusy"
+                title="copy the missing voices to both profiles">⇄ mirror</button>
+        <button class="btn tiny" @click="setVoicePartner()"
+                :disabled="!voiceMirror.other || voiceMirror.other === activeProfile || !!voiceLabBusy"
+                :title="partnerIs(voiceMirror.other) ? 'stop treating this profile as the voice partner' : 'keep this profile in sync with that one — the profile picker warns while the two libraries differ'"
+                x-text="partnerIs(voiceMirror.other) ? '★ voice partner' : '☆ set as voice partner'"></button>
+        <small class="hint" x-show="voiceMirror.msg" x-text="voiceMirror.msg" style="flex-basis:100%;"></small>
+      </div>
+      <div class="mirror-diff" x-show="voiceMirror.plan">
+        <template x-for="line in mirrorLines()" :key="line">
+          <small class="hint" x-text="line"></small>
+        </template>
+        <small class="hint hint-ok" x-show="!mirrorPending()">
+          Nothing to mirror under this policy — the two libraries already match.
+        </small>
+      </div>
+      <p class="hint" style="margin:6px 0 0;" x-show="voiceMirror.other" x-text="partnerHint()"></p>
 
       <h3 class="subhead" style="margin-top:26px;">Clone a voice</h3>
       <p class="hint" style="margin:4px 0 10px;">
@@ -853,6 +1201,11 @@
         <h2>Avatar</h2>
         <p>VTube Studio integration. Lipsync, idle motion and expression triggers driven by the speech pipeline.</p>
       </header>
+      <div class="info-box">
+        Wallie drives your Live2D model over VTube Studio's API: it opens the mouth from the
+        speech envelope and fires expression hotkeys per emotion. Enable it and connect once
+        the session is running so the mouth actually moves.
+      </div>
 
       <label class="toggle-row big">
         <span>Enable VTube Studio avatar</span>
@@ -1014,6 +1367,11 @@
         <h2>Topics</h2>
         <p>What your streamer riffs on between chat messages.</p>
       </header>
+      <div class="info-box">
+        Two modes: <b>AI picks</b> lets the model choose a fresh topic every segment, while
+        <b>From list</b> cycles your pool. <b>Switch chance</b> applies per segment — set it to
+        0 to never move on before the min time elapses.
+      </div>
       <div class="field">
         <label>Topic mode</label>
         <div class="segmented">
@@ -1048,6 +1406,11 @@
         <h2>Vision</h2>
         <p>Let your streamer react to what's on your screen. Needs a vision-capable LLM.</p>
       </header>
+      <div class="info-box">
+        Vision sends a downscaled screenshot to a vision-capable LLM only when the picture
+        changes. Raise <b>frame interval</b> / <b>change threshold</b> to spend less; the warning
+        below appears if your current model can't see images.
+      </div>
       <label class="toggle-row big">
         <span>Enable screen vision</span>
         <input type="checkbox" class="switch" x-model="cfg.vision.enabled" />
@@ -1217,6 +1580,11 @@
         <h2>Play — Minecraft 🎮</h2>
         <p>Wallie actually PLAYS Minecraft and reacts in character. When this is ON, the commentary is grounded in what Wallie is really doing (not guessing from the screen). When OFF, standard Vision mode runs as usual.</p>
       </header>
+      <div class="info-box">
+        Play mode hands the controls to the Minecraft agent — the <b>goal</b> is what it pursues.
+        This replaces screen-guessing with real, grounded commentary; keep
+        <b>commentary from the playing brain</b> on for that, and let it end lines with <b>F8</b>.
+      </div>
 
       <label class="toggle-row big">
         <span>Enable Play mode</span>
@@ -1262,6 +1630,11 @@
         <h2>Hearing</h2>
         <p>Let your streamer hear system audio — game sound, video, music, voice — and fuse it with what it sees. Runs locally (no API cost).</p>
       </header>
+      <div class="info-box">
+        Hearing captures <b>system playback</b> (not your microphone) and transcribes it. Pick
+        the loopback device that carries the game/voice-comms audio, enable it, then Start a
+        session so the capture loop can run.
+      </div>
       <label class="toggle-row big">
         <span>Enable hearing</span>
         <input type="checkbox" class="switch" x-model="cfg.hearing.enabled" />
@@ -1387,6 +1760,11 @@
         <h2>Chat</h2>
         <p>Live chat monitoring across platforms.</p>
       </header>
+      <div class="info-box">
+        Turn on a platform to feed its messages to the streamer as chat events. Account
+        credentials live on the <b>API Keys</b> page; <b>mention-only</b> ignores messages that
+        don't address Wallie.
+      </div>
       <div class="grid three">
         <label class="toggle-row">
           <span>YouTube</span>
@@ -1448,6 +1826,10 @@
         <h2>Avatar</h2>
         <p>VTube Studio integration — drive your Live2D avatar's mouth and expressions in real time.</p>
       </header>
+      <div class="info-box">
+        Connect to VTube Studio, then map Wallie's emotion slots to your model's hotkeys so the
+        face matches the voice. The mouth is driven automatically from the speech envelope.
+      </div>
 
       <label class="toggle-row big">
         <span>Enable VTube Studio avatar</span>
@@ -1522,6 +1904,11 @@
         <h2>Donations</h2>
         <p>LivePix and Streamlabs donations fan into the SAME pipeline as chat — the orchestrator replies once per donation, in your voice, with the existing TTS.</p>
       </header>
+      <div class="info-box">
+        Donations run through the same reply pipeline as chat. Configure each platform's keys
+        under <b>API Keys</b>, then use the <b>Test</b> strip below to exercise the whole path
+        without real money.
+      </div>
 
       <div class="grid two">
         <div class="field">
@@ -1587,6 +1974,10 @@
         <h2>Captions</h2>
         <p>Render Wallie's speech as a browser-source caption overlay for OBS / Streamlabs. The caption box <b>clears itself when the TTS message ends</b> — no stale line lingers on screen.</p>
       </header>
+      <div class="info-box">
+        Captions stream Wallie's text to a browser source in OBS / Streamlabs. Copy the overlay
+        URL into a <b>Browser Source</b>; the box clears itself a moment after speech ends.
+      </div>
 
       <label class="toggle-row big">
         <span>Enable caption overlay</span>
@@ -1658,6 +2049,11 @@
         <h2>Memory</h2>
         <p>Durable facts the AI keeps <b>on this device</b> (short + long term), plus spontaneous thoughts so it brings up topics on its own. Memories are stored per profile in <code>profiles/&lt;name&gt;.longterm.json</code>.</p>
       </header>
+      <div class="info-box">
+        Memory is local and per profile. While running, the AI captures durable facts on its
+        own — you can add, edit, tag or delete memories here. The extractor model is set under
+        <b>Vision → Memory extractor</b>.
+      </div>
 
       <label class="toggle-row big">
         <span>Enable durable memory</span>
@@ -1899,6 +2295,11 @@
         <h2>Engine</h2>
         <p>The brain. Pick a provider and tune sampling.</p>
       </header>
+      <div class="info-box">
+        The engine is the LLM that writes every line. Provider, model and sampling here drive
+        the main brain; the per-subsystem overrides live on their own pages (Vision, Memory,
+        Spontaneous thoughts).
+      </div>
       <div class="grid two">
         <div class="field">
           <label>Provider</label>
@@ -2066,6 +2467,11 @@
           leaves this machine.
         </p>
       </header>
+      <div class="info-box">
+        Keys live in <code>.env</code> on this machine and are never written into profiles or
+        sent back to the browser after saving. Use <b>add provider block</b> to point a
+        subsystem at a second endpoint without touching your main key.
+      </div>
 
       <div class="warn-banner" style="border-color: var(--accent-glow); background: var(--accent-soft); color: var(--accent-hot);">
         <b>Heads up:</b> the dashboard runs on <code>127.0.0.1</code> by default

@@ -360,6 +360,13 @@ class TTSConfig(BaseModel):
     fish_chunk_length: int = 100
     piper_model_path: str = ""
     piper_length_scale: float = 1.0
+    # Piper tuning knobs (the "voice customization" menu). length_scale above
+    # sets speed; these two shape the delivery: noise_scale adds expressiveness
+    # (higher = more varied, can get wobbly at 1.0+) and noise_w widens the
+    # phoneme-duration jitter (higher = more natural pacing, lower = flatter).
+    # Defaults are Piper's own, so an untouched profile sounds identical.
+    piper_noise_scale: float = 0.667
+    piper_noise_w: float = 0.8
     # Kokoro — local, high-quality neural TTS (free, runs on CPU/GPU). voice e.g.
     # af_heart / am_adam / bf_emma / pf_dora. The voice id's first letter IS the
     # lang_code: 'a'=US English, 'b'=UK, 'e'=Spanish, 'f'=French, 'h'=Hindi,
@@ -717,6 +724,11 @@ class AppConfig(BaseModel):
     # purpose: a hand-edited YAML with a bogus theme must never block profile
     # loading — the UI falls back to cyan for unknown values.
     dashboard_theme: str = "cyan"
+    # Voice partner: another profile whose saved-voice library this one is meant
+    # to stay in sync with (the Voice Lab's ⇄ mirror target). Kept as a plain
+    # name so a profile can point at a profile that was since deleted — the
+    # dashboard reports the partner as stale instead of failing to load.
+    voice_partner: str = ""
     # --- Dynamic provider blocks (managed on the API Keys page) ---
     # Named OpenAI-compatible endpoints; subsystems point at one by name.
     providers: list[ProviderBlock] = Field(default_factory=list[ProviderBlock])

@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import base64
 import json
+from dataclasses import replace
 
 import httpx
+import pytest
 
 from config import AppConfig, Runtime, Secrets
 
@@ -125,6 +127,319 @@ def test_library_reports_provider_readiness(tmp_path, monkeypatch):
     assert set(by_id) == {"elevenlabs", "fish"}
     assert all(p["ready"] is False for p in providers)
     assert by_id["elevenlabs"]["key_env"] == "ELEVENLABS_API_KEY"
+
+
+# ---------------------------------------------------------------------------
+# Backup file — the saved voices as a downloadable / uploadable .json
+# ---------------------------------------------------------------------------
+
+def test_backup_bundle_roundtrips_and_keeps_the_voice_intact(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "PROFILES_DIR", tmp_path)
+    from tts import voice_lab as vl
+
+    vl.add_preset("p-src", {
+        "name": "Wallie BR", "provider": "kokoro", "voice_id": "pf_dora",
+        "notes": "main host", "source": "local:kokoro", "created_at": "2026-01-02T03:04:05+00:00",
+        "tts": {"kokoro_lang_code": "p", "output_device": "dropped"},
+    })
+    bundle = vl.export_bundle("p-src")
+    assert bundle["format"] == vl.EXPORT_FORMAT
+    assert bundle["version"] == vl.EXPORT_VERSION
+    assert bundle["source_profile"] == "p-src" and bundle["exported_at"]
+    assert bundle["count"] == 1 and [p["name"] for p in bundle["presets"]] == ["Wallie BR"]
+
+    # The file is JSON text; parse it back the way an upload does.
+    result = vl.import_bundle("p-src2", vl.parse_bundle_text(json.dumps(bundle)))
+    assert result == {"imported": 1, "added": 1, "skipped": 0,
+                     "replaced": 0, "unchanged": 0, "total": 1}
+    got = vl.load_library("p-src2")[0]
+    assert (got.name, got.provider, got.voice_id, got.source) == (
+        "Wallie BR", "kokoro", "pf_dora", "local:kokoro")
+    assert got.notes == "main host" and got.created_at == "2026-01-02T03:04:05+00:00"
+    assert got.tts == {"kokoro_lang_code": "p"}          # routing field dropped
+
+    # A single named voice can be exported on its own.
+    vl.add_preset("p-src", {"name": "Other", "provider": "piper"})
+    one = vl.export_bundle("p-src", ["Other"])
+    assert [p["name"] for p in one["presets"]] == ["Other"]
+    with pytest.raises(vl.VoiceLabError):
+        vl.export_bundle("p-src", ["not saved here"])
+
+
+def test_import_merges_by_name_and_skips_junk(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "PROFILES_DIR", tmp_path)
+    from tts import voice_lab as vl
+
+    vl.add_preset("p", {"name": "one", "provider": "piper", "voice_id": "a.onnx"})
+    payload = {"presets": [
+        {"name": "ONE", "provider": "elevenlabs", "voice_id": "v-9"},   # replaces
+        {"provider": "piper"},                                          # no name
+        "junk",
+        {"name": "   "},
+        {"name": "Two", "provider": "fish", "voice_id": "f-1"},          # new
+    ]}
+    # Replacing a differently tuned same-named voice asks first...
+    with pytest.raises(vl.VoiceConflictError) as err:
+        vl.import_bundle("p", payload)
+    assert err.value.plan["replaced"] == ["ONE"] and err.value.plan["added"] == ["Two"]
+    assert [p.name for p in vl.load_library("p")] == ["one"]      # nothing written
+
+    result = vl.import_bundle("p", payload, overwrite=True)
+    assert result == {"imported": 2, "added": 1, "skipped": 2,
+                     "replaced": 1, "unchanged": 0, "total": 2}
+    got = {p.name: p for p in vl.load_library("p")}
+    assert set(got) == {"ONE", "Two"} and got["ONE"].provider == "elevenlabs"
+
+    # A bare list, a library file and a single saved voice are all accepted.
+    assert vl.import_bundle("p", [{"name": "From list"}])["imported"] == 1
+    assert vl.import_bundle("p", {"profile": "p", "presets": [{"name": "Lib"}]})["imported"] == 1
+    assert vl.import_bundle("p", {"name": "Solo", "provider": "piper"})["imported"] == 1
+
+
+def test_merge_plan_flags_only_real_differences(tmp_path, monkeypatch):
+    """The warning must fire on a different voice — and stay quiet on a re-save
+    (``created_at``/``source`` change on every save, so they are ignored)."""
+    import config
+    monkeypatch.setattr(config, "PROFILES_DIR", tmp_path)
+    from tts import voice_lab as vl
+
+    base = vl.VoicePreset(name="V", provider="piper", voice_id="x.onnx", notes="hi",
+                          tts={"piper_noise_w": 0.9},
+                          created_at="2020-01-01T00:00:00+00:00")
+    resaved = replace(base, created_at="2026-01-01T00:00:00+00:00", source="local:piper")
+    plan = vl.merge_plan([base], [resaved])
+    assert plan == {"added": [], "replaced": [], "unchanged": ["V"], "conflicts": []}
+
+    for field, value in [("provider", "kokoro"), ("voice_id", "y.onnx"),
+                         ("notes", "bye"), ("tts", {"piper_noise_w": 0.1})]:
+        plan = vl.merge_plan([base], [replace(base, **{field: value})])
+        assert plan["replaced"] == ["V"], field
+        assert plan["conflicts"][0]["name"] == "V"
+        assert plan["unchanged"] == [] and plan["added"] == []
+
+    # A brand-new name is an add, and the message names the voices.
+    plan = vl.merge_plan([base], [base, vl.VoicePreset(name="New")])
+    assert plan["added"] == ["New"] and plan["unchanged"] == ["V"]
+    assert "V" in vl.conflict_message("dst", vl.merge_plan([base], [replace(base, provider="x")]))
+
+
+def test_copying_between_profiles_asks_before_replacing(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "PROFILES_DIR", tmp_path)
+    from tts import voice_lab as vl
+
+    vl.add_preset("dst", {"name": "Wallie BR", "provider": "kokoro", "voice_id": "pf_dora",
+                          "tts": {"kokoro_lang_code": "p"}})
+    vl.add_preset("src", {"name": "Wallie BR", "provider": "elevenlabs", "voice_id": "v-9"})
+
+    with pytest.raises(vl.VoiceConflictError) as err:
+        vl.export_presets("src", "dst")
+    conflict = err.value.plan["conflicts"][0]
+    assert conflict["name"] == "Wallie BR"
+    assert conflict["current"] == "kokoro : pf_dora (kokoro_lang_code=p)"
+    assert conflict["incoming"] == "elevenlabs : v-9"
+    assert "Wallie BR" in str(err.value)
+    assert vl.load_library("dst")[0].provider == "kokoro"      # untouched until confirmed
+    assert vl.plan_export("src", "dst")["replaced"] == ["Wallie BR"]
+
+    assert vl.export_presets("src", "dst", overwrite=True) == 1
+    assert vl.load_library("dst")[0].provider == "elevenlabs"
+
+
+def test_import_refuses_unusable_files_without_writing(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "PROFILES_DIR", tmp_path)
+    from tts import voice_lab as vl
+
+    for bad in ["", "   ", "{not json", "[1, 2, 3]", '{"hello": 1}', '{"presets": []}']:
+        with pytest.raises(vl.VoiceLabError):
+            vl.import_bundle("p", vl.parse_bundle_text(bad))
+    with pytest.raises(vl.VoiceLabError):
+        vl.parse_bundle_text("x" * (vl.MAX_IMPORT_CHARS + 1))
+    # A backup from a newer format is refused instead of half-read.
+    with pytest.raises(vl.VoiceLabError):
+        vl.import_bundle("p", {"format": vl.EXPORT_FORMAT,
+                                "version": vl.EXPORT_VERSION + 1,
+                                "presets": [{"name": "Future"}]})
+    assert not vl.library_path("p").exists()      # nothing was written
+
+    # Overflowing the library fails loudly — and again writes nothing.
+    vl.add_preset("full", {"name": "One"})
+    from tts.voice_lab import MAX_PRESETS
+    big = {"presets": [{"name": f"v{i}"} for i in range(MAX_PRESETS)]}
+    with pytest.raises(vl.VoiceLabError):
+        vl.import_bundle("full", big)
+    assert [p.name for p in vl.load_library("full")] == ["One"]
+
+
+def test_backup_endpoint_downloads_and_restores(tmp_path, monkeypatch):
+    app = _profiled_app(tmp_path, monkeypatch, AppConfig(profile_name="p-bk"))
+    with _client(app) as client:
+        assert client.get("/api/voices/backup").status_code == 400   # nothing saved yet
+        client.post("/api/voices/library", json={
+            "name": "A", "provider": "piper", "voice_id": "voices/a.onnx"})
+        client.post("/api/voices/library", json={
+            "name": "B", "provider": "elevenlabs", "voice_id": "v-1"})
+
+        bundle = client.get("/api/voices/backup").json()
+        assert [p["name"] for p in bundle["presets"]] == ["B", "A"]
+        one = client.get("/api/voices/backup", params={"names": "A"}).json()
+        assert [p["name"] for p in one["presets"]] == ["A"]
+        assert client.get("/api/voices/backup", params={"names": "nope"}).status_code == 400
+
+        # Wipe the library, then restore it from the exported file's text.
+        client.delete("/api/voices/library/A")
+        client.delete("/api/voices/library/B")
+        assert client.get("/api/voices/library").json()["presets"] == []
+        r = client.post("/api/voices/import", json={"content": json.dumps(bundle)})
+        assert r.status_code == 200, r.text
+        assert r.json()["imported"] == 2 and r.json()["total"] == 2
+        assert [p["name"] for p in r.json()["presets"]] == ["B", "A"]
+        assert client.get("/api/voices/library").json()["presets"][1]["voice_id"] == "voices/a.onnx"
+
+        # Re-importing the same file upserts instead of duplicating.
+        r = client.post("/api/voices/import", json={"content": json.dumps(bundle)})
+        assert r.json()["imported"] == 2 and r.json()["total"] == 2
+
+        # Bad uploads are actionable 400s, not tracebacks.
+        for content in ["", "{not json", '{"hello": 1}']:
+            bad = client.post("/api/voices/import", json={"content": content})
+            assert bad.status_code == 400, bad.text
+            assert bad.json()["detail"]
+
+
+def test_import_endpoint_asks_before_replacing_a_different_voice(tmp_path, monkeypatch):
+    """Restoring a backup must not silently overwrite a voice this profile has
+    tuned differently: 409 with the diff first, then apply with overwrite."""
+    app = _profiled_app(tmp_path, monkeypatch, AppConfig(profile_name="p-imp"))
+    with _client(app) as client:
+        client.post("/api/voices/library", json={
+            "name": "A", "provider": "piper", "voice_id": "x.onnx"})
+        bundle = client.get("/api/voices/backup").json()
+        bundle["presets"][0]["voice_id"] = "y.onnx"        # same name, different voice
+
+        r = client.post("/api/voices/import", json={"content": json.dumps(bundle)})
+        assert r.status_code == 409, r.text
+        detail = r.json()["detail"]
+        assert detail["conflicts"] == [{"name": "A", "current": "piper : x.onnx",
+                                        "incoming": "piper : y.onnx"}]
+        assert "A" in detail["message"]
+        assert client.get("/api/voices/library").json()["presets"][0]["voice_id"] == "x.onnx"
+
+        r = client.post("/api/voices/import",
+                        json={"content": json.dumps(bundle), "overwrite": True})
+        assert r.status_code == 200, r.text
+        assert r.json()["replaced"] == 1 and r.json()["added"] == 0
+        assert client.get("/api/voices/library").json()["presets"][0]["voice_id"] == "y.onnx"
+
+        # Re-importing the very same file is not a conflict — it just re-saves.
+        r = client.post("/api/voices/import", json={"content": json.dumps(bundle)})
+        assert r.status_code == 200, r.text
+        assert r.json()["replaced"] == 0 and r.json()["unchanged"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Mirroring two libraries
+# ---------------------------------------------------------------------------
+
+def test_mirror_plan_is_a_two_way_diff(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "PROFILES_DIR", tmp_path)
+    from tts import voice_lab as vl
+
+    vl.add_preset("a", {"name": "Mine only", "provider": "piper"})
+    vl.add_preset("a", {"name": "Shared", "provider": "piper", "voice_id": "x.onnx"})
+    vl.add_preset("a", {"name": "Clash", "provider": "kokoro", "voice_id": "pf_dora"})
+    vl.add_preset("b", {"name": "Theirs only", "provider": "fish", "voice_id": "f-1"})
+    vl.add_preset("b", {"name": "Shared", "provider": "piper", "voice_id": "x.onnx"})
+    vl.add_preset("b", {"name": "Clash", "provider": "elevenlabs", "voice_id": "v-9"})
+
+    plan = vl.mirror_plan("a", "b")
+    assert plan["this_profile"] == "a" and plan["other_profile"] == "b"
+    assert plan["to_other"] == ["Mine only"]
+    assert plan["to_this"] == ["Theirs only"]
+    assert plan["identical"] == ["Shared"]
+    assert plan["conflicts"] == [{"name": "Clash", "this": "kokoro : pf_dora",
+                                 "other": "elevenlabs : v-9"}]
+    assert plan["this_count"] == 3 and plan["other_count"] == 3
+    # Planning writes nothing.
+    assert len(vl.load_library("a")) == 3 and len(vl.load_library("b")) == 3
+
+
+def test_mirror_copies_both_ways_and_skips_clashes_by_default(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "PROFILES_DIR", tmp_path)
+    from tts import voice_lab as vl
+
+    vl.add_preset("a", {"name": "Mine only"})
+    vl.add_preset("a", {"name": "Clash", "provider": "piper", "voice_id": "x.onnx"})
+    vl.add_preset("b", {"name": "Theirs only"})
+    vl.add_preset("b", {"name": "Clash", "provider": "elevenlabs", "voice_id": "v-9"})
+
+    result = vl.mirror_libraries("a", "b")
+    assert result["policy"] == "skip"
+    assert result["to_other"] == 1 and result["to_this"] == 1 and result["skipped"] == 1
+    assert result["this_total"] == 3 and result["other_total"] == 3
+    assert sorted(p.name for p in vl.load_library("a")) == ["Clash", "Mine only", "Theirs only"]
+    assert sorted(p.name for p in vl.load_library("b")) == ["Clash", "Mine only", "Theirs only"]
+    # The clashing voice kept each side's own settings.
+    assert {p.name: p.provider for p in vl.load_library("a")}["Clash"] == "piper"
+    assert {p.name: p.provider for p in vl.load_library("b")}["Clash"] == "elevenlabs"
+    # Applying again is a no-op (already mirrored).
+    again = vl.mirror_libraries("a", "b")
+    assert again["to_other"] == 0 and again["to_this"] == 0 and again["skipped"] == 1
+    assert again["plan"]["conflicts"] == result["plan"]["conflicts"]
+
+
+def test_mirror_conflict_policies_pick_a_winner(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "PROFILES_DIR", tmp_path)
+    from tts import voice_lab as vl
+
+    def seed():
+        for profile in ("a", "b"):
+            for preset in vl.load_library(profile):
+                vl.remove_preset(profile, preset.name)
+        vl.add_preset("a", {"name": "Clash", "provider": "piper", "voice_id": "x.onnx",
+                            "tts": {"piper_noise_w": 0.9}})
+        vl.add_preset("b", {"name": "Clash", "provider": "elevenlabs", "voice_id": "v-9"})
+
+    seed()
+    result = vl.mirror_libraries("a", "b", conflicts="this")
+    assert result["policy"] == "this" and result["skipped"] == 0
+    assert vl.load_library("b")[0].provider == "piper"        # mine won
+    assert vl.load_library("a")[0].provider == "piper"        # and mine was not touched
+
+    seed()
+    result = vl.mirror_libraries("a", "b", conflicts="other")
+    assert result["policy"] == "other"
+    assert vl.load_library("a")[0].provider == "elevenlabs"   # theirs won
+    assert vl.load_library("b")[0].provider == "elevenlabs"
+    assert vl.load_library("a")[0].tts == {}                  # mine's tuning is gone
+
+    with pytest.raises(vl.VoiceLabError):
+        vl.mirror_libraries("a", "b", conflicts="nonsense")
+
+
+def test_mirror_refuses_when_a_library_would_overflow(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "PROFILES_DIR", tmp_path)
+    from tts import voice_lab as vl
+    from tts.voice_lab import MAX_PRESETS
+
+    for i in range(MAX_PRESETS):
+        vl.add_preset("a", {"name": f"a{i}"})
+    for i in range(MAX_PRESETS):
+        vl.add_preset("b", {"name": f"b{i}"})
+
+    with pytest.raises(vl.VoiceLabError):
+        vl.mirror_libraries("a", "b")
+    # Nothing was written on either side.
+    assert len(vl.load_library("a")) == MAX_PRESETS
+    assert len(vl.load_library("b")) == MAX_PRESETS
+    assert [p.name for p in vl.load_library("a")][:1] == [f"a{MAX_PRESETS - 1}"]
 
 
 # ---------------------------------------------------------------------------
@@ -614,3 +929,42 @@ def test_library_file_corruption_is_not_fatal(tmp_path, monkeypatch):
     assert [p.name for p in load_library("p-bad")] == ["recovered"]
     on_disk = json.loads((tmp_path / "p-bad.voices.json").read_text(encoding="utf-8"))
     assert on_disk["profile"] == "p-bad"
+
+
+# ---------------------------------------------------------------------------
+# Voice partner — is this profile still in sync with its partner?
+# ---------------------------------------------------------------------------
+
+def test_sync_state_measures_a_profile_against_its_partner(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "PROFILES_DIR", tmp_path)
+    from tts import voice_lab as vl
+
+    vl.add_preset("a", {"name": "Mine only", "provider": "piper"})
+    vl.add_preset("a", {"name": "Clash", "provider": "piper", "voice_id": "x.onnx"})
+    vl.add_preset("b", {"name": "Theirs only"})
+    vl.add_preset("b", {"name": "Clash", "provider": "elevenlabs", "voice_id": "v-9"})
+
+    state = vl.sync_state("a", "b")
+    assert state["partner"] == "b" and state["out_of_sync"] is True
+    assert (state["to_other"], state["to_this"], state["conflicts"]) == (1, 1, 1)
+    # Measuring writes nothing to either library.
+    assert len(vl.load_library("a")) == 2 and len(vl.load_library("b")) == 2
+
+    # After a default (skip) mirror the missing voices match but the clashing
+    # one does not — that is still divergence, which is exactly what the badge
+    # is for ("skip" alone would never resolve it).
+    vl.mirror_libraries("a", "b")
+    state = vl.sync_state("a", "b")
+    assert state["out_of_sync"] is True
+    assert state["conflicts"] == 1 and state["identical"] == 2
+
+    # Picking a winner leaves nothing to report.
+    vl.mirror_libraries("a", "b", conflicts="this")
+    state = vl.sync_state("a", "b")
+    assert state["out_of_sync"] is False
+    assert state["conflicts"] == 0 and state["identical"] == 3
+    assert state["this_count"] == 3 and state["other_count"] == 3
+
+    # Two profiles with no saved voices at all are trivially in sync.
+    assert vl.sync_state("empty-a", "empty-b")["out_of_sync"] is False

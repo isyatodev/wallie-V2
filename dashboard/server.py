@@ -127,6 +127,21 @@ def _scrub_error(msg: str, limit: int = 220) -> str:
     return out[:limit]
 
 
+_PIPER_PCT_RE = _re.compile(r"\((\d{1,3})%\)")
+
+
+def _last_percent(text: str) -> int | None:
+    """Last ``(NN%)`` a Piper helper printed, for the download progress bar.
+    Returns None when the chunk has no percentage yet."""
+    matches = _PIPER_PCT_RE.findall(text)
+    if not matches:
+        return None
+    try:
+        return max(0, min(100, int(matches[-1])))
+    except ValueError:  # pragma: no cover - regex guarantees digits
+        return None
+
+
 class DashboardState:
     def __init__(self) -> None:
         self.orchestrator: Optional[Orchestrator] = None
@@ -137,6 +152,18 @@ class DashboardState:
         self.kokoro_install: dict[str, Any] = {
             "running": False,
             "lang": None,
+            "started_at": None,
+            "finished_at": None,
+            "returncode": None,
+            "log": "",
+        }
+        # Piper one-click install / voice-download job (Voice-tab badge). Read by
+        # GET /api/tts/piper/status; updated by the background task.
+        self.piper_job: dict[str, Any] = {
+            "running": False,
+            "kind": "",
+            "voice": "",
+            "progress": 0,
             "started_at": None,
             "finished_at": None,
             "returncode": None,
@@ -319,6 +346,66 @@ class VoicePreviewBody(BaseModel):
 class KokoroInstallBody(BaseModel):
     lang: str = "a"     # Kokoro lang_code — picks which language extra (misaki) to pull in
     voice: str = ""     # optional voice to pre-download (defaults to the language's first)
+
+
+class PiperDownloadBody(BaseModel):
+    voice: str          # e.g. en_US-amy-medium
+
+
+class LocalVoiceBody(BaseModel):
+    """One saved voice for a single local engine (Piper / Kokoro)."""
+
+    name: str
+    voice_id: str = ""
+    notes: str = ""
+    tts: dict[str, Any] = {}
+
+
+class VoiceExportBody(BaseModel):
+    """Copy saved voices from the active profile into another profile."""
+
+    target_profile: str
+    names: list[str] = []      # empty = the whole saved-voice library
+    # Replacing a same-named voice with DIFFERENT settings needs this flag; the
+    # server answers 409 first so the dashboard can ask.
+    overwrite: bool = False
+
+
+class VoiceImportBody(BaseModel):
+    """A saved-voice backup file, posted as text.
+
+    The dashboard reads the ``.json`` in the browser and sends its contents, so
+    the server stays the single owner of the format: parsing, validation and the
+    TTS-knob sanitizing all happen in ``tts.voice_lab``.
+    """
+
+    content: str = ""
+    overwrite: bool = False    # see VoiceExportBody.overwrite
+
+
+class VoicePullBody(BaseModel):
+    """Bring saved voices FROM another profile's library (the inverse of an
+    export, which pushes them into another profile)."""
+
+    source_profile: str
+    names: list[str] = []      # empty = every voice that profile has
+    overwrite: bool = False    # see VoiceExportBody.overwrite
+
+
+class VoiceMirrorBody(BaseModel):
+    """Two-way sync: make this profile and another one hold the same voices."""
+
+    other_profile: str
+    # skip | this | other — what to do with same-named voices that differ.
+    conflicts: str = "skip"
+
+
+class VoicePartnerBody(BaseModel):
+    """Record (or clear) this profile's voice partner — the profile its
+    saved-voice library is meant to stay in sync with. An empty string clears
+    it. This only stores the choice; nothing is copied by setting it."""
+
+    partner: str = ""
 
 
 class TestProviderBody(BaseModel):
@@ -587,10 +674,41 @@ def _build_app(
         activate_profile(name)
         return {"ok": True, "active": name}
 
+    def _auto_mirror_partner(cfg: Any) -> dict[str, Any]:
+        """Keep a just-activated profile's voices in step with its partner.
+
+        Switching profiles is the moment the user expects the two libraries to
+        match, so when the profile has a voice partner and the two differ, the
+        voices each side is missing are copied both ways. The policy is always
+        ``skip`` — the only one that can never discard a setting — so a shared
+        name with different settings is left exactly as it is and merely
+        reported: the ⇄ badge keeps pointing at it instead of the server picking
+        a winner behind the user's back. Returns ``{}`` when there is nothing to
+        do (no partner, a stale one, or already in step), and a report rather
+        than an exception when the copy is refused, so a full library can never
+        fail a profile switch.
+        """
+        partner = (getattr(cfg, "voice_partner", "") or "").strip()
+        if not partner or partner == cfg.profile_name or partner not in list_profiles():
+            return {}
+        try:
+            if not _vlab.sync_state(cfg.profile_name, partner)["out_of_sync"]:
+                return {}
+            result = _vlab.mirror_libraries(cfg.profile_name, partner)
+        except _vlab.VoiceLabError as e:
+            return {"partner": partner, "synced": False, "error": str(e)}
+        return {
+            "partner": partner,
+            "synced": True,
+            "to_other": result["to_other"],
+            "to_this": result["to_this"],
+            "skipped": result["skipped"],
+        }
+
     @app.put("/api/profiles/{name}/activate")
     def api_profiles_activate(name: str) -> dict[str, Any]:
         cfg = activate_profile(name)
-        return {"ok": True, "active": cfg.profile_name}
+        return {"ok": True, "active": cfg.profile_name, "partner_sync": _auto_mirror_partner(cfg)}
 
     @app.delete("/api/profiles/{name}")
     def api_profiles_delete(name: str) -> dict[str, Any]:
@@ -771,6 +889,109 @@ def _build_app(
         asyncio.create_task(_run_kokoro_install(lang, voice), name="kokoro-install")
         return {"ok": True, "started": True, "lang": lang}
 
+    # ---------- Piper (optional local TTS) — status, install, voice downloads ----------
+    from tts import piper_setup as _piper
+
+    _PIPER_JOB_TIMEOUT = 1800.0
+
+    async def _run_piper_job(argv: list[str]) -> None:
+        """Run a Piper install/download subprocess off the event loop and stream
+        its output onto state.piper_job so the Voice tab can show live progress.
+
+        The downloader prints ``… (NN%)`` on stderr/stdout; each chunk is scanned
+        for the last percentage, which the UI polls. The whole job is bounded by
+        ``_PIPER_JOB_TIMEOUT``."""
+        job = state.piper_job
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(_piper.REPO_ROOT),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except Exception as e:
+            job.update(running=False, returncode=-1, finished_at=time.time(),
+                       log=f"could not start the job: {_scrub_error(str(e))}")
+            return
+        buf = bytearray()
+        deadline = time.time() + _PIPER_JOB_TIMEOUT
+        try:
+            assert proc.stdout is not None
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=remaining)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                text = bytes(buf).decode("utf-8", "ignore")
+                job["log"] = text[-4000:]
+                pct = _last_percent(text)
+                if pct is not None:
+                    job["progress"] = pct
+            await proc.wait()
+        except asyncio.TimeoutError:
+            proc.kill()
+            job.update(running=False, returncode=-1, finished_at=time.time(),
+                       log="the job timed out — check your connection and try again")
+            return
+        job.update(
+            running=False,
+            returncode=proc.returncode,
+            finished_at=time.time(),
+            log=bytes(buf).decode("utf-8", "ignore")[-4000:],
+        )
+        if proc.returncode == 0:
+            job["progress"] = 100
+
+    @app.get("/api/tts/piper/status")
+    def api_piper_status() -> dict[str, Any]:
+        """Is the local Piper engine installed? Which voices are on disk? What
+        is the last install/download job doing?"""
+        return {"ok": True, **_piper.detect(), "job": dict(state.piper_job)}
+
+    @app.post("/api/tts/piper/install")
+    async def api_piper_install() -> dict[str, Any]:
+        """Start a background pip install of the Piper runtime."""
+        if state.piper_job["running"]:
+            raise HTTPException(409, "a Piper job is already running")
+        state.piper_job.update(
+            running=True, kind="install", voice="", progress=0, started_at=time.time(),
+            finished_at=None, returncode=None, log="installing the Piper runtime…",
+        )
+        asyncio.create_task(_run_piper_job(_piper.install_argv()), name="piper-install")
+        return {"ok": True, "started": True, "kind": "install"}
+
+    @app.post("/api/tts/piper/download")
+    async def api_piper_download(body: PiperDownloadBody) -> dict[str, Any]:
+        """Download one voice from the HuggingFace catalogue into voices/."""
+        if not _piper.INSTALL_SCRIPT.is_file():
+            raise HTTPException(400, "helper script missing: scripts/download_piper_voice.py")
+        if state.piper_job["running"]:
+            raise HTTPException(409, "a Piper job is already running")
+        voice = (body.voice or "").strip()
+        try:
+            argv = _piper.download_argv(voice)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        state.piper_job.update(
+            running=True, kind="download", voice=voice, progress=0, started_at=time.time(),
+            finished_at=None, returncode=None, log=f"downloading {voice}…",
+        )
+        asyncio.create_task(_run_piper_job(argv), name="piper-download")
+        return {"ok": True, "started": True, "kind": "download", "voice": voice}
+
+    @app.get("/api/tts/piper/catalog")
+    async def api_piper_catalog(refresh: bool = False) -> dict[str, Any]:
+        """Every voice published in the rhasspy/piper-voices catalogue, so the
+        Voice tab can browse/download without leaving the dashboard."""
+        try:
+            voices = await _piper.fetch_catalog(force=bool(refresh))
+        except _piper.PiperCatalogError as e:
+            raise HTTPException(400, str(e))
+        return {"ok": True, "count": len(voices), "voices": voices}
+
     # ---------- Voice Lab — saved voices + voice cloning ----------
     from tts import voice_lab as _vlab
 
@@ -790,11 +1011,28 @@ def _build_app(
             ],
         }
 
+    def _conflict_response(e: "_vlab.VoiceConflictError") -> HTTPException:
+        """409 + the diff, so the UI can ask before replacing saved voices."""
+        return HTTPException(409, detail={
+            "message": str(e),
+            "conflicts": e.plan.get("conflicts", []),
+            "plan": e.plan,
+        })
+
     @app.get("/api/voices/library")
-    def api_voices_library() -> dict[str, Any]:
-        """Saved voices for the active profile + which cloning backends have a key."""
+    def api_voices_library(profile: str = "") -> dict[str, Any]:
+        """Saved voices + which cloning backends have a key.
+
+        ``?profile=<name>`` peeks at ANOTHER profile's library (read-only) so the
+        Voice Lab can offer to pull voices from it; the default is the active one.
+        """
         cfg = load_profile()
-        return _voice_library_payload(cfg.profile_name)
+        if not profile or profile == cfg.profile_name:
+            return _voice_library_payload(cfg.profile_name)
+        from config import list_profiles
+        if profile not in list_profiles():
+            raise HTTPException(404, f"no profile named {profile}")
+        return _voice_library_payload(profile)
 
     @app.post("/api/voices/library")
     def api_voices_library_add(body: VoicePresetBody) -> dict[str, Any]:
@@ -812,6 +1050,246 @@ def _build_app(
         if not _vlab.remove_preset(cfg.profile_name, name):
             raise HTTPException(404, f"no saved voice named {name}")
         return {"ok": True, **_voice_library_payload(cfg.profile_name)}
+
+    # ---------- Local voice pickers — one saved list per local engine ----------
+    from tts import local_voices as _lvoices
+
+    @app.get("/api/voices/local")
+    def api_local_voices() -> dict[str, Any]:
+        """Saved voices bucket, one list per local engine (Piper / Kokoro)."""
+        cfg = load_profile()
+        return {
+            "ok": True,
+            "supported": list(_lvoices.LOCAL_VOICE_PROVIDERS),
+            **_lvoices.providers_payload(cfg.profile_name),
+        }
+
+    @app.post("/api/voices/local/{provider}")
+    def api_local_voices_add(provider: str, body: LocalVoiceBody) -> dict[str, Any]:
+        cfg = load_profile()
+        try:
+            voice = _lvoices.add_local(cfg.profile_name, provider, body.model_dump())
+        except _lvoices.LocalVoiceError as e:
+            raise HTTPException(400, str(e))
+        return {
+            "ok": True,
+            "voice": voice.to_dict(),
+            **_lvoices.providers_payload(cfg.profile_name),
+        }
+
+    @app.delete("/api/voices/local/{provider}/{name}")
+    def api_local_voices_delete(provider: str, name: str) -> dict[str, Any]:
+        cfg = load_profile()
+        try:
+            removed = _lvoices.remove_local(cfg.profile_name, provider, name)
+        except _lvoices.LocalVoiceError as e:
+            raise HTTPException(400, str(e))
+        if not removed:
+            raise HTTPException(404, f"no saved {provider} voice named {name}")
+        return {"ok": True, **_lvoices.providers_payload(cfg.profile_name)}
+
+    @app.post("/api/voices/export")
+    def api_voices_export(body: VoiceExportBody) -> dict[str, Any]:
+        """Copy the active profile's saved voices (including the local
+        Piper/Kokoro ones) into another profile's library."""
+        from config import list_profiles
+        cfg = load_profile()
+        target = (body.target_profile or "").strip()
+        if not target:
+            raise HTTPException(400, "pick a target profile")
+        if target == cfg.profile_name:
+            raise HTTPException(400, "pick a different profile")
+        if target not in list_profiles():
+            raise HTTPException(404, f"no profile named {target}")
+        plan = _vlab.plan_export(cfg.profile_name, target, body.names or None)
+        try:
+            copied = _vlab.export_presets(
+                cfg.profile_name, target, body.names or None, overwrite=body.overwrite
+            )
+        except _vlab.VoiceConflictError as e:
+            raise _conflict_response(e)
+        except _vlab.VoiceLabError as e:
+            raise HTTPException(400, str(e))
+        return {
+            "ok": True,
+            "copied": copied,
+            "target": target,
+            "total": len(_vlab.load_library(target)),
+            "added": len(plan["added"]),
+            "replaced": len(plan["replaced"]),
+            "unchanged": len(plan["unchanged"]),
+        }
+
+    @app.get("/api/voices/backup")
+    def api_voices_backup(names: str = "") -> dict[str, Any]:
+        """The active profile's saved voices as a portable, downloadable
+        ``.json`` bundle (``?names=a,b`` limits it to those voices)."""
+        cfg = load_profile()
+        wanted = [n.strip() for n in (names or "").split(",") if n.strip()]
+        try:
+            bundle = _vlab.export_bundle(cfg.profile_name, wanted or None)
+        except _vlab.VoiceLabError as e:
+            raise HTTPException(400, str(e))
+        if not bundle["presets"]:
+            raise HTTPException(400, "no saved voices to export in this profile")
+        return bundle
+
+    @app.post("/api/voices/import")
+    def api_voices_import(body: VoiceImportBody) -> dict[str, Any]:
+        """Merge a voice backup file into the active profile's library.
+
+        Same-named voices are replaced (upsert), so restoring a backup onto a
+        library that already has some of the voices is safe to repeat."""
+        cfg = load_profile()
+        try:
+            payload = _vlab.parse_bundle_text(body.content)
+            result = _vlab.import_bundle(
+                cfg.profile_name, payload, overwrite=body.overwrite
+            )
+        except _vlab.VoiceConflictError as e:
+            raise _conflict_response(e)
+        except _vlab.VoiceLabError as e:
+            raise HTTPException(400, str(e))
+        return {"ok": True, **result, **_voice_library_payload(cfg.profile_name)}
+
+    @app.post("/api/voices/pull")
+    def api_voices_pull(body: VoicePullBody) -> dict[str, Any]:
+        """The inverse of /api/voices/export: bring saved voices FROM another
+        profile's library into this one (upsert by name).
+
+        This is how a character's voices — including local Piper/Kokoro ones —
+        move back without re-creating them.
+        """
+        from config import list_profiles
+        cfg = load_profile()
+        source = (body.source_profile or "").strip()
+        if not source:
+            raise HTTPException(400, "pick a source profile")
+        if source == cfg.profile_name:
+            raise HTTPException(400, "pick a different profile")
+        if source not in list_profiles():
+            raise HTTPException(404, f"no profile named {source}")
+        if not _vlab.load_library(source):
+            raise HTTPException(400, f"“{source}” has no saved voices to pull")
+        plan = _vlab.plan_export(source, cfg.profile_name, body.names or None)
+        try:
+            copied = _vlab.export_presets(
+                source, cfg.profile_name, body.names or None, overwrite=body.overwrite
+            )
+        except _vlab.VoiceConflictError as e:
+            raise _conflict_response(e)
+        except _vlab.VoiceLabError as e:
+            raise HTTPException(400, str(e))
+        if body.names and not copied:
+            raise HTTPException(400, f"none of those voices are saved in “{source}”")
+        return {
+            "ok": True,
+            "copied": copied,
+            "source": source,
+            "added": len(plan["added"]),
+            "replaced": len(plan["replaced"]),
+            "unchanged": len(plan["unchanged"]),
+            "total": len(_vlab.load_library(cfg.profile_name)),
+            **_voice_library_payload(cfg.profile_name),
+        }
+
+    def _validate_other_profile(name: str) -> str:
+        """A profile that exists and is not the active one (400/404 otherwise)."""
+        from config import list_profiles
+        other = (name or "").strip()
+        if not other:
+            raise HTTPException(400, "pick another profile")
+        if other == load_profile().profile_name:
+            raise HTTPException(400, "pick a different profile")
+        if other not in list_profiles():
+            raise HTTPException(404, f"no profile named {other}")
+        return other
+
+    @app.get("/api/voices/mirror")
+    def api_voices_mirror_plan(other: str = "") -> dict[str, Any]:
+        """The two-way diff between the active profile's saved voices and
+        another profile's — what a mirror would add on each side, and which
+        shared names differ."""
+        other = _validate_other_profile(other)
+        cfg = load_profile()
+        return {"ok": True, **_vlab.mirror_plan(cfg.profile_name, other)}
+
+    @app.post("/api/voices/mirror")
+    def api_voices_mirror(body: VoiceMirrorBody) -> dict[str, Any]:
+        """Give both profiles the same saved voices (missing ones copied each
+        way; differing shared names follow the chosen ``conflicts`` policy)."""
+        other = _validate_other_profile(body.other_profile)
+        cfg = load_profile()
+        try:
+            result = _vlab.mirror_libraries(
+                cfg.profile_name, other, conflicts=body.conflicts
+            )
+        except _vlab.VoiceLabError as e:
+            raise HTTPException(400, str(e))
+        return {
+            "ok": True,
+            "other": other,
+            **result,
+            **_voice_library_payload(cfg.profile_name),
+        }
+
+    @app.get("/api/voices/partners")
+    def api_voices_partners() -> dict[str, Any]:
+        """Every profile against its voice partner, for the profile picker's
+        out-of-sync badge.
+
+        Read-only. A partner that was renamed or deleted since it was chosen is
+        reported as ``stale`` rather than silently cleared, so a wrong badge
+        never becomes a silently rewritten profile.
+        """
+        cfg = load_profile()
+        names = list_profiles() or [cfg.profile_name]
+        profiles: dict[str, Any] = {}
+        for name in names:
+            partner = (load_profile(name).voice_partner or "").strip()
+            entry: dict[str, Any] = {
+                "partner": partner,
+                "stale": False,
+                "out_of_sync": False,
+                "to_other": 0,
+                "to_this": 0,
+                "conflicts": 0,
+            }
+            if partner:
+                if partner == name or partner not in names:
+                    entry["stale"] = True
+                else:
+                    entry.update(_vlab.sync_state(name, partner))
+            profiles[name] = entry
+        return {"ok": True, "active": cfg.profile_name, "profiles": profiles}
+
+    @app.post("/api/voices/partner")
+    def api_voices_set_partner(body: VoicePartnerBody) -> dict[str, Any]:
+        """Set this profile's voice partner (empty clears it).
+
+        Only records the choice — the libraries are still equalised by
+        ``POST /api/voices/mirror``, so nothing is copied behind the user's back.
+        """
+        cfg = load_profile()
+        partner = (body.partner or "").strip()
+        if partner:
+            if partner == cfg.profile_name:
+                raise HTTPException(400, "a profile cannot partner itself")
+            if partner not in (list_profiles() or []):
+                raise HTTPException(404, f"no profile named {partner}")
+        cfg.voice_partner = partner
+        save_profile(cfg, cfg.profile_name)
+        state: dict[str, Any] = {
+            "partner": "",
+            "stale": False,
+            "out_of_sync": False,
+            "to_other": 0,
+            "to_this": 0,
+            "conflicts": 0,
+        }
+        if partner:
+            state.update(_vlab.sync_state(cfg.profile_name, partner))
+        return {"ok": True, "active": cfg.profile_name, **state}
 
     @app.post("/api/voices/clone")
     async def api_voices_clone(body: VoiceCloneBody) -> dict[str, Any]:

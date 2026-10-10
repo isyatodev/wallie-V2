@@ -102,6 +102,42 @@ def test_visual_styling_stays_out_of_the_markup():
 
 
 # ---------------------------------------------------------------------------
+# Click targets
+# ---------------------------------------------------------------------------
+
+def test_partner_badge_shortcut_points_at_a_real_handler_and_section():
+    """The ⇄ badge opens the Voice Lab with the partner already selected.
+
+    Both halves of that shortcut fail silently: delete/rename
+    ``openPartnerMirror()`` and the click does nothing; rename the section id
+    and it switches to a section that isn't there.
+    """
+    html = _read("index.html")
+    app = _read("app.js")
+
+    badge = re.search(r"<button[^>]*class=\"sync-badge\"[^>]*>", html, re.S)
+    assert badge, "the ⇄ partner badge is no longer a clickable button"
+    assert '@click="openPartnerMirror()"' in badge.group(0)
+
+    handler = re.search(r"openPartnerMirror\(\)\s*\{", app)
+    assert handler, "openPartnerMirror() is gone from app.js"
+    end = app.find("\n    },", handler.end())      # the method's own closing brace
+    body = app[handler.end():end if end != -1 else len(app)]
+    target = re.search(r'this\.section = "([^"]+)"', body)
+    assert target, "openPartnerMirror() no longer switches section"
+    section_id = target.group(1)
+    assert f"section==='{section_id}'" in html, f"no section with id '{section_id}'"
+    # The nav must offer it too, or the shortcut lands on an unreachable page.
+    assert f'id: "{section_id}"' in app, f"'{section_id}' is missing from the nav sections"
+    # And it scrolls to the mirror block, which is why that id has to exist.
+    assert 'this.scrollToMirror()' in body
+    scroller = re.search(r"scrollToMirror\(\)\s*\{", app)
+    assert scroller, "scrollToMirror() is gone from app.js"
+    assert 'getElementById("voice-mirror")' in app[scroller.end():scroller.end() + 400]
+    assert 'id="voice-mirror"' in html
+
+
+# ---------------------------------------------------------------------------
 # Asset cache policy
 # ---------------------------------------------------------------------------
 

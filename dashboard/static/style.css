@@ -221,6 +221,20 @@ a { color: var(--accent-hot); }
 /* Accent-theme picker (topbar) — same chrome as the profile picker. */
 .theme-picker select { min-width: 84px; text-transform: capitalize; }
 
+/* Voice-partner badge (topbar): shown while this profile's saved-voice library
+   differs from its partner's — the same diff the Voice Lab's ⇄ mirror shows. */
+.sync-badge {
+  font-family: inherit;
+  font-size: var(--fs-2xs); font-weight: 700; letter-spacing: .4px;
+  padding: 3px 7px; border-radius: var(--radius-pill);
+  border: 1px solid var(--line); background: var(--bg-1); color: var(--fg-2);
+  white-space: nowrap; cursor: pointer;
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.sync-badge:hover { border-color: var(--line-strong); }
+.sync-badge.ok { color: var(--ok-ink); border-color: var(--ok-line); background: var(--ok-soft); }
+.sync-badge.warn { color: var(--warn-ink); border-color: var(--warn-line); background: var(--warn-soft); }
+
 .topbar-right { display: flex; align-items: center; gap: 8px; }
 .status-pill {
   display: flex; align-items: center; gap: 8px;
@@ -275,6 +289,9 @@ a { color: var(--accent-hot); }
 .btn.ghost.panic { color: var(--err-ink); border-color: var(--err-line); }
 .btn.ghost.panic:hover:not(:disabled) { background: var(--err-soft); color: var(--err-ink); border-color: var(--err-line); }
 .btn.tiny { min-height: var(--ctl-xs); padding: 0 9px; font-size: var(--fs-sm); border-radius: 6px; }
+/* Buttons that are really <label>s wrapping a hidden <input type="file">. */
+.btn.is-disabled { opacity: .4; cursor: not-allowed; }
+.btn.is-disabled:hover { background: transparent; box-shadow: none; }
 
 .icon-btn {
   background: transparent;
@@ -446,6 +463,71 @@ body:not(.drawer-open) .drawer { display: none; }
 /* Semantic inline notes — replaces the one-off colour: #hex in the markup. */
 .hint-note { color: var(--info-ink); }
 .hint-ok { color: var(--ok-ink); }
+
+/* Small teaching callouts above the complex controls in every panel. One rule
+   set used across the whole app, so the explanation boxes read as one system
+   (an accent-notched card that never competes with the controls below it). */
+.info-box {
+  margin: 0 0 16px;
+  padding: 10px 14px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent-line);
+  border-radius: var(--radius-sm);
+  color: var(--fg-2);
+  font-size: var(--fs-md);
+  line-height: 1.5;
+  box-shadow: inset 0 1px 0 var(--sheen);
+}
+.info-box b { color: var(--fg-1); }
+.info-box code {
+  background: var(--bg-3);
+  color: var(--accent-hot);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+}
+
+/* Piper download progress + the online voice catalogue browser. */
+.dl-progress { margin: 6px 0 4px; }
+.dl-bar {
+  height: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: var(--bg-3);
+  overflow: hidden;
+}
+.dl-bar span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width var(--dur) var(--ease);
+}
+.catalog {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-1);
+}
+.catalog-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.catalog-bar input { flex: 1 1 180px; }
+.catalog-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+  max-height: 260px;
+  overflow: auto;
+}
+.catalog-list .speaker-row { padding: 5px 6px; }
 
 /* ============ INLINE INSTALL HELP (collapsible <details>) ============ */
 /* Used by the Voice tab and the setup wizard to teach optional local deps
@@ -1154,7 +1236,9 @@ input.switch:checked::after { left: 19px; background: var(--accent); box-shadow:
   transition: border-color var(--dur) var(--ease);
 }
 .speaker-row:hover { border-color: var(--line-strong); }
-.speaker-row > span:first-child { font-weight: 600; min-width: 90px; overflow-wrap: anywhere; }
+/* ``:first-of-type`` (not ``:first-child``) so the name stays the header even
+   when a pick checkbox leads the row. */
+.speaker-row > span:first-of-type { font-weight: 600; min-width: 90px; overflow-wrap: anywhere; }
 .speaker-row input { min-width: 0; }
 /* Voice Lab A/B — the two clips side by side, stacking on narrow windows so a
    small dashboard still gets two usable players instead of two squeezed ones. */
@@ -1183,7 +1267,16 @@ input.switch:checked::after { left: 19px; background: var(--accent); box-shadow:
 /* Voice Lab rows carry more metadata (provider:id, source, notes) than the
    speaker rows they reuse — wrap rather than overflow, and ellipsize notes. */
 .speakers-list.voice-lab .speaker-row { flex-wrap: wrap; }
-.speakers-list.voice-lab .speaker-row > span:first-child { min-width: 140px; }
+.speakers-list.voice-lab .speaker-row > span:first-of-type { min-width: 140px; }
+/* Ticked rows read as a set — the border carries the selection. */
+.speakers-list.voice-lab .speaker-row.picked { border-color: var(--accent); background: var(--bg-3); }
+/* Mirror diff — what a two-way sync would change, listed before it is applied. */
+.mirror-diff {
+  margin-top: 10px; display: flex; flex-direction: column; gap: 4px;
+  padding: 10px 12px; background: var(--bg-1);
+  border: 1px solid var(--line); border-radius: var(--radius);
+}
+.mirror-diff .hint { max-width: 100%; overflow-wrap: anywhere; margin: 0; }
 .speakers-list.voice-lab .speaker-row .hint { max-width: 100%; overflow-wrap: anywhere; }
 .enroll-strip { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .enroll-strip input { flex: 1; min-width: 140px; }
@@ -1293,6 +1386,18 @@ input.switch:checked::after { left: 19px; background: var(--accent); box-shadow:
 }
 /* Stale saved audio device (TTS output / hearing loopback): amber variant. */
 .device-warn-toast {
+  background: var(--warn-soft);
+  border-color: var(--warn-line);
+  color: var(--warn-ink);
+}
+/* Voice-partner auto-sync on a profile switch: green when voices were copied,
+   amber (`.is-warn`) when the copy was refused. */
+.partner-sync-toast {
+  background: var(--ok-soft);
+  border-color: var(--ok-line);
+  color: var(--ok-ink);
+}
+.partner-sync-toast.is-warn {
   background: var(--warn-soft);
   border-color: var(--warn-line);
   color: var(--warn-ink);

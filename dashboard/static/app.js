@@ -151,7 +151,7 @@ function emptyCfg() {
       vision_first_person: true, vision_commentary_density: "balanced",
     },
     llm: { provider: "groq", model: "", temperature: 0.85, top_p: 0.95, max_tokens: 500, presence_penalty: 0.3, frequency_penalty: 0.4, vision_capable: false, ollama_base_url: "http://localhost:11434", ollama_keep_alive: "5m", vision_provider: "main", vision_model: "", vision_provider_ref: "", vision_openai_compatible_base_url: "", vision_openai_compatible_timeout: 30, vision_max_tokens: 200, provider_ref: "", openai_compatible_base_url: "", openai_compatible_timeout: 25 },
-    tts: { provider: "fish", voice_id: "", sample_rate: 24000, el_model_id: "eleven_turbo_v2_5", el_stability: 0.45, el_similarity_boost: 0.75, el_style: 0.0, el_optimize_streaming_latency: 3, fish_latency_mode: "balanced", fish_chunk_length: 100, piper_model_path: "", piper_length_scale: 1.0, kokoro_voice: "af_heart", kokoro_lang_code: "a", kokoro_speed: 1.0, openai_compatible_base_url: "", openai_compatible_model: "", openai_compatible_timeout: 30, openai_compatible_voice: "alloy", openai_compatible_speed: 1.0, openai_compatible_pcm_sample_rate: 24000, provider_ref: "", output_device: "" },
+    tts: { provider: "fish", voice_id: "", sample_rate: 24000, el_model_id: "eleven_turbo_v2_5", el_stability: 0.45, el_similarity_boost: 0.75, el_style: 0.0, el_optimize_streaming_latency: 3, fish_latency_mode: "balanced", fish_chunk_length: 100, piper_model_path: "", piper_length_scale: 1.0, piper_noise_scale: 0.667, piper_noise_w: 0.8, kokoro_voice: "af_heart", kokoro_lang_code: "a", kokoro_speed: 1.0, openai_compatible_base_url: "", openai_compatible_model: "", openai_compatible_timeout: 30, openai_compatible_voice: "alloy", openai_compatible_speed: 1.0, openai_compatible_pcm_sample_rate: 24000, provider_ref: "", output_device: "" },
     vision: { enabled: false, source: "monitor", monitor_index: 1, interval_sec: 3.0, min_change_threshold: 8, max_edge_px: 768, startup_delay_sec: 5 },
     play: { enabled: false, game: "minecraft", goal: "Build a thriving Minecraft empire LIVE for an audience — gather, craft full gear, build, fight and explore. Make the journey entertaining, not a speedrun.", talk_from_agent: true, hide_chat: true, avoid_water: true },
     hearing: { enabled: false, window_sec: 5.0, model_size: "small", language: "", silence_threshold: 0.006, sound_event_threshold: 0.06, max_context_age_sec: 12.0, engine: "", openai_compatible_base_url: "", openai_compatible_model: "whisper-1", openai_compatible_timeout: 20, openai_compatible_prompt: "", provider_ref: "", loopback_device: "", speaker_id: { enabled: false, threshold: 0.68, unknown_threshold: 0.45, collect_other_voices: false } },
@@ -256,6 +256,18 @@ function app() {
     kokoro: { installed: false, kokoro_version: "", missing: [], installer_present: true, python_ok: true, python_version: "", python_range: "3.10–3.12", can_install: true, running: false, log: "" },
     kokoroBusy: false,
     _kokoroPoll: null,
+    // Piper one-click install / voice download badge (Voice tab).
+    piper: { installed: false, piper_tts_version: "", voices: [], voice_count: 0, voices_dir: "", installer_present: true, can_install: true, job: { running: false, kind: "", voice: "", returncode: null, log: "" } },
+    piperBusy: false,
+    _piperPoll: null,
+    piperDownloadVoice: "",
+    piperCatalogPanel: false,
+    piperCatalog: { voices: [], loading: false, msg: "", query: "", lang: "" },
+    // One saved-voice list per local engine (Piper / Kokoro), keyed by provider.
+    localVoices: { piper: [], kokoro: [] },
+    localVoiceName: { piper: "", kokoro: "" },
+    localVoiceBusy: "",
+    localVoiceMsg: "",
     _nextLogId: 1,
     _ws: null,
 
@@ -292,6 +304,24 @@ function app() {
     voiceLabSaveName: "",
     voiceLabRecordSeconds: 8,
     voiceLabRecording: false,
+    // Copy the whole saved-voice library (incl. local Piper/Kokoro voices) to
+    // another profile so a character's voices travel with it.
+    voiceExport: { target: "", msg: "" },
+    // Backup file: download the saved voices as a .json, or merge one back in.
+    voiceBackup: { msg: "" },
+    // Names of the saved voices ticked in the list — the ⇪ copy selected /
+    // ⤓ selected .json buttons act on these.
+    voicePick: [],
+    // Pull — the inverse of ⇪: bring voices FROM another profile's library into
+    // this one. ``presets`` is that profile's list (read-only peek), ``names``
+    // the voices ticked to bring over.
+    voicePull: { source: "", presets: [], names: [], loading: false, msg: "" },
+    // Mirror — two-way sync with another profile: ``plan`` is the diff the server
+    // computed, ``policy`` what to do with shared names that differ.
+    voiceMirror: { other: "", policy: "skip", plan: null, loading: false, msg: "" },
+    // Voice partner — the profile this one should stay in sync with. Filled
+    // from /api/voices/partners; drives the ⇄ badge in the profile picker.
+    voicePartners: {},
     // A/B: two voices, one line, audio returned to this page only.
     voiceAb: { a: "", b: "", text: "", msg: "", busy: false },
     abClips: { a: null, b: null },
@@ -322,6 +352,8 @@ function app() {
     providerCategories: ["llm", "vision", "tts", "stt", "memory", "thoughts"],
     providerBusy: false,      providerMsg: "",
       healedMsg: "",
+      partnerSyncMsg: "",      // what switching profile did to the voice libraries
+      _partnerSyncTimer: null,
     // Persisted-load failure: when /api/config can't be read the UI would
     // otherwise show factory defaults as if they were the user's settings,
     // and a save in that state would OVERWRITE the profile with defaults.
@@ -386,8 +418,11 @@ function app() {
       await this.loadSpeakers();
       await this.loadLtm();
       await this.loadVoiceLibrary();
+      await this.loadLocalVoices();
       // Kokoro badge: probe now, and keep polling if an install is mid-flight.
       this.loadKokoroStatus().then(s => { if (s && s.running) this._pollKokoroInstall(); });
+      // Piper badge: same treatment (install + voice downloads share one job).
+      this.loadPiperStatus().then(s => { if (s && s.job && s.job.running) this._pollPiperJob(); });
       this.wizardMaybeOpen();
       this.connectWs();
       setInterval(() => { this.refreshStatus(); this.loadSpeakers(); }, 2000);
@@ -1009,13 +1044,20 @@ function app() {
       const data = await r.json();
       this.profiles = data.profiles;
       this.activeProfile = data.active;
+      await this.loadVoicePartners();
     },
 
     async switchProfile(name) {
-      await fetch(`/api/profiles/${encodeURIComponent(name)}/activate`, { method: "PUT" });
+      // The server keeps a partnered profile's saved voices in step with its
+      // partner on activate, so this response carries what that did (or why it
+      // refused) — reported below instead of syncing silently.
+      const r = await fetch(`/api/profiles/${encodeURIComponent(name)}/activate`, { method: "PUT" });
+      const data = await r.json().catch(() => ({}));
       await this.loadConfig();
       await this.loadProfiles();
       await this.loadVoiceLibrary();   // saved voices are per profile
+      await this.loadVoicePartners();  // ...and so is the voice partner
+      this.notePartnerSync(data.partner_sync);
     },
 
     async promptNewProfile() {
@@ -1528,6 +1570,208 @@ function app() {
       }, 2000);
     },
 
+    // ----- Piper (optional local TTS) — install + per-voice downloads -----
+    async loadPiperStatus() {
+      try {
+        const r = await fetch("/api/tts/piper/status");
+        if (!r.ok) return null;
+        const d = await r.json();
+        this.piper = {
+          installed: !!d.installed,
+          piper_tts_version: d.piper_tts_version || "",
+          voices: d.voices || [],
+          voice_count: d.voice_count || 0,
+          voices_dir: d.voices_dir || "",
+          installer_present: d.installer_present !== false,
+          can_install: d.can_install !== false,
+          job: d.job || { running: false, kind: "", voice: "", returncode: null, log: "" },
+        };
+        return this.piper;
+      } catch (e) {
+        return null;
+      }
+    },
+    async installPiper() {
+      if (this.piperBusy) return;
+      this.piperBusy = true;
+      this.piper.job = { ...this.piper.job, log: "starting install…" };
+      try {
+        const r = await fetch("/api/tts/piper/install", { method: "POST" });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok && r.status !== 409) {
+          this.piper.job = { ...this.piper.job, log: "install failed: " + (d.detail || ("HTTP " + r.status)) };
+          this.piperBusy = false;
+          return;
+        }
+        await this.loadPiperStatus();
+        this._pollPiperJob();
+      } catch (e) {
+        this.piper.job = { ...this.piper.job, log: "install failed: " + e };
+        this.piperBusy = false;
+      }
+    },
+    async downloadPiperVoice() {
+      const voice = (this.piperDownloadVoice || "").trim();
+      if (!voice || this.piperBusy) return;
+      this.piperBusy = true;
+      this.piper.job = { ...this.piper.job, log: `downloading ${voice}…` };
+      try {
+        const r = await fetch("/api/tts/piper/download", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ voice }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok && r.status !== 409) {
+          this.piper.job = { ...this.piper.job, log: "✗ " + (d.detail || ("HTTP " + r.status)) };
+          this.piperBusy = false;
+          return;
+        }
+        this.piperDownloadVoice = "";
+        await this.loadPiperStatus();
+        this._pollPiperJob();
+      } catch (e) {
+        this.piper.job = { ...this.piper.job, log: "✗ " + e };
+        this.piperBusy = false;
+      }
+    },
+    _pollPiperJob() {
+      if (this._piperPoll) clearInterval(this._piperPoll);
+      this.piperBusy = true;
+      this._piperPoll = setInterval(async () => {
+        const s = await this.loadPiperStatus();
+        if (!s || !s.job || !s.job.running) {
+          clearInterval(this._piperPoll);
+          this._piperPoll = null;
+          this.piperBusy = false;
+          // A finished download adds a voice to voices/ — refresh the menu.
+          if (s && s.job && s.job.kind === "download") this.loadPiperStatus();
+        }
+      }, 1000);
+    },
+
+    // Online catalogue of download-able voices (HuggingFace rhasspy/piper-voices).
+    async loadPiperCatalog(refresh = false) {
+      if (this.piperCatalog.loading) return;
+      this.piperCatalog.loading = true;
+      this.piperCatalog.msg = "loading the catalogue…";
+      try {
+        const r = await fetch("/api/tts/piper/catalog" + (refresh ? "?refresh=true" : ""));
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.piperCatalog.msg = "✗ " + (d.detail || `HTTP ${r.status}`);
+          return;
+        }
+        this.piperCatalog.voices = d.voices || [];
+        this.piperCatalog.msg = `${this.piperCatalog.voices.length} voices available`;
+      } catch (e) {
+        this.piperCatalog.msg = "✗ " + e;
+      } finally {
+        this.piperCatalog.loading = false;
+      }
+    },
+    piperCatalogLangs() {
+      const seen = new Map();
+      for (const v of this.piperCatalog.voices) {
+        if (v.language && !seen.has(v.language)) seen.set(v.language, v.language_name || v.language);
+      }
+      return [...seen].map(([code, label]) => ({ code, label }))
+        .sort((a, b) => a.label.localeCompare(b.label));
+    },
+    piperCatalogResults() {
+      const q = (this.piperCatalog.query || "").trim().toLowerCase();
+      const lang = this.piperCatalog.lang || "";
+      const out = [];
+      for (const v of this.piperCatalog.voices) {
+        if (lang && v.language !== lang) continue;
+        if (q) {
+          const hay = `${v.name} ${v.voice || ""} ${v.language_name || ""}`.toLowerCase();
+          if (!hay.includes(q)) continue;
+        }
+        out.push(v);
+        if (out.length >= 80) break;   // cap the DOM; refine the search for more
+      }
+      return out;
+    },
+    downloadPiperCatalogVoice(v) {
+      this.piperDownloadVoice = v.name;
+      this.downloadPiperVoice();
+    },
+    fmtMB(bytes) {
+      const n = Number(bytes) || 0;
+      if (!n) return "—";
+      return (n / (1024 * 1024)).toFixed(n >= 100 * 1024 * 1024 ? 0 : 1) + " MB";
+    },
+
+    // ----- Per-model saved voices (Piper / Kokoro) -----
+    async loadLocalVoices() {
+      try {
+        const r = await fetch("/api/voices/local");
+        if (!r.ok) return;
+        const d = await r.json();
+        const p = d.providers || {};
+        this.localVoices = { piper: p.piper || [], kokoro: p.kokoro || [] };
+      } catch {}
+    },
+    async saveLocalVoice(provider) {
+      const name = (this.localVoiceName[provider] || "").trim();
+      if (!name || this.localVoiceBusy) return;
+      this.localVoiceBusy = provider;
+      this.localVoiceMsg = "";
+      try {
+        const t = this.cfg.tts;
+        const body = {
+          name,
+          voice_id: provider === "piper" ? (t.piper_model_path || "") : (t.kokoro_voice || ""),
+          tts: provider === "piper"
+            ? { piper_length_scale: t.piper_length_scale, piper_noise_scale: t.piper_noise_scale, piper_noise_w: t.piper_noise_w }
+            : { kokoro_lang_code: t.kokoro_lang_code, kokoro_speed: t.kokoro_speed },
+        };
+        const r = await fetch(`/api/voices/local/${provider}`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.localVoiceMsg = "✗ " + (d.detail || `HTTP ${r.status}`);
+          return;
+        }
+        const p = d.providers || {};
+        this.localVoices = { piper: p.piper || [], kokoro: p.kokoro || [] };
+        this.localVoiceName[provider] = "";
+        this.localVoiceMsg = `✓ saved “${name}” for ${provider}`;
+      } catch (e) {
+        this.localVoiceMsg = "✗ " + e;
+      } finally {
+        this.localVoiceBusy = "";
+        setTimeout(() => (this.localVoiceMsg = ""), 6000);
+      }
+    },
+    async applyLocalVoice(provider, voice) {
+      Object.assign(this.cfg.tts, voice.tts || {});
+      this.cfg.tts.provider = provider;
+      if (provider === "piper" && voice.voice_id) this.cfg.tts.piper_model_path = voice.voice_id;
+      if (provider === "kokoro" && voice.voice_id) this.cfg.tts.kokoro_voice = voice.voice_id;
+      await this.save();
+    },
+    async deleteLocalVoice(provider, name) {
+      if (!confirm(`Delete the saved ${provider} voice “${name}”?`)) return;
+      try {
+        const r = await fetch(`/api/voices/local/${provider}/${encodeURIComponent(name)}`, { method: "DELETE" });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.localVoiceMsg = "✗ " + (d.detail || `HTTP ${r.status}`);
+          return;
+        }
+        const p = d.providers || {};
+        this.localVoices = { piper: p.piper || [], kokoro: p.kokoro || [] };
+        this.localVoiceMsg = `✓ deleted “${name}”`;
+      } catch (e) {
+        this.localVoiceMsg = "✗ " + e;
+      } finally {
+        setTimeout(() => (this.localVoiceMsg = ""), 6000);
+      }
+    },
+
     async resetAudio() {
       try {
         await fetch("/api/audio/reset", { method: "POST" });
@@ -1755,6 +1999,7 @@ function app() {
         const data = await r.json();
         this.voiceLab.presets = data.presets || [];
         this.voiceLab.providers = data.providers || [];
+        this._pruneVoicePick();
         // Preselect a provider the account can actually clone with.
         const current = this.cloneProvider();
         if (!current || !current.ready) {
@@ -1789,8 +2034,10 @@ function app() {
           return;
         }
         this.voiceLab.presets = data.presets || this.voiceLab.presets;
+        this._pruneVoicePick();
         this.voiceLabSaveName = "";
         this.voiceLabMsg = `✓ saved “${name}”`;
+        this.loadVoicePartners();     // a new voice may have broken the parity
       } catch (e) {
         this.voiceLabMsg = "✗ " + e;
       } finally {
@@ -1831,6 +2078,475 @@ function app() {
       }
     },
 
+    // ----- Pull: bring voices FROM another profile (inverse of ⇪) -----
+    async loadPullSource() {
+      const src = (this.voicePull.source || "").trim();
+      this.voicePull.presets = [];
+      this.voicePull.names = [];
+      this.voicePull.msg = "";
+      if (!src || src === this.activeProfile) return;
+      this.voicePull.loading = true;
+      try {
+        const r = await fetch(`/api/voices/library?profile=${encodeURIComponent(src)}`);
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voicePull.msg = "✗ " + (d.detail || `HTTP ${r.status}`);
+          return;
+        }
+        this.voicePull.presets = d.presets || [];
+        // Everything that profile has is ticked by default — untick to exclude.
+        this.voicePull.names = this.voicePull.presets.map(p => p.name);
+        this.voicePull.msg = this.voicePull.presets.length
+          ? `“${src}” has ${this.voicePull.presets.length} saved voice(s) — untick any you don't want`
+          : `“${src}” has no saved voices`;
+      } catch (e) {
+        this.voicePull.msg = "✗ " + e;
+      } finally {
+        this.voicePull.loading = false;
+      }
+    },
+
+    pullPicked(name) {
+      return this.voicePull.names.includes(name);
+    },
+
+    togglePullPick(name, on) {
+      if (on && !this.pullPicked(name)) this.voicePull.names = [...this.voicePull.names, name];
+      else if (!on) this.voicePull.names = this.voicePull.names.filter(n => n !== name);
+    },
+
+    async pullVoices() {
+      const src = (this.voicePull.source || "").trim();
+      if (this.voiceLabBusy || !src || !this.voicePull.names.length) return;
+      const names = [...this.voicePull.names];
+      this.voiceLabBusy = "pull";
+      this.voicePull.msg = `pulling ${names.length} voice(s) from “${src}”…`;
+      try {
+        const { r, d, cancelled } = await this._mergeRequest("/api/voices/pull", {
+          source_profile: src, names,
+        });
+        if (cancelled) {
+          this.voicePull.msg = "kept this profile's voices — nothing was replaced";
+          return;
+        }
+        if (!r.ok) {
+          this.voicePull.msg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        this.voiceLab.presets = d.presets || this.voiceLab.presets;
+        this._pruneVoicePick();
+        const extra = d.replaced ? ` (${d.replaced} replaced)` : "";
+        this.voicePull.msg = `✓ pulled ${d.copied} voice(s) from “${src}” — this profile now has ${d.total}${extra}`;
+      } catch (e) {
+        this.voicePull.msg = "✗ " + e;
+      } finally {
+        this.voiceLabBusy = "";
+      }
+    },
+
+    // ----- Mirror: make two profiles hold the same voices, both ways -----
+    async loadMirrorPlan() {
+      const other = (this.voiceMirror.other || "").trim();
+      this.voiceMirror.plan = null;
+      this.voiceMirror.msg = "";
+      if (!other || other === this.activeProfile) return;
+      this.voiceMirror.loading = true;
+      try {
+        const r = await fetch(`/api/voices/mirror?other=${encodeURIComponent(other)}`);
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceMirror.msg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        this.voiceMirror.plan = d;
+      } catch (e) {
+        this.voiceMirror.msg = "✗ " + e;
+      } finally {
+        this.voiceMirror.loading = false;
+      }
+    },
+
+    // One line per category of the diff, so the change is visible before it is applied.
+    mirrorLines() {
+      const p = this.voiceMirror.plan;
+      if (!p) return [];
+      const names = list => (list.length > 6
+        ? ` (${list.slice(0, 6).join(", ")}…)` : ` (${list.join(", ")})`);
+      const lines = [
+        `→ ${p.other_profile}: ${p.to_other.length} to add${p.to_other.length ? names(p.to_other) : ""}`,
+        `← ${p.this_profile}: ${p.to_this.length} to add${p.to_this.length ? names(p.to_this) : ""}`,
+        `= ${p.identical.length} already identical`,
+      ];
+      if (p.conflicts.length) {
+        lines.push(`! ${p.conflicts.length} differ: `
+          + p.conflicts.slice(0, 4).map(c => `${c.name} (${c.this} vs ${c.other})`).join("; ")
+          + (p.conflicts.length > 4 ? ` +${p.conflicts.length - 4} more` : ""));
+      }
+      return lines;
+    },
+
+    // Anything to do? With the "skip" policy a pile of conflicts alone changes nothing.
+    mirrorPending() {
+      const p = this.voiceMirror.plan;
+      if (!p) return false;
+      if (p.to_other.length || p.to_this.length) return true;
+      return this.voiceMirror.policy !== "skip" && p.conflicts.length > 0;
+    },
+
+    async mirrorVoices() {
+      const other = (this.voiceMirror.other || "").trim();
+      if (this.voiceLabBusy || !this.mirrorPending()) return;
+      this.voiceLabBusy = "mirror";
+      this.voiceMirror.msg = `mirroring with “${other}”…`;
+      try {
+        const r = await fetch("/api/voices/mirror", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ other_profile: other, conflicts: this.voiceMirror.policy }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceMirror.msg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        this.voiceLab.presets = d.presets || this.voiceLab.presets;
+        this._pruneVoicePick();
+        this.voiceMirror.plan = d.plan || null;      // the diff AFTER applying
+        const skipped = d.skipped ? `, ${d.skipped} differing left alone` : "";
+        this.voiceMirror.msg = `✓ mirrored: ${d.to_other} → “${other}”, ${d.to_this} → this`
+          + ` — now ${d.this_total} here and ${d.other_total} there${skipped}`;
+        this.loadVoicePartners();     // the two libraries just changed
+      } catch (e) {
+        this.voiceMirror.msg = "✗ " + e;
+      } finally {
+        this.voiceLabBusy = "";
+      }
+    },
+
+    // ----- Voice partner: the profile this one should stay in sync with -----
+    // The badge in the profile picker warns while the two libraries differ. Its
+    // state comes from the server (GET /api/voices/partners), computed from the
+    // very same diff ⇄ mirror shows, so the badge can't disagree with the mirror.
+    // What the switch route did to the voice libraries: said out loud, because
+    // it is a write the user asked for only by naming a partner.
+    notePartnerSync(sync) {
+      clearTimeout(this._partnerSyncTimer);
+      this.partnerSyncMsg = "";
+      if (!sync || !sync.partner) return;
+      if (sync.error) {
+        this.partnerSyncMsg = `⚠ voices not synced with “${sync.partner}” on switch: ${sync.error}`;
+      } else if (sync.synced) {
+        const bits = [];
+        if (sync.to_other) bits.push(`${sync.to_other} → “${sync.partner}”`);
+        if (sync.to_this) bits.push(`${sync.to_this} → this profile`);
+        const left = sync.skipped ? `, ${sync.skipped} differing left alone` : "";
+        this.partnerSyncMsg = `⇄ auto-synced with “${sync.partner}” on switch: `
+          + (bits.join(", ") || "nothing to copy") + left;
+      } else {
+        return;                      // already in step — the badge says so
+      }
+      this._partnerSyncTimer = setTimeout(() => (this.partnerSyncMsg = ""), 12000);
+    },
+
+    partnerState(name) {
+      return this.voicePartners[name || this.activeProfile]
+        || { partner: "", stale: false, out_of_sync: false, to_other: 0, to_this: 0, conflicts: 0 };
+    },
+
+    partnerIs(name) {
+      return !!name && name !== this.activeProfile && this.partnerState().partner === name;
+    },
+
+    partnerBadge() {
+      const s = this.partnerState();
+      if (!s.partner) return { show: false, text: "", cls: "", title: "" };
+      if (s.stale) {
+        return { show: true, text: "⇄ partner missing", cls: "warn",
+          title: `“${s.partner}” is no longer a profile — click to pick another voice partner in the Voice Lab.` };
+      }
+      if (!s.out_of_sync) {
+        return { show: true, text: "⇄ in sync", cls: "ok",
+          title: `Saved voices match “${s.partner}”. Click to open the diff in the Voice Lab.` };
+      }
+      const bits = [];
+      if (s.to_this) bits.push(`${s.to_this} to pull`);
+      if (s.to_other) bits.push(`${s.to_other} to copy`);
+      if (s.conflicts) bits.push(`${s.conflicts} differing`);
+      return { show: true, text: "⇄ out of sync", cls: "warn",
+        title: `Saved voices differ from “${s.partner}”: ${bits.join(", ")}. Click to open the Voice Lab with the diff ready to mirror.` };
+    },
+
+    // The badge is a shortcut to the place that fixes the divergence: open the
+    // Voice Lab with the partner already chosen as the mirror target, so the
+    // diff (and the ⇄ mirror button's state) is there on arrival. A stale or
+    // missing partner has nothing to select — the hint below the strip says so.
+    openPartnerMirror() {
+      this.section = "voicelab";
+      const s = this.partnerState();
+      if (s.partner && !s.stale && s.partner !== this.activeProfile) {
+        this.voiceMirror.other = s.partner;
+        this.voiceMirror.msg = "";
+        this.loadMirrorPlan();
+      }
+      this.scrollToMirror();
+    },
+
+    // The section is only revealed a frame AFTER ``section`` flips (Alpine
+    // defers the display change to requestAnimationFrame), so scrolling right
+    // away would measure a still-hidden block and go nowhere. Wait for layout,
+    // with a timer as the fallback for frames a backgrounded tab never paints.
+    scrollToMirror() {
+      const go = () => {
+        const el = document.getElementById("voice-mirror");
+        if (el && el.getBoundingClientRect().height > 0) el.scrollIntoView({ block: "center" });
+      };
+      this.$nextTick(() => requestAnimationFrame(() => requestAnimationFrame(go)));
+      setTimeout(go, 300);
+    },
+
+    // Marks a profile in the dropdown itself, so divergence is visible before
+    // you switch to it. Options can't hold markup — a glyph is all we get.
+    profileOptionLabel(name) {
+      const s = this.voicePartners[name];
+      return s && s.partner && !s.stale && s.out_of_sync ? `${name} ⇄` : name;
+    },
+
+    partnerHint() {
+      const other = (this.voiceMirror.other || "").trim();
+      if (!other || other === this.activeProfile) return "";
+      if (this.partnerIs(other)) {
+        return `★ “${other}” is this profile's voice partner — the profile picker shows ⇄ while the two libraries differ.`;
+      }
+      const s = this.partnerState();
+      if (s.partner) return `This profile's voice partner is “${s.partner}” — setting a new one replaces it.`;
+      return `☆ Optional: make “${other}” this profile's voice partner and the picker warns whenever the two libraries drift apart.`;
+    },
+
+    async loadVoicePartners() {
+      try {
+        const r = await fetch("/api/voices/partners");
+        if (!r.ok) return;
+        const d = await r.json();
+        this.voicePartners = d.profiles || {};
+      } catch { /* the badge is advisory — never block a load on it */ }
+    },
+
+    async setVoicePartner() {
+      const other = (this.voiceMirror.other || "").trim();
+      if (!other || other === this.activeProfile) return;
+      const partner = this.partnerIs(other) ? "" : other;   // the same button toggles off
+      this.voiceLabBusy = "partner";
+      try {
+        const r = await fetch("/api/voices/partner", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ partner }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceMirror.msg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        await this.loadVoicePartners();
+        this.voiceMirror.msg = partner
+          ? `★ “${partner}” is now this profile's voice partner`
+            + (d.out_of_sync ? " — the two libraries differ, ⇄ mirror to even them out" : " — the two libraries already match")
+          : "☆ voice partner cleared";
+      } catch (e) {
+        this.voiceMirror.msg = "✗ " + e;
+      } finally {
+        this.voiceLabBusy = "";
+      }
+    },
+
+    // Copies saved voices to the target profile. Pass ``names`` to copy just
+    // those (the ⇪ button on a row, or the ticked selection); no names = all.
+    async exportVoices(names) {
+      const target = (this.voiceExport.target || "").trim();
+      if (this.voiceLabBusy) return;
+      if (!target) {
+        this.voiceExport.msg = "✗ pick a destination profile in the strip below first";
+        setTimeout(() => (this.voiceExport.msg = ""), 6000);
+        return;
+      }
+      if (target === this.activeProfile) return;
+      const picked = (Array.isArray(names) ? names : []).filter(Boolean);
+      const one = picked.length === 1 ? picked : null;
+      const many = picked.length > 1;
+      this.voiceLabBusy = "export";
+      this.voiceExport.msg = one
+        ? `copying “${one[0]}”…`
+        : many ? `copying ${picked.length} voices…` : "copying…";
+      try {
+        const body = { target_profile: target };
+        if (picked.length) body.names = picked;
+        const { r, d, cancelled } = await this._mergeRequest("/api/voices/export", body);
+        if (cancelled) {
+          this.voiceExport.msg = `kept “${target}” as it was — nothing was replaced`;
+          return;
+        }
+        if (!r.ok) {
+          this.voiceExport.msg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        const extra = d.replaced ? ` (${d.replaced} replaced)` : "";
+        this.voiceExport.msg = one
+          ? `✓ copied “${one[0]}” to “${target}” — it now has ${d.total} voice(s)${extra}`
+          : many
+            ? `✓ copied ${d.copied} of ${picked.length} selected voice(s) to “${target}” — it now has ${d.total}${extra}`
+            : `✓ copied ${d.copied} voice(s) to “${target}” — it now has ${d.total}${extra}`;
+      } catch (e) {
+        this.voiceExport.msg = "✗ " + e;
+      } finally {
+        this.voiceLabBusy = "";
+        setTimeout(() => (this.voiceExport.msg = ""), 8000);
+      }
+    },
+
+    // ----- Selection of several saved voices -----
+    voicePicked(name) {
+      return this.voicePick.includes(name);
+    },
+
+    toggleVoicePick(name, on) {
+      if (on && !this.voicePicked(name)) this.voicePick = [...this.voicePick, name];
+      else if (!on) this.voicePick = this.voicePick.filter(n => n !== name);
+    },
+
+    allVoicesPicked() {
+      return this.voiceLab.presets.length > 0
+        && this.voicePick.length === this.voiceLab.presets.length;
+    },
+
+    pickAllVoices(on) {
+      this.voicePick = on ? this.voiceLab.presets.map(p => p.name) : [];
+    },
+
+    // A ticked voice that no longer exists (deleted, or replaced by an import)
+    // must not stay in the selection.
+    _pruneVoicePick() {
+      this.voicePick = this.voicePick.filter(
+        n => this.voiceLab.presets.some(p => p.name === n));
+    },
+
+    // Error text for a failed response — ``detail`` is a string for most routes
+    // and an object ({message, conflicts, plan}) for the voice-merge ones.
+    _apiError(data, status) {
+      const det = data && data.detail;
+      if (typeof det === "string" && det) return det;
+      if (det && typeof det === "object") return det.message || `HTTP ${status}`;
+      return `HTTP ${status}`;
+    },
+
+    // Posts a voice merge (copy / pull / import). Same-named voices whose
+    // settings differ come back as a 409 with the diff, so the user is asked
+    // before anything is replaced; only then is the request re-sent with
+    // ``overwrite``.
+    async _mergeRequest(url, body) {
+      const post = (payload) => fetch(url, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      let r = await post(body);
+      let d = await r.json().catch(() => ({}));
+      if (r.status !== 409 || !d.detail || typeof d.detail !== "object") return { r, d };
+
+      const conflicts = d.detail.conflicts || [];
+      const lines = conflicts.slice(0, 6)
+        .map(c => `• ${c.name}: ${c.current} → ${c.incoming}`).join("\n");
+      const more = conflicts.length > 6 ? `\n…and ${conflicts.length - 6} more` : "";
+      if (!confirm(`${d.detail.message}\n\n${lines}${more}\n\nReplace them?`)) {
+        return { cancelled: true };
+      }
+      r = await post({ ...body, overwrite: true });
+      d = await r.json().catch(() => ({}));
+      return { r, d };
+    },
+
+    // Filename-safe version of a voice or profile name for the downloaded backup.
+    _jsonFileBase(label) {
+      const s = String(label || "voices").trim()
+        .replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[.\-]+|[.\-]+$/g, "");
+      return s || "voices";
+    },
+
+    // Downloads saved voices as a portable .json file — the whole library, one
+    // voice (the ⤓ button on a row) or the ticked ones. The server owns the format.
+    async backupVoices(names) {
+      if (this.voiceLabBusy) return;
+      const picked = (Array.isArray(names) ? names : []).filter(Boolean);
+      const one = picked.length === 1 ? picked : null;
+      this.voiceLabBusy = "backup";
+      this.voiceBackup.msg = one
+        ? `packing “${one[0]}”…`
+        : picked.length ? `packing ${picked.length} voices…` : "packing…";
+      try {
+        const q = picked.length
+          ? "?names=" + encodeURIComponent(picked.join(","))
+          : "";
+        const r = await fetch("/api/voices/backup" + q);
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceBackup.msg = "✗ " + (data.detail || `HTTP ${r.status}`);
+          return;
+        }
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = one
+          ? `wallie-voice-${this._jsonFileBase(one[0])}.json`
+          : picked.length
+            ? "wallie-voices-selected.json"
+            : `wallie-voices-${this._jsonFileBase(this.activeProfile)}.json`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+        const n = (data.presets || []).length;
+        this.voiceBackup.msg = one
+          ? `✓ downloaded “${one[0]}” as a .json file`
+          : picked.length
+            ? `✓ downloaded ${n} selected voice(s) as a .json file`
+            : `✓ downloaded ${n} saved voice(s) as a .json file`;
+      } catch (e) {
+        this.voiceBackup.msg = "✗ " + e;
+      } finally {
+        this.voiceLabBusy = "";
+        setTimeout(() => (this.voiceBackup.msg = ""), 8000);
+      }
+    },
+
+    // Reads a backup .json in the browser and asks the server to merge it into
+    // this profile's library (same-named voices are replaced).
+    async importVoices(event) {
+      const file = (event.target.files || [])[0];
+      event.target.value = "";       // the same file can be re-picked
+      if (!file || this.voiceLabBusy) return;
+      this.voiceLabBusy = "import";
+      this.voiceBackup.msg = `reading ${file.name}…`;
+      try {
+        const content = await file.text();
+        const { r, d, cancelled } = await this._mergeRequest("/api/voices/import", { content });
+        if (cancelled) {
+          this.voiceBackup.msg = `kept this profile's voices — nothing from ${file.name} was applied`;
+          return;
+        }
+        if (!r.ok) {
+          this.voiceBackup.msg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        this.voiceLab.presets = d.presets || this.voiceLab.presets;
+        this.voiceLab.providers = d.providers || this.voiceLab.providers;
+        this._pruneVoicePick();
+        const extra = d.replaced ? ` (${d.replaced} replaced)` : "";
+        this.voiceBackup.msg = `✓ imported ${d.imported} voice(s) from ${file.name} — ${d.total} saved now${extra}`;
+      } catch (e) {
+        this.voiceBackup.msg = "✗ could not read " + file.name + ": " + e;
+      } finally {
+        this.voiceLabBusy = "";
+        setTimeout(() => (this.voiceBackup.msg = ""), 10000);
+      }
+    },
+
     async deleteVoice(name) {
       if (!confirm(`Delete the saved voice “${name}”?\n\nThe voice itself stays on the provider.`)) return;
       try {
@@ -1841,7 +2557,9 @@ function app() {
           return;
         }
         this.voiceLab.presets = data.presets || [];
+        this._pruneVoicePick();
         this.voiceLabMsg = `✓ deleted “${name}”`;
+        this.loadVoicePartners();     // deleting can also break the parity
       } catch (e) {
         this.voiceLabMsg = "✗ " + e;
       } finally {

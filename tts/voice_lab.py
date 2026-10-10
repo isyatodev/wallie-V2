@@ -57,6 +57,32 @@ ALLOWED_AUDIO_SUFFIXES = (".wav", ".mp3", ".m4a", ".ogg", ".flac", ".webm", ".mp
 # that routes audio and is not a property of a voice.
 PRESET_TTS_FIELDS: frozenset[str] = frozenset(TTSConfig.model_fields) - {"output_device"}
 
+# Portable backup file written by the Voice Lab (a .json the user downloads and
+# uploads again). The format tag lets an import refuse a file it cannot read
+# instead of guessing at its shape.
+EXPORT_FORMAT = "wallie.voices"
+EXPORT_VERSION = 1
+MAX_IMPORT_CHARS = 2 * 1024 * 1024      # a backup is a few KB; this is a guard
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _preset_from_raw(raw: dict[str, Any], *, now: str = "") -> VoicePreset:
+    """Normalize one raw dict — from the UI, a library file or a backup file —
+    into a VoicePreset, truncating the fields and keeping only real TTS knobs."""
+    return VoicePreset(
+        name=str(raw.get("name") or "").strip()[:60],
+        provider=str(raw.get("provider") or ""),
+        voice_id=str(raw.get("voice_id") or ""),
+        notes=str(raw.get("notes") or "")[:400],
+        source=str(raw.get("source") or "manual")[:40],
+        created_at=str(raw.get("created_at") or now or _now_iso()),
+        tts=sanitize_tts(raw.get("tts")),
+    )
+
 
 class VoiceLabError(RuntimeError):
     """A failure worth showing the user verbatim (missing key, bad samples…)."""
@@ -133,21 +159,9 @@ def save_library(profile: str, presets: Iterable[VoicePreset]) -> None:
 
 def add_preset(profile: str, raw: dict[str, Any], *, now: str = "") -> VoicePreset:
     """Upsert by name (case-insensitive) so re-saving a voice updates it."""
-    name = str(raw.get("name") or "").strip()
-    if not name:
+    if not str(raw.get("name") or "").strip():
         raise VoiceLabError("the saved voice needs a name")
-    if not now:
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    preset = VoicePreset(
-        name=name[:60],
-        provider=str(raw.get("provider") or ""),
-        voice_id=str(raw.get("voice_id") or ""),
-        notes=str(raw.get("notes") or "")[:400],
-        source=str(raw.get("source") or "manual")[:40],
-        created_at=str(raw.get("created_at") or now),
-        tts=sanitize_tts(raw.get("tts")),
-    )
+    preset = _preset_from_raw(raw, now=now)
     presets = [p for p in load_library(profile) if p.name.lower() != preset.name.lower()]
     presets.insert(0, preset)
     if len(presets) > MAX_PRESETS:
@@ -163,6 +177,425 @@ def remove_preset(profile: str, name: str) -> bool:
         return False
     save_library(profile, kept)
     return True
+
+
+def get_preset(profile: str, name: str) -> VoicePreset | None:
+    target = (name or "").strip().lower()
+    if not target:
+        return None
+    for p in load_library(profile):
+        if p.name.lower() == target:
+            return p
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Merging libraries — what a copy/pull/import would do to the saved voices
+# ---------------------------------------------------------------------------
+
+# Two presets are "the same voice" when these match. ``created_at`` is
+# deliberately excluded — it is stamped on every save, so comparing it would
+# flag every re-save as a change.
+_COMPARE_FIELDS: tuple[str, ...] = ("provider", "voice_id", "notes", "tts")
+
+
+def _same_settings(a: VoicePreset, b: VoicePreset) -> bool:
+    return all(getattr(a, f) == getattr(b, f) for f in _COMPARE_FIELDS)
+
+
+def _descriptor(preset: VoicePreset) -> str:
+    """Short human description of a voice, for the replace warning."""
+    label = f"{preset.provider or '?'}"
+    if preset.voice_id:
+        label += f" : {preset.voice_id}"
+    if preset.tts:
+        label += " (" + ", ".join(f"{k}={v}" for k, v in sorted(preset.tts.items())) + ")"
+    return label
+
+
+def _limited(
+    presets: Iterable[VoicePreset],
+    names: Iterable[str] | None,
+) -> list[VoicePreset]:
+    """``names`` selects presets (case-insensitive); ``None`` keeps them all."""
+    listed = list(presets)
+    if names is None:
+        return listed
+    wanted = {str(n).strip().lower() for n in names if str(n).strip()}
+    return [p for p in listed if p.name.lower() in wanted]
+
+
+def merge_plan(
+    existing: Iterable[VoicePreset],
+    incoming: Iterable[VoicePreset],
+) -> dict[str, Any]:
+    """What applying ``incoming`` over ``existing`` (upsert by name) would do.
+
+    * ``added`` — new names that would be created.
+    * ``replaced`` / ``conflicts`` — same name but DIFFERENT settings, i.e. the
+      writes that would overwrite what the profile already has (the UI asks
+      before allowing these).
+    * ``unchanged`` — same name and same settings, a harmless re-save.
+    """
+    by_name = {p.name.lower(): p for p in existing}
+    latest: dict[str, VoicePreset] = {}
+    for preset in incoming:
+        latest[preset.name.lower()] = preset      # the same voice twice: last wins
+    plan: dict[str, Any] = {"added": [], "replaced": [], "unchanged": [], "conflicts": []}
+    for preset in latest.values():
+        current = by_name.get(preset.name.lower())
+        if current is None:
+            plan["added"].append(preset.name)
+        elif _same_settings(current, preset):
+            plan["unchanged"].append(preset.name)
+        else:
+            plan["replaced"].append(preset.name)
+            plan["conflicts"].append({
+                "name": preset.name,
+                "current": _descriptor(current),
+                "incoming": _descriptor(preset),
+            })
+    return plan
+
+
+def _apply_merge(existing: Iterable[VoicePreset], incoming: Iterable[VoicePreset]) -> list[VoicePreset]:
+    """Upsert ``incoming`` into ``existing`` by name; new voices are appended."""
+    merged = list(existing)
+    by_name = {p.name.lower(): i for i, p in enumerate(merged)}
+    for preset in incoming:
+        key = preset.name.lower()
+        if key in by_name:
+            merged[by_name[key]] = preset
+        else:
+            by_name[key] = len(merged)
+            merged.append(preset)
+    return merged
+
+
+class VoiceConflictError(VoiceLabError):
+    """Applying this merge would overwrite saved voices that differ.
+
+    Carries :attr:`plan` (see :func:`merge_plan`) so the caller can show exactly
+    which voices would change before asking the user to confirm.
+    """
+
+    def __init__(self, message: str, plan: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.plan = plan
+
+
+def conflict_message(target: str, plan: dict[str, Any]) -> str:
+    """Plain-language summary of the voices an operation would overwrite."""
+    conflicts = plan.get("conflicts") or []
+    names = ", ".join(c["name"] for c in conflicts[:5])
+    more = "" if len(conflicts) <= 5 else f" +{len(conflicts) - 5} more"
+    return (
+        f"{len(conflicts)} saved voice(s) in “{target or 'default'}” already use "
+        f"that name with different settings: {names}{more}"
+    )
+
+
+def export_presets(
+    src_profile: str,
+    dst_profile: str,
+    names: Iterable[str] | None = None,
+    *,
+    overwrite: bool = False,
+) -> int:
+    """Copy saved voices from one profile's library into another (upsert by
+    name), returning how many were written. ``names`` limits the export;
+    ``None`` copies the whole library.
+
+    This is how a voice — including a local Piper/Kokoro voice saved on the
+    Voice page — moves between characters without re-creating it.
+
+    Overwriting a same-named voice whose settings DIFFER raises
+    :class:`VoiceConflictError` unless ``overwrite`` is set, so a copy can never
+    silently replace a tuned voice with a different one.
+    """
+    src = _limited(load_library(src_profile), names)
+    if not src:
+        return 0
+
+    dst = load_library(dst_profile)
+    plan = merge_plan(dst, src)
+    if plan["conflicts"] and not overwrite:
+        raise VoiceConflictError(conflict_message(dst_profile, plan), plan)
+    if len(dst) + len(plan["added"]) > MAX_PRESETS:
+        raise VoiceLabError(
+            f"“{dst_profile}” already has {MAX_PRESETS} saved voices — delete one there first"
+        )
+    save_library(dst_profile, _apply_merge(dst, src))
+    return len(src)
+
+
+def plan_export(
+    src_profile: str,
+    dst_profile: str,
+    names: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """What :func:`export_presets` would do, without writing anything — so the
+    caller can report how many voices it added or replaced."""
+    return merge_plan(
+        load_library(dst_profile),
+        _limited(load_library(src_profile), names),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Backup file — the whole library (or one voice) as a portable .json
+# ---------------------------------------------------------------------------
+
+def export_bundle(
+    profile: str,
+    names: Iterable[str] | None = None,
+    *,
+    now: str = "",
+) -> dict[str, Any]:
+    """A portable, profile-independent snapshot of saved voices.
+
+    Unlike :func:`export_presets` — which copies into another profile's library —
+    this returns a plain dict the dashboard downloads as a file, so a voice
+    library can be backed up, versioned or handed to someone else. ``names``
+    limits the bundle to those voices; ``None`` takes the whole library.
+    """
+    presets = _limited(load_library(profile), names)
+    if names is not None and not presets:
+        raise VoiceLabError("none of those voices are saved in this profile")
+    return {
+        "format": EXPORT_FORMAT,
+        "version": EXPORT_VERSION,
+        "exported_at": now or _now_iso(),
+        "source_profile": profile or "default",
+        "count": len(presets),
+        "presets": [p.to_dict() for p in presets],
+    }
+
+
+def parse_bundle_text(text: str) -> Any:
+    """Parse an uploaded ``.json`` backup, with a message worth showing the user."""
+    if not (text or "").strip():
+        raise VoiceLabError("that file is empty — pick an exported voice backup")
+    if len(text) > MAX_IMPORT_CHARS:
+        raise VoiceLabError(
+            f"that file is too large ({len(text) // 1024} KB) — expected a small voice backup"
+        )
+    try:
+        return json.loads(text)
+    except ValueError as e:
+        raise VoiceLabError(f"that file is not valid JSON ({str(e)[:100]})") from e
+
+
+def _bundle_items(payload: Any) -> list[dict[str, Any]]:
+    """The saved-voice dicts inside a backup payload: an exported bundle, a raw
+    library file (same shape), a bare list of presets, or a single saved voice."""
+    if isinstance(payload, dict):
+        try:
+            newer = int(payload.get("version")) > EXPORT_VERSION
+        except (TypeError, ValueError):
+            newer = False
+        if payload.get("format") and newer:
+            raise VoiceLabError(
+                f"that backup was written by a newer Wallie (format v{payload.get('version')})"
+            )
+        items = payload.get("presets")
+        if items is None and payload.get("name"):
+            items = [payload]
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        items = None
+    return [item for item in (items or []) if isinstance(item, dict)]
+
+
+def import_bundle(
+    profile: str,
+    payload: Any,
+    *,
+    now: str = "",
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Merge saved voices from a backup into this profile's library (upsert by
+    name), returning ``{imported, skipped, replaced, unchanged, total}``.
+
+    Malformed entries are skipped instead of failing the whole file, but a file
+    with no usable voice — or one that would overflow the library — is refused
+    with an actionable message. Nothing is written unless the whole file fits,
+    so a refused import never leaves a half-merged library behind.
+
+    Same-named voices with DIFFERENT settings raise :class:`VoiceConflictError`
+    unless ``overwrite`` is set — restoring a backup never silently replaces a
+    voice this profile has tuned differently.
+    """
+    items = _bundle_items(payload)
+    if not items:
+        raise VoiceLabError(
+            "no saved voices found in that file — expected a Wallie voice backup "
+            "(or a profiles/<name>.voices.json)"
+        )
+    now = now or _now_iso()
+    incoming = [
+        _preset_from_raw(raw, now=now)
+        for raw in items
+        if str(raw.get("name") or "").strip()
+    ]
+    skipped = len(items) - len(incoming)
+    library = load_library(profile)
+    plan = merge_plan(library, incoming)
+    if plan["conflicts"] and not overwrite:
+        raise VoiceConflictError(conflict_message(profile, plan), plan)
+    if len(library) + len(plan["added"]) > MAX_PRESETS:
+        raise VoiceLabError(
+            f"“{profile or 'default'}” already has {MAX_PRESETS} saved voices — "
+            "delete some before importing"
+        )
+    merged = _apply_merge(library, incoming)
+    save_library(profile, merged)
+    return {
+        "imported": len(incoming),
+        "added": len(plan["added"]),
+        "skipped": skipped,
+        "replaced": len(plan["replaced"]),
+        "unchanged": len(plan["unchanged"]),
+        "total": len(merged),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Mirroring — make two profiles hold the same saved voices
+# ---------------------------------------------------------------------------
+
+# What to do with a shared name whose settings DIFFER. "skip" is the default
+# because it is the only policy that can never discard a setting.
+MIRROR_POLICIES: tuple[str, ...] = ("skip", "this", "other")
+
+
+def mirror_plan(this_profile: str, other_profile: str) -> dict[str, Any]:
+    """The two-way diff between two libraries, computed without writing anything.
+
+    * ``to_other`` — voices this profile has and the other one lacks.
+    * ``to_this`` — the other way round.
+    * ``identical`` — shared names with the same settings.
+    * ``conflicts`` — shared names whose settings DIFFER; a mirror needs a policy
+      (:func:`mirror_libraries`) before those can be equalised.
+    """
+    mine = load_library(this_profile)
+    theirs = load_library(other_profile)
+    their_by = {p.name.lower(): p for p in theirs}
+    my_by = {p.name.lower(): p for p in mine}
+    to_other: list[str] = []
+    identical: list[str] = []
+    conflicts: list[dict[str, str]] = []
+    for key, preset in my_by.items():
+        twin = their_by.get(key)
+        if twin is None:
+            to_other.append(preset.name)
+        elif _same_settings(preset, twin):
+            identical.append(preset.name)
+        else:
+            conflicts.append({
+                "name": preset.name,
+                "this": _descriptor(preset),
+                "other": _descriptor(twin),
+            })
+    return {
+        "this_profile": this_profile or "default",
+        "other_profile": other_profile or "default",
+        "to_other": to_other,
+        "to_this": [p.name for key, p in their_by.items() if key not in my_by],
+        "identical": identical,
+        "conflicts": conflicts,
+        "this_count": len(mine),
+        "other_count": len(theirs),
+    }
+
+
+def mirror_libraries(
+    this_profile: str,
+    other_profile: str,
+    *,
+    conflicts: str = "skip",
+) -> dict[str, Any]:
+    """Copy each profile's missing voices into the other one, both ways.
+
+    ``conflicts`` decides the shared names that differ: ``skip`` leaves them
+    exactly as they are, ``this`` makes this profile's version win (overwriting
+    theirs), ``other`` makes theirs win. Returns the counts plus the diff AFTER
+    applying, so the caller can show the resulting state without a second call.
+
+    Both libraries are checked for capacity first, so a mirror that cannot fit
+    changes nothing at all.
+    """
+    policy = (conflicts or "skip").strip().lower()
+    if policy not in MIRROR_POLICIES:
+        raise VoiceLabError(
+            f"unknown conflict policy {conflicts!r} — use one of {', '.join(MIRROR_POLICIES)}"
+        )
+    plan = mirror_plan(this_profile, other_profile)
+    clash = {c["name"].lower() for c in plan["conflicts"]}
+    mine = load_library(this_profile)
+    theirs = load_library(other_profile)
+    my_keys = {p.name.lower() for p in mine}
+    their_keys = {p.name.lower() for p in theirs}
+    # Only the voices that actually CHANGE something travel: the missing ones
+    # each way, plus the differing ones when a policy picks a winner (an
+    # identical voice is left alone instead of being re-saved).
+    push = [p for p in mine if p.name.lower() not in their_keys]
+    pull = [p for p in theirs if p.name.lower() not in my_keys]
+    if policy == "this":
+        push += [p for p in mine if p.name.lower() in clash]
+    elif policy == "other":
+        pull += [p for p in theirs if p.name.lower() in clash]
+
+    def _fits(dst_profile: str, dst: Sequence[VoicePreset], incoming: Sequence[VoicePreset]) -> None:
+        known = {p.name.lower() for p in dst}
+        adds = sum(1 for p in incoming if p.name.lower() not in known)
+        if len(dst) + adds > MAX_PRESETS:
+            raise VoiceLabError(
+                f"“{dst_profile}” would hold more than {MAX_PRESETS} saved voices — "
+                "delete some there first"
+            )
+
+    _fits(other_profile, theirs, push)
+    _fits(this_profile, mine, pull)
+    merged_theirs = _apply_merge(theirs, push)
+    merged_mine = _apply_merge(mine, pull)
+    save_library(other_profile, merged_theirs)
+    save_library(this_profile, merged_mine)
+    return {
+        "policy": policy,
+        "to_other": len(push),
+        "to_this": len(pull),
+        "skipped": len(clash) if policy == "skip" else 0,
+        "this_total": len(merged_mine),
+        "other_total": len(merged_theirs),
+        "plan": mirror_plan(this_profile, other_profile),
+    }
+
+
+def sync_state(this_profile: str, partner: str) -> dict[str, Any]:
+    """One profile measured against its **voice partner** — the data behind the
+    dashboard's out-of-sync badge.
+
+    A partner is simply the profile this one is supposed to mirror (the
+    ``voice_partner`` field on the profile). ``out_of_sync`` is True when a
+    mirror under the default ``skip`` policy would still change something:
+    either side holding a voice the other lacks, or a shared name whose
+    settings differ. Two libraries that merely *disagree* about a shared voice
+    count as out of sync too — that is usually what the badge is for, since
+    ``skip`` alone would never resolve it. Read-only.
+    """
+    plan = mirror_plan(this_profile, partner)
+    return {
+        "partner": partner,
+        "out_of_sync": bool(plan["to_other"] or plan["to_this"] or plan["conflicts"]),
+        "to_other": len(plan["to_other"]),
+        "to_this": len(plan["to_this"]),
+        "conflicts": len(plan["conflicts"]),
+        "identical": len(plan["identical"]),
+        "this_count": plan["this_count"],
+        "other_count": plan["other_count"],
+    }
 
 
 def tts_updates(preset: VoicePreset) -> dict[str, Any]:
