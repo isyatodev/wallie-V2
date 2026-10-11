@@ -1,5 +1,6 @@
 profile_name: default
 dashboard_theme: cyan
+voice_partner: ''
 providers:
 - id: naga
   name: groq
@@ -11,6 +12,11 @@ providers:
   category: stt
   base_url: https://api.naga.ac/v1
   model: whisper-large-v3:free
+- id: outerrouter
+  name: OuterRouter
+  category: vision
+  base_url: https://api.unorouter.com/v1/chat/completions
+  model: step-5-preview
 speaker_id:
   enabled: false
   threshold: 0.68
@@ -105,6 +111,8 @@ tts:
   fish_chunk_length: 100
   piper_model_path: ''
   piper_length_scale: 1.0
+  piper_noise_scale: 0.667
+  piper_noise_w: 0.8
   kokoro_voice: pf_dora
   kokoro_lang_code: p
   kokoro_speed: 1.0
