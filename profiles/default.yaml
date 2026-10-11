@@ -13,7 +13,7 @@ providers:
   base_url: https://api.naga.ac/v1
   model: whisper-large-v3:free
 - id: outerrouter
-  name: OuterRouter
+  name: sk-avI6eQDds2dAsN1gNgbK1WEi1u6FgNkHJUHyrcx1S0JtFHu1
   category: vision
   base_url: https://api.unorouter.com/v1/chat/completions
   model: step-5-preview

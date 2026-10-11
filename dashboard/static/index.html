@@ -709,6 +709,51 @@
             <small class="hint" x-show="localVoiceMsg" x-text="localVoiceMsg"></small>
           </div>
         </template>
+        <template x-if="cfg.tts.provider==='kokoro'">
+          <div class="field wide">
+            <label>Download a Kokoro voice
+              <button type="button" class="mini-btn" style="float:right"
+                @click="kokoroCatalogPanel = !kokoroCatalogPanel; if (kokoroCatalogPanel && !kokoroCatalog.voices.length) loadKokoroCatalog()"
+                x-text="kokoroCatalogPanel ? 'hide catalogue' : 'browse catalogue'"></button>
+            </label>
+            <div class="enroll-strip">
+              <input x-model="kokoroDownloadVoice" placeholder="af_heart / pf_dora / zf_xiaobei"
+                     @keydown.enter="downloadKokoroVoice()" />
+              <button class="btn tiny" @click="downloadKokoroVoice()"
+                      :disabled="kokoroVoiceBusy || !kokoroDownloadVoice.trim()"
+                      x-text="kokoroVoiceBusy && kokoro.job && kokoro.job.kind==='download' ? 'downloading…' : '⬇ download'"></button>
+            </div>
+            <div class="dl-progress" x-show="kokoro.job && kokoro.job.running">
+              <div class="dl-bar"><span :style="'width:' + (kokoro.job.progress || 0) + '%'"></span></div>
+              <small class="hint" x-text="(kokoro.job.voice || '') + ' — ' + (kokoro.job.progress || 0) + '%'"></small>
+            </div>
+            <small class="hint">
+              <span x-text="(kokoro.voice_count || 0) + ' voice(s) in ' + (kokoro.voices_dir || 'voices/kokoro/')"></span> —
+              pick one from the catalogue or type its id. Only the voices you pick are downloaded;
+              files land in <code>voices/kokoro/</code> and are used offline afterwards.
+            </small>
+            <div class="catalog" x-show="kokoroCatalogPanel">
+              <div class="catalog-bar">
+                <input x-model="kokoroCatalog.query" placeholder="search voice (af_, pf_, zf_…)" />
+                <button type="button" class="btn tiny ghost" @click="loadKokoroCatalog(true)"
+                        :disabled="kokoroCatalog.loading"
+                        x-text="kokoroCatalog.loading ? '…' : 'refresh'"></button>
+              </div>
+              <small class="hint" x-show="kokoroCatalog.msg" x-text="kokoroCatalog.msg"></small>
+              <div class="catalog-list">
+                <template x-for="v in kokoroCatalogResults()" :key="v.name">
+                  <div class="speaker-row">
+                    <span x-text="v.name"></span>
+                    <small class="hint" x-text="kokoroIsLocal(v.name) ? '✓ downloaded' : fmtMB(v.size_bytes)"></small>
+                    <button class="btn tiny" @click="downloadKokoroCatalogVoice(v)"
+                            :disabled="kokoroVoiceBusy || kokoroIsLocal(v.name)">⬇</button>
+                  </div>
+                </template>
+              </div>
+              <small class="hint" x-show="kokoroCatalogPanel && !kokoroCatalog.loading && !kokoroCatalogResults().length">No voices match that filter.</small>
+            </div>
+          </div>
+        </template>
         <div class="field wide">
           <label>Output device <button type="button" class="mini-btn" style="float:right"
             @click="loadAudioDevices()" :disabled="audioDevicesBusy"
@@ -2084,6 +2129,27 @@
             <small class="hint">A small, fast model is enough — it only classifies + writes facts.</small>
           </div>
         </template>
+        <template x-if="cfg.memory.extractor==='openai_compatible'">
+          <div class="field wide">
+            <label>Memory provider block</label>
+            <select x-model="cfg.memory.provider_ref">
+              <option value="">— auto (first MEMORY block) —</option>
+              <template x-for="p in providers.filter(x => x.category==='memory')" :key="'memb-' + (p.id || p.name)">
+                <option :value="p.id" x-text="p.name + (p.base_url ? ` (${p.base_url})` : '')" :selected="cfg.memory.provider_ref===p.id"></option>
+              </template>
+            </select>
+            <template x-if="staleRef(cfg.memory.provider_ref, 'memory')">
+              <div class="stale-ref-warn">
+                <span x-text="'⚠ ' + staleRef(cfg.memory.provider_ref, 'memory')"></span>
+                <template x-if="suggestedRef('memory')">
+                  <button type="button" class="btn tiny" @click="applySuggestedRef('cfg.memory.provider_ref', 'memory')"
+                    x-text="'→ use “' + (providers.find(p => p.id === suggestedRef('memory'))?.name || suggestedRef('memory')) + '”'"></button>
+                </template>
+              </div>
+            </template>
+            <small class="hint">Blocks are managed on the <b>API Keys</b> page (endpoint, model and key). Without a block, the base URL above is used.</small>
+          </div>
+        </template>
         <div class="field">
           <label>Short-term TTL <span class="slider-val" x-text="(cfg.memory.short_term_ttl_sec/3600).toFixed(0)+'h'"></span></label>
           <input type="range" min="1" max="168" step="1" x-model.number="cfg.memory.short_term_ttl_sec" @change="cfg.memory.short_term_ttl_sec = Math.round(cfg.memory.short_term_ttl_sec/3600)*3600" />
@@ -2281,6 +2347,27 @@
             <input x-model="cfg.random_thoughts.model" placeholder="e.g. llama-3.1-8b-instant" />
           </div>
         </template>
+        <template x-if="cfg.random_thoughts.generator==='openai_compatible'">
+          <div class="field wide">
+            <label>Thoughts provider block</label>
+            <select x-model="cfg.random_thoughts.provider_ref">
+              <option value="">— auto (first THOUGHTS block) —</option>
+              <template x-for="p in providers.filter(x => x.category==='thoughts')" :key="'thb-' + (p.id || p.name)">
+                <option :value="p.id" x-text="p.name + (p.base_url ? ` (${p.base_url})` : '')" :selected="cfg.random_thoughts.provider_ref===p.id"></option>
+              </template>
+            </select>
+            <template x-if="staleRef(cfg.random_thoughts.provider_ref, 'thoughts')">
+              <div class="stale-ref-warn">
+                <span x-text="'⚠ ' + staleRef(cfg.random_thoughts.provider_ref, 'thoughts')"></span>
+                <template x-if="suggestedRef('thoughts')">
+                  <button type="button" class="btn tiny" @click="applySuggestedRef('cfg.random_thoughts.provider_ref', 'thoughts')"
+                    x-text="'→ use “' + (providers.find(p => p.id === suggestedRef('thoughts'))?.name || suggestedRef('thoughts')) + '”'"></button>
+                </template>
+              </div>
+            </template>
+            <small class="hint">Blocks are managed on the <b>API Keys</b> page (endpoint, model and key). Without a block, the base URL above is used.</small>
+          </div>
+        </template>
         <div class="field" style="grid-column: 1 / -1;">
           <label>Seed topics (one per line — the AI picks from this pool when present)</label>
           <textarea class="mono" rows="3" x-model="cfg.random_thoughts.seed_topics_text"></textarea>
@@ -2364,8 +2451,70 @@
             <button :class="{on: cfg.llm.vision_provider==='main'}" @click="cfg.llm.vision_provider='main'">This model</button>
             <button :class="{on: cfg.llm.vision_provider==='openai_compatible'}" @click="cfg.llm.vision_provider='openai_compatible'">Separate OpenAI-compatible block</button>
           </div>
-          <small class="hint">Use a different vision model than the brain (e.g. Qwen-VL). Configure it in the <b>Vision</b> section → Vision model.</small>
+          <small class="hint">Use a different vision model than the brain (e.g. Qwen-VL). Add the block and its key right here, or configure it fully in the <b>Vision</b> section → Vision model.</small>
         </div>
+        <template x-if="cfg.llm.vision_provider==='openai_compatible'">
+          <div class="field" style="grid-column: 1 / -1;">
+            <label>Vision provider block</label>
+            <div class="block-fields">
+              <select x-model="cfg.llm.vision_provider_ref">
+                <option value="">— auto (first VISION block) —</option>
+                <template x-for="p in providers.filter(x => x.category==='vision')" :key="'visb-' + (p.id || p.name)">
+                  <option :value="p.id" x-text="p.name + (p.base_url ? ` (${p.base_url})` : '')" :selected="cfg.llm.vision_provider_ref===p.id"></option>
+                </template>
+              </select>
+              <button type="button" class="btn tiny" @click="providerAdd('vision')">＋ new vision block</button>
+              <button type="button" class="btn tiny ghost" @click="providerSaveAll()" :disabled="providerBusy"
+                x-text="providerBusy ? '…' : 'save blocks'"></button>
+            </div>
+            <template x-if="staleRef(cfg.llm.vision_provider_ref, 'vision')">
+              <div class="stale-ref-warn">
+                <span x-text="'⚠ ' + staleRef(cfg.llm.vision_provider_ref, 'vision')"></span>
+                <template x-if="suggestedRef('vision')">
+                  <button type="button" class="btn tiny" @click="applySuggestedRef('cfg.llm.vision_provider_ref', 'vision')"
+                    x-text="'→ use “' + (providers.find(p => p.id === suggestedRef('vision'))?.name || suggestedRef('vision')) + '”'"></button>
+                </template>
+              </div>
+            </template>
+            <template x-if="visionBlock()">
+              <div class="block-key">
+                <span class="block-key-env mono" x-text="providerKeyEnv(visionBlock())"></span>
+                <template x-if="visionBlock().id && !(providerKeyEnv(visionBlock()) in secretEdits)">
+                  <div class="secret-display">
+                    <span class="secret-mask" x-show="providerKeySet(visionBlock())" x-text="providerKeyMasked(visionBlock())"></span>
+                    <span class="secret-empty" x-show="!providerKeySet(visionBlock())">no API key</span>
+                    <button class="btn tiny" @click="startEditSecret(providerKeyEnv(visionBlock()))"
+                      x-text="providerKeySet(visionBlock()) ? 'edit key' : 'add key'"></button>
+                  </div>
+                </template>
+                <template x-if="visionBlock().id && (providerKeyEnv(visionBlock()) in secretEdits)">
+                  <div class="secret-edit">
+                    <input :type="secretShow[providerKeyEnv(visionBlock())] ? 'text' : 'password'"
+                      x-model="secretEdits[providerKeyEnv(visionBlock())]"
+                      :placeholder="providerKeySet(visionBlock()) ? 'enter new value to replace, or leave blank to clear' : 'paste the API key…'"
+                      autocomplete="off" spellcheck="false" />
+                    <button class="btn tiny ghost" @click="secretShow[providerKeyEnv(visionBlock())] = !secretShow[providerKeyEnv(visionBlock())]"
+                      :title="secretShow[providerKeyEnv(visionBlock())] ? 'hide' : 'show'">
+                      <span x-text="secretShow[providerKeyEnv(visionBlock())] ? '🙈' : '👁'"></span>
+                    </button>
+                    <button class="btn tiny primary" @click="saveSecret(providerKeyEnv(visionBlock()))">save</button>
+                    <button class="btn tiny" @click="cancelEditSecret(providerKeyEnv(visionBlock()))">cancel</button>
+                  </div>
+                </template>
+                <small class="hint" x-show="!visionBlock().id">Save blocks first — the key field appears once the block has an id.</small>
+                <span class="secret-msg" x-show="secretMsg[providerKeyEnv(visionBlock())]" x-text="secretMsg[providerKeyEnv(visionBlock())]"></span>
+              </div>
+            </template>
+            <template x-if="!visionBlock()">
+              <small class="hint">No vision block yet — <b>＋ new vision block</b>, set its endpoint and model, press <b>save blocks</b>, then paste the key here.</small>
+            </template>
+            <div class="test-strip">
+              <button type="button" class="btn tiny" @click="loadVisionModels()" :disabled="vlModelsBusy"
+                x-text="vlModelsBusy ? 'listing…' : 'list models'"></button>
+              <span class="hint" x-show="vlModelsMsg" x-text="vlModelsMsg"></span>
+            </div>
+          </div>
+        </template>
         <template x-if="cfg.llm.provider === 'ollama'">
           <div class="field" style="grid-column: 1 / -1;">
             <label>Ollama base URL</label>
@@ -2483,7 +2632,6 @@
       <!-- ============ dynamic provider blocks ============ -->
       <div class="subhead" style="display:flex; align-items:center; gap:10px; margin-top:18px;">
         <span>Provider blocks</span>
-        <button class="btn tiny" @click="providerAdd()" :disabled="providerBusy">+ add block</button>
         <button class="btn tiny ghost" @click="providerSaveAll()" :disabled="providerBusy"
           x-text="providerBusy ? '…' : 'save blocks'"></button>
         <span class="hint" x-show="providerMsg" x-text="providerMsg"></span>
@@ -2491,39 +2639,96 @@
       <p class="hint" style="margin:4px 0 10px;">
         Each block is a named OpenAI-compatible endpoint. The <b>category</b> decides which task it serves
         (LLM / Vision / TTS / STT / Memory / Thoughts) — subsystems automatically use the block for their
-        category, no per-file editing. Keys live in the list below; endpoints on localhost (Ollama, LM Studio)
-        don't need a key.
+        category, no per-file editing. Every block's own <b>API key</b> is edited on its row below; endpoints on
+        localhost (Ollama, LM Studio) don't need a key. A block's key name is fixed when you first save it,
+        so renaming a block never breaks the subsystems pointing at it.
       </p>
-      <div class="secrets-list">
-        <template x-for="(p, i) in providers" :key="p._localKey || (p.id || 'new') + '-' + i">
-          <div class="secret-row" style="align-items:center;">
-            <div class="secret-label" style="min-width:180px;">
-              <input x-model="p.name" placeholder="name (e.g. Main LLM)" style="width:100%;" />
-              <small class="hint" x-text="p.id ? 'key: ' + providerKeyEnv(p) : 'key assigned on save'"></small>
-            </div>
-            <div class="secret-value" style="display:grid; grid-template-columns: 130px 1fr 1fr auto; gap:8px; width:100%;">
-              <select x-model="p.category" title="which task this block serves">
-                <template x-for="c in providerCategories" :key="c">
-                  <option :value="c" x-text="c.toUpperCase()" :selected="p.category===c"></option>
-                </template>
-              </select>
-              <input x-model="p.base_url" placeholder="https://host/v1  (endpoint, version path included)" />
-              <input x-model="p.model" placeholder="model (e.g. llama3.1 / qwen-vl / tts-1)" />
-              <div style="display:flex; gap:6px;">
-                <button class="btn tiny" @click="providerTest(p)" :disabled="providerBusy">test</button>
-                <button class="btn tiny" @click="providerConfirmDelete(p)">🗑</button>
-              </div>
+
+      <template x-for="cat in providerCategories" :key="'pg-' + cat">
+        <div class="cat-group">
+          <button type="button" class="cat-head" :class="{ open: groupOpen('provider', cat) }"
+                  @click="toggleGroup('provider', cat)">
+            <span class="cat-caret" x-text="groupOpen('provider', cat) ? '▾' : '▸'"></span>
+            <span class="cat-title" x-text="providerCatLabel(cat)"></span>
+            <span class="cat-count" x-text="providerBlocks(cat).length"></span>
+            <span class="hint cat-note" x-text="providerCatHint(cat)"></span>
+            <span class="cat-add" @click.stop="providerAdd(cat)">＋ add</span>
+          </button>
+          <div class="cat-body" x-show="groupOpen('provider', cat)">
+            <div class="secrets-list">
+              <template x-for="(p, i) in providerBlocks(cat)" :key="p._localKey || (p.id || 'new') + '-' + i">
+                <div class="secret-row">
+                  <div class="secret-label">
+                    <input x-model="p.name" placeholder="name (e.g. Main LLM)" />
+                    <small class="hint" x-text="p.id ? 'key: ' + providerKeyEnv(p) : 'key assigned on save'"></small>
+                  </div>
+                  <div class="secret-value">
+                    <div class="block-fields">
+                      <select x-model="p.category" title="which task this block serves">
+                        <template x-for="c in providerCategories" :key="'pc-' + c">
+                          <option :value="c" x-text="c.toUpperCase()" :selected="p.category===c"></option>
+                        </template>
+                      </select>
+                      <input x-model="p.base_url" placeholder="https://host/v1  (endpoint, version path included)" />
+                      <input x-model="p.model" placeholder="model (e.g. llama3.1 / qwen-vl / tts-1)" />
+                    </div>
+                    <div class="block-actions">
+                      <button class="btn tiny" @click="providerTest(p)" :disabled="providerBusy">test</button>
+                      <button class="btn tiny" @click="providerRename(p)" title="Rename this block">✎ rename</button>
+                      <button class="btn tiny ghost panic" @click="providerConfirmDelete(p)" title="Delete this block">🗑 delete</button>
+                    </div>
+                    <template x-if="p.id">
+                      <div class="block-key">
+                        <span class="block-key-env mono" x-text="providerKeyEnv(p)"></span>
+                        <template x-if="!(providerKeyEnv(p) in secretEdits)">
+                          <div class="secret-display">
+                            <span class="secret-mask" x-show="providerKeySet(p)" x-text="providerKeyMasked(p)"></span>
+                            <span class="secret-empty" x-show="!providerKeySet(p)">no API key</span>
+                            <button class="btn tiny" @click="startEditSecret(providerKeyEnv(p))"
+                              x-text="providerKeySet(p) ? 'edit key' : 'add key'"></button>
+                          </div>
+                        </template>
+                        <template x-if="providerKeyEnv(p) in secretEdits">
+                          <div class="secret-edit">
+                            <input :type="secretShow[providerKeyEnv(p)] ? 'text' : 'password'"
+                              x-model="secretEdits[providerKeyEnv(p)]"
+                              :placeholder="providerKeySet(p) ? 'enter new value to replace, or leave blank to clear' : 'paste key…'"
+                              autocomplete="off" spellcheck="false" />
+                            <button class="btn tiny ghost" @click="secretShow[providerKeyEnv(p)] = !secretShow[providerKeyEnv(p)]"
+                              :title="secretShow[providerKeyEnv(p)] ? 'hide' : 'show'">
+                              <span x-text="secretShow[providerKeyEnv(p)] ? '🙈' : '👁'"></span>
+                            </button>
+                            <button class="btn tiny primary" @click="saveSecret(providerKeyEnv(p))">save</button>
+                            <button class="btn tiny" @click="cancelEditSecret(providerKeyEnv(p))">cancel</button>
+                          </div>
+                        </template>
+                        <span class="secret-msg" x-show="secretMsg[providerKeyEnv(p)]" x-text="secretMsg[providerKeyEnv(p)]"></span>
+                      </div>
+                    </template>
+                    <small class="hint" x-show="!p.id">Save the block first — its key field appears once it has an id.</small>
+                  </div>
+                </div>
+              </template>
+              <p class="hint" x-show="!providerBlocks(cat).length">
+                No <b x-text="providerCatLabel(cat)"></b> blocks yet —
+                <button type="button" class="link-btn" @click="providerAdd(cat)">add one</button>.
+              </p>
             </div>
           </div>
-        </template>
-        <p class="hint" x-show="!providers.length">No blocks yet — add one and point your LLM/TTS/STT/Vision/Memory at it.</p>
-      </div>
+        </div>
+      </template>
 
-      <template x-for="kind in ['llm','tts','stt','stream']" :key="kind">
-        <div>
-          <h3 class="subhead" x-text="kind === 'llm' ? 'LLM providers' : kind === 'tts' ? 'TTS providers' : kind === 'stt' ? 'STT providers' : 'Stream platforms'"></h3>
+      <template x-for="kind in ['llm','tts','stt','stream']" :key="'sg-' + kind">
+        <div class="cat-group">
+          <button type="button" class="cat-head" :class="{ open: groupOpen('secret', kind) }"
+                  @click="toggleGroup('secret', kind)">
+            <span class="cat-caret" x-text="groupOpen('secret', kind) ? '▾' : '▸'"></span>
+            <span class="cat-title" x-text="secretKindLabel(kind)"></span>
+            <span class="cat-count" x-text="builtinSecrets(kind).length"></span>
+          </button>
+          <div class="cat-body" x-show="groupOpen('secret', kind)">
           <div class="secrets-list">
-            <template x-for="s in secretsByKind(kind)" :key="s.env">
+            <template x-for="s in builtinSecrets(kind)" :key="s.env">
               <div class="secret-row">
                 <div class="secret-label">
                   <strong x-text="s.label"></strong>
@@ -2572,6 +2777,7 @@
                 </div>
               </div>
             </template>
+          </div>
           </div>
         </div>
       </template>

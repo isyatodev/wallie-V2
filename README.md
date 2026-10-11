@@ -77,6 +77,8 @@ Everything below is fork-specific. If a feature is not listed here, assume it ca
 | **Piper voice catalogue** | Browse the official `rhasspy/piper-voices` catalogue **inside the dashboard** — search by name, filter by language, see speakers/quality/size per voice — and download any of them with a live progress bar. No CLI needed | Dashboard → **Voice** |
 | **Piper tuning** | Speed (`length_scale`), **Expressiveness** (`noise_scale`) and **Pacing variety** (`noise_w`) as sliders, so a local voice can be tuned to taste instead of taking Piper's defaults | Dashboard → **Voice** |
 | **Kokoro languages** | A real language picker instead of US/UK only — including **Portuguese (Brazil)** (`pf_dora` / `pm_alex` / `pm_santa`), plus Spanish, French, Hindi, Italian, Japanese and Mandarin. Voice ids stay in sync with the language, and the voice field autocompletes per language | Dashboard → **Voice** |
+| **Kokoro voice catalogue** | Browse every voice Kokoro publishes **inside the dashboard** and download only the ones you want with a progress bar. A downloaded voice is used straight from disk — offline, and never re-downloaded | Dashboard → **Voice** |
+| **Grouped API Keys** | The API Keys page groups provider blocks by service (LLM / Vision / TTS / STT / Memory / Thoughts) in collapsible sections, each block with its own inline API-key field plus rename and delete; the built-in platform keys collapse too | Dashboard → **API Keys** |
 | **Vision test with any model** | The Vision test strip can probe **any provider + model** (and base URL) *without saving it* — the escape hatch when a provider retires a model mid-stream | Dashboard → **Vision** |
 | **Current Gemini defaults** | New profiles and the setup wizard now point at `gemini-3.8-flash`; the deprecated `gemini-2.0-flash` entry is gone and the restricted 2.5 family is labelled as such | Dashboard → **Engine** / setup wizard |
 | **Per-profile themes** | Dashboard accent themes (cyan / amber / rose) saved in the profile, so each persona can look different | Top bar |
@@ -311,6 +313,17 @@ Non-English languages need a reasonably recent `kokoro` (≥ 0.9.4). Japanese an
 need their `misaki` extra (`python scripts/install_kokoro.py --lang j --install`) and espeak-ng,
 depending on your platform. If a language refuses to load, the Kokoro error in the server log says
 exactly which package is missing.
+
+**Ready-made voices from the UI.** On the **Voice** page with `kokoro` selected, the **Download a
+Kokoro voice** box downloads individual voice packs: click **browse catalogue** to list every voice
+Kokoro publishes (search by id — `pf_`, `zf_`…), then download just the ones you want with a
+progress bar. Files land in `voices/kokoro/<voice>.pt` and are passed to the pipeline straight from
+disk, so a downloaded voice works offline and is never fetched again. The `voices/` tree is
+gitignored, and `python scripts/download_kokoro_voice.py <voice>` is the headless equivalent.
+
+The pipeline (the ~300 MB model) is cached per language, so previews, A/B takes and live segments
+reuse one instance instead of re-loading it, and audio is streamed chunk-by-chunk instead of only
+after the whole segment is synthesised — that is the time-to-first-audio win you feel on stream.
 </details>
 
 <details>

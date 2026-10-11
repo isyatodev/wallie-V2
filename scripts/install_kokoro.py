@@ -12,6 +12,7 @@ Usage:
     python scripts/install_kokoro.py --install            # also pip-install deps
     python scripts/install_kokoro.py --lang p --voice pf_dora
     python scripts/install_kokoro.py --lang j --install   # Japanese (adds misaki[ja])
+    python scripts/install_kokoro.py --check              # is it ready? (no downloads)
     python scripts/install_kokoro.py --play               # verify + speak it out loud
 
 With ``--play`` the script does not stop at "the model loads": it speaks one line
@@ -321,6 +322,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--install", action="store_true",
                     help="pip-install kokoro + soundfile (+ language extras) first")
+    ap.add_argument("--check", action="store_true",
+                    help="only report whether Kokoro can run here — no pip, no downloads. "
+                         "Exits 0 (ready), 2 (packages missing) or 3 (interpreter too old)")
     ap.add_argument("--lang", default="a", choices=sorted(_LANGS),
                     help="Kokoro language code (default: a = English US)")
     ap.add_argument("--voice", default=None,
@@ -338,12 +342,25 @@ def main(argv: list[str] | None = None) -> int:
     voice = args.voice or default_voice
 
     print(f"Kokoro installer — language: {label} ({lang}) · voice: {voice}")
-    print(f"  {_describe_env()}")
 
     # The Python range only blocks us when we actually have to INSTALL kokoro;
     # an already-installed copy can still be warmed/verified on any interpreter.
     if _installed_version("kokoro") is None and not _check_python():
         return 3
+
+    # --check answers "could a live session use Kokoro right now?" without
+    # touching the network (no pip, no model/voice download) and without the
+    # device probe (which imports torch just for a hint). Used by the
+    # installer's own self-test and by CI, where a warm-up would be flaky.
+    if args.check:
+        missing = _check_requirements(lang)
+        if missing:
+            print(f"✗ Missing package(s): {', '.join(missing)}")
+            return 2
+        print("✓ Kokoro is installed — nothing to install or warm.")
+        return 0
+
+    print(f"  {_describe_env()}")
 
     if args.install:
         if not _install(lang):

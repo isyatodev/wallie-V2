@@ -142,6 +142,60 @@ def _last_percent(text: str) -> int | None:
         return None
 
 
+async def _stream_subprocess_job(
+    job: dict[str, Any], argv: list[str], *, cwd: Path, timeout: float
+) -> None:
+    """Run an install/download subprocess off the event loop, streaming its
+    output onto ``job`` so the Voice tab can show live progress.
+
+    The helper scripts print ``… (NN%)``; the last percentage lands on
+    ``job["progress"]``. The whole job is bounded by ``timeout``. Shared by the
+    Piper and Kokoro download endpoints so both report progress identically.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except Exception as e:
+        job.update(running=False, returncode=-1, finished_at=time.time(),
+                   log=f"could not start the job: {_scrub_error(str(e))}")
+        return
+    buf = bytearray()
+    deadline = time.time() + timeout
+    try:
+        assert proc.stdout is not None
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=remaining)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            text = bytes(buf).decode("utf-8", "ignore")
+            job["log"] = text[-4000:]
+            pct = _last_percent(text)
+            if pct is not None:
+                job["progress"] = pct
+        await proc.wait()
+    except asyncio.TimeoutError:
+        proc.kill()
+        job.update(running=False, returncode=-1, finished_at=time.time(),
+                   log="the job timed out — check your connection and try again")
+        return
+    job.update(
+        running=False,
+        returncode=proc.returncode,
+        finished_at=time.time(),
+        log=bytes(buf).decode("utf-8", "ignore")[-4000:],
+    )
+    if proc.returncode == 0:
+        job["progress"] = 100
+
+
 class DashboardState:
     def __init__(self) -> None:
         self.orchestrator: Optional[Orchestrator] = None
@@ -160,6 +214,19 @@ class DashboardState:
         # Piper one-click install / voice-download job (Voice-tab badge). Read by
         # GET /api/tts/piper/status; updated by the background task.
         self.piper_job: dict[str, Any] = {
+            "running": False,
+            "kind": "",
+            "voice": "",
+            "progress": 0,
+            "started_at": None,
+            "finished_at": None,
+            "returncode": None,
+            "log": "",
+        }
+        # Kokoro voice-pack download job (separate from the pip install job so
+        # the two can be reported independently). Read by
+        # GET /api/tts/kokoro/status.
+        self.kokoro_job: dict[str, Any] = {
             "running": False,
             "kind": "",
             "voice": "",
@@ -350,6 +417,10 @@ class KokoroInstallBody(BaseModel):
 
 class PiperDownloadBody(BaseModel):
     voice: str          # e.g. en_US-amy-medium
+
+
+class KokoroVoiceBody(BaseModel):
+    voice: str = ""     # e.g. af_heart / pf_dora / zf_xiaobei
 
 
 class LocalVoiceBody(BaseModel):
@@ -868,8 +939,18 @@ def _build_app(
 
     @app.get("/api/tts/kokoro/status")
     def api_kokoro_status() -> dict[str, Any]:
-        """Is the local Kokoro voice installed? Cheap metadata probe + install job."""
-        return {"ok": True, **_kokoro.detect(), "install": dict(state.kokoro_install)}
+        """Is the local Kokoro voice installed? Cheap metadata probe, the voice
+        packs downloaded on disk, and the install/download jobs."""
+        local = _kokoro.list_local_voices()
+        return {
+            "ok": True,
+            **_kokoro.detect(),
+            "voices_dir": str(_kokoro.voices_dir()),
+            "voices": local,
+            "voice_count": len(local),
+            "install": dict(state.kokoro_install),
+            "job": dict(state.kokoro_job),
+        }
 
     @app.post("/api/tts/kokoro/install")
     async def api_kokoro_install(body: KokoroInstallBody) -> dict[str, Any]:
@@ -889,61 +970,61 @@ def _build_app(
         asyncio.create_task(_run_kokoro_install(lang, voice), name="kokoro-install")
         return {"ok": True, "started": True, "lang": lang}
 
+    async def _run_kokoro_job(argv: list[str]) -> None:
+        """Download one Kokoro voice pack into voices/kokoro/ with live progress."""
+        await _stream_subprocess_job(
+            state.kokoro_job, argv, cwd=_kokoro.REPO_ROOT, timeout=_PIPER_JOB_TIMEOUT
+        )
+
+    @app.get("/api/tts/kokoro/catalog")
+    async def api_kokoro_catalog(refresh: bool = False) -> dict[str, Any]:
+        """Every ready-made voice Kokoro publishes, so the Voice tab can browse
+        and download individual voices without leaving the dashboard."""
+        try:
+            voices = await _kokoro.fetch_catalog(force=bool(refresh))
+        except _kokoro.KokoroCatalogError as e:
+            raise HTTPException(400, str(e))
+        local = {v["name"] for v in _kokoro.list_local_voices()}
+        for v in voices:
+            v["local"] = v["name"] in local
+        return {
+            "ok": True,
+            "count": len(voices),
+            "voices": voices,
+            "voices_dir": str(_kokoro.voices_dir()),
+        }
+
+    @app.post("/api/tts/kokoro/download")
+    async def api_kokoro_download(body: KokoroVoiceBody) -> dict[str, Any]:
+        """Download one voice pack into voices/kokoro/ (background job)."""
+        if not _kokoro.DOWNLOAD_SCRIPT.is_file():
+            raise HTTPException(400, "helper script missing: scripts/download_kokoro_voice.py")
+        if state.kokoro_job["running"]:
+            raise HTTPException(409, "a Kokoro voice download is already running")
+        voice = (body.voice or "").strip()
+        try:
+            argv = _kokoro.download_argv(voice, str(_kokoro.voices_dir()))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        state.kokoro_job.update(
+            running=True, kind="download", voice=voice, progress=0,
+            started_at=time.time(), finished_at=None, returncode=None,
+            log=f"downloading {voice}…",
+        )
+        asyncio.create_task(_run_kokoro_job(argv), name="kokoro-download")
+        return {"ok": True, "started": True, "voice": voice}
+
     # ---------- Piper (optional local TTS) — status, install, voice downloads ----------
     from tts import piper_setup as _piper
 
     _PIPER_JOB_TIMEOUT = 1800.0
 
     async def _run_piper_job(argv: list[str]) -> None:
-        """Run a Piper install/download subprocess off the event loop and stream
-        its output onto state.piper_job so the Voice tab can show live progress.
-
-        The downloader prints ``… (NN%)`` on stderr/stdout; each chunk is scanned
-        for the last percentage, which the UI polls. The whole job is bounded by
-        ``_PIPER_JOB_TIMEOUT``."""
-        job = state.piper_job
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=str(_piper.REPO_ROOT),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-        except Exception as e:
-            job.update(running=False, returncode=-1, finished_at=time.time(),
-                       log=f"could not start the job: {_scrub_error(str(e))}")
-            return
-        buf = bytearray()
-        deadline = time.time() + _PIPER_JOB_TIMEOUT
-        try:
-            assert proc.stdout is not None
-            while True:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    raise asyncio.TimeoutError
-                chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=remaining)
-                if not chunk:
-                    break
-                buf.extend(chunk)
-                text = bytes(buf).decode("utf-8", "ignore")
-                job["log"] = text[-4000:]
-                pct = _last_percent(text)
-                if pct is not None:
-                    job["progress"] = pct
-            await proc.wait()
-        except asyncio.TimeoutError:
-            proc.kill()
-            job.update(running=False, returncode=-1, finished_at=time.time(),
-                       log="the job timed out — check your connection and try again")
-            return
-        job.update(
-            running=False,
-            returncode=proc.returncode,
-            finished_at=time.time(),
-            log=bytes(buf).decode("utf-8", "ignore")[-4000:],
+        """Run a Piper install/download subprocess and stream its output onto
+        state.piper_job so the Voice tab can show live progress."""
+        await _stream_subprocess_job(
+            state.piper_job, argv, cwd=_piper.REPO_ROOT, timeout=_PIPER_JOB_TIMEOUT
         )
-        if proc.returncode == 0:
-            job["progress"] = 100
 
     @app.get("/api/tts/piper/status")
     def api_piper_status() -> dict[str, Any]:

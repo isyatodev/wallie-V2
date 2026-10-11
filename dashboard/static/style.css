@@ -1086,6 +1086,56 @@ input.switch:checked::after { left: 19px; background: var(--accent); box-shadow:
   .secret-row { grid-template-columns: 1fr; }
 }
 
+/* ---- API Keys: collapsible service categories + provider block rows ---- */
+/* The page used to be one flat wall of rows. Each service category (and each
+   platform-key group) is a disclosure so a long key list costs one line each. */
+.cat-group {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-1);
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+.cat-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 10px 12px;
+  background: none; border: none; cursor: pointer;
+  font-family: inherit; font-size: var(--fs-md); font-weight: 600;
+  color: var(--fg-1); text-align: left;
+}
+.cat-head:hover { background: var(--bg-3); color: var(--fg-0); }
+.cat-head.open { color: var(--fg-0); }
+.cat-caret { width: 12px; color: var(--fg-3); font-size: var(--fs-sm); }
+.cat-title { letter-spacing: .02em; }
+.cat-count {
+  min-width: 20px; padding: 1px 7px; border-radius: var(--radius-pill);
+  background: var(--bg-3); color: var(--fg-2);
+  font-size: var(--fs-2xs); font-weight: 600; text-align: center;
+}
+.cat-note { margin-left: auto; font-size: var(--fs-sm); font-weight: 400; }
+.cat-add {
+  color: var(--accent-hot); font-size: var(--fs-sm); font-weight: 600;
+  padding: 2px 6px; border-radius: 5px; white-space: nowrap;
+}
+.cat-add:hover { background: var(--accent-soft); }
+.cat-body { padding: 2px 12px 12px; }
+.block-fields { display: grid; grid-template-columns: 130px 1fr 1fr; gap: 8px; }
+.block-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.block-key {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 8px 10px; border: 1px dashed var(--line); border-radius: var(--radius-sm);
+  background: var(--bg-0);
+}
+.block-key-env { color: var(--fg-3); overflow-wrap: anywhere; }
+.secret-label input { width: 100%; }
+.link-btn {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: var(--accent-hot); font: inherit; text-decoration: underline;
+}
+@media (max-width: 720px) {
+  .block-fields { grid-template-columns: 1fr; }
+}
+
 /* ---- Avatar / VTS panel ---- */
 .vts-status {
   display: flex; align-items: center; gap: 12px;

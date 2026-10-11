@@ -112,15 +112,32 @@ def test_installer_check_python_bounds():
 
 def test_installer_exit_code_matches_python_support():
     """On an unsupported interpreter the script must refuse with exit 3 and a
-    fix; on a supported one it proceeds to the package/warm path."""
+    fix; on a supported one it reports the package state.
+
+    Runs with ``--check`` so the assertion never depends on the network (the
+    warm-up path downloads model weights from HuggingFace) and decodes the
+    child's output as UTF-8 — the installer prints ✓/→/✗ glyphs that a cp1252
+    Windows console cannot round-trip, which used to raise UnicodeDecodeError
+    here and made this test flaky between interpreters.
+    """
+    import importlib.metadata as _md
     import subprocess
     import sys
     from tts import kokoro_setup as k
+    try:
+        _md.version("kokoro")
+        kokoro_installed = True
+    except Exception:  # noqa: BLE001 - metadata can raise beyond PackageNotFoundError
+        kokoro_installed = False
+
     r = subprocess.run(
-        [sys.executable, str(k.INSTALL_SCRIPT), "--lang", "p"],
-        capture_output=True, text=True, cwd=str(k.REPO_ROOT), timeout=120,
+        [sys.executable, str(k.INSTALL_SCRIPT), "--lang", "p", "--check"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(k.REPO_ROOT), timeout=60,
     )
-    if k.python_ok():
+    # The Python range only blocks the install path when kokoro still has to be
+    # fetched, so mirror the script's own condition exactly.
+    if k.python_ok() or kokoro_installed:
         assert r.returncode in (0, 2), r.stdout + r.stderr
     else:
         assert r.returncode == 3

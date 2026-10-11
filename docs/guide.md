@@ -120,6 +120,8 @@ You can also skip the terminal entirely: on the **Voice** page with `piper` sele
 
 Available voices: [rhasspy.github.io/piper-samples](https://rhasspy.github.io/piper-samples/)
 
+**For Kokoro (free, local):** with `kokoro` selected on the **Voice** page, the **Download a Kokoro voice** box → **browse catalogue** lists every voice Kokoro publishes; download the ones you want (they land in `voices/kokoro/` and are used offline afterwards). The CLI equivalent is `python scripts/download_kokoro_voice.py af_heart`.
+
 ---
 
 ## Cost Breakdown

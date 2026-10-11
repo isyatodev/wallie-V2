@@ -20,6 +20,18 @@ import sys
 import urllib.request
 from pathlib import Path
 
+# The progress glyphs below (↓ ✓ ·) crash a cp1252 Windows console, and the
+# dashboard runs this script with stdout as a PIPE (also cp1252 by default) —
+# which made the download die with UnicodeEncodeError before saving anything
+# (the Voice tab looked like it downloaded, but no .onnx ever landed).
+# Force UTF-8 on stdout/stderr where the interpreter allows it.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 _BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
 
 

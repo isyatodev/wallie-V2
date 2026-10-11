@@ -416,3 +416,30 @@ def test_download_job_streams_progress(tmp_path, monkeypatch):
     assert state.piper_job["running"] is False
     assert state.piper_job["progress"] == 37
     assert state.piper_job["returncode"] == 1
+
+
+def test_download_helper_survives_a_cp1252_pipe():
+    """The dashboard runs the downloader with stdout as a PIPE; on Windows that
+    is cp1252, so the '↓'/'✓' progress glyphs raised UnicodeEncodeError and the
+    .onnx never landed (the Voice tab looked like it downloaded but voices/ was
+    empty). The helper must force UTF-8 on its own streams."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "download_piper_voice.py"
+    code = (
+        "import importlib.util as u\n"
+        f"spec = u.spec_from_file_location('dpv', r'{script}')\n"
+        "m = u.module_from_spec(spec)\n"
+        "spec.loader.exec_module(m)\n"
+        "print('\\u2193 \\u2713 \\u00b7')  # the glyphs the progress prints\n"
+    )
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+    r = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+        encoding="utf-8", errors="replace", env=env, timeout=60,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "UnicodeEncodeError" not in r.stderr

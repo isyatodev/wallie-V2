@@ -253,9 +253,15 @@ function app() {
     playLog: "",
     playBusy: false,
     // Kokoro one-click install badge (Voice tab + setup wizard panels).
-    kokoro: { installed: false, kokoro_version: "", missing: [], installer_present: true, python_ok: true, python_version: "", python_range: "3.10–3.12", can_install: true, running: false, log: "" },
+    kokoro: { installed: false, kokoro_version: "", missing: [], installer_present: true, python_ok: true, python_version: "", python_range: "3.10–3.12", can_install: true, running: false, log: "", voices_dir: "", voice_count: 0, job: { running: false, kind: "", voice: "", progress: 0, returncode: null, log: "" } },
     kokoroBusy: false,
     _kokoroPoll: null,
+    // Ready-made voice packs: browse the catalogue, download only what you pick.
+    kokoroVoiceBusy: false,
+    _kokoroVoicePoll: null,
+    kokoroDownloadVoice: "",
+    kokoroCatalogPanel: false,
+    kokoroCatalog: { voices: [], loading: false, msg: "", query: "" },
     // Piper one-click install / voice download badge (Voice tab).
     piper: { installed: false, piper_tts_version: "", voices: [], voice_count: 0, voices_dir: "", installer_present: true, can_install: true, job: { running: false, kind: "", voice: "", returncode: null, log: "" } },
     piperBusy: false,
@@ -351,6 +357,9 @@ function app() {
     providers: [],
     providerCategories: ["llm", "vision", "tts", "stt", "memory", "thoughts"],
     providerBusy: false,      providerMsg: "",
+    // Which collapsible groups on the API Keys page are open, keyed
+    // "provider:<category>" / "secret:<kind>". Absent = the default.
+    groupState: {},
       healedMsg: "",
       partnerSyncMsg: "",      // what switching profile did to the voice libraries
       _partnerSyncTimer: null,
@@ -587,9 +596,102 @@ function app() {
       await this.loadProviders();
     },
 
-    providerAdd() {
+    providerAdd(category) {
       // Local draft; persisted by providerSaveAll (one PUT, ids assigned server-side).
-      this.providers.push({ id: "", name: "New provider", category: "llm", base_url: "", model: "" });
+      const cat = this.providerCategories.includes(category) ? category : "llm";
+      this.providers.push({ id: "", name: "New " + this.providerCatLabel(cat) + " provider", category: cat, base_url: "", model: "" });
+      this.groupState["provider:" + cat] = true;
+    },
+
+    providerBlocks(category) {
+      return (this.providers || []).filter(p => p.category === category);
+    },
+
+    providerCatLabel(category) {
+      return {
+        llm: "LLM", vision: "Vision", tts: "TTS", stt: "STT",
+        memory: "Memory", thoughts: "Thoughts",
+      }[category] || String(category || "").toUpperCase();
+    },
+
+    providerCatHint(category) {
+      return {
+        llm: "the brain — chat/completions",
+        vision: "screen understanding (VL models)",
+        tts: "speech synthesis (audio/speech)",
+        stt: "speech-to-text (audio/transcriptions)",
+        memory: "what to remember",
+        thoughts: "spontaneous topics",
+      }[category] || "";
+    },
+
+    // Collapsible groups on the API Keys page. A category the user actually has
+    // blocks in opens by default (so nothing looks lost); the platform-key
+    // groups start collapsed to save space.
+    groupOpen(scope, key) {
+      const saved = this.groupState[scope + ":" + key];
+      if (saved !== undefined) return saved;
+      if (scope === "provider") return this.providerBlocks(key).length > 0;
+      return false;
+    },
+
+    toggleGroup(scope, key) {
+      const id = scope + ":" + key;
+      const next = !this.groupOpen(scope, key);
+      this.groupState = { ...this.groupState, [id]: next };
+    },
+
+    providerRename(p) {
+      // Renaming only changes the display name — the block id (and therefore the
+      // PROVIDER_<ID>_API_KEY env name) is deliberately kept so existing
+      // provider_refs across subsystems never dangle.
+      const next = window.prompt("Rename this block (the API-key name stays the same):", p.name || "");
+      if (next === null) return;
+      const name = next.trim();
+      if (!name) return;
+      p.name = name;
+      if (p.id) this.providerSaveAll();
+      else this.providerMsg = "renamed — remember to save blocks";
+    },
+
+    secretRow(env) {
+      return (this.secrets || []).find(s => s.env === env) || null;
+    },
+
+    providerKeySet(p) {
+      const row = this.secretRow(this.providerKeyEnv(p));
+      return !!(row && row.is_set);
+    },
+
+    providerKeyMasked(p) {
+      const row = this.secretRow(this.providerKeyEnv(p));
+      return row ? (row.masked || "••••") : "";
+    },
+
+    // The vision block the Engine/Vision pages key off: the explicit ref when it
+    // resolves, else the first block of the category — mirrors the runtime's
+    // _resolve_provider fallback so the UI shows the key that will actually be
+    // used. Returns null when no vision block exists yet.
+    visionBlock() {
+      const ref = (this.cfg?.llm?.vision_provider_ref || "").trim();
+      if (ref) {
+        const hit = (this.providers || []).find(p => p.id === ref);
+        if (hit) return hit;
+      }
+      return (this.providers || []).find(p => p.category === "vision") || null;
+    },
+
+    // Built-in platform keys for a group — dynamic provider-block keys are
+    // excluded because they are edited inline on their own block row.
+    builtinSecrets(kind) {
+      return (this.secrets || []).filter(s => s.kind === kind && !s.dynamic);
+    },
+
+    secretKindLabel(kind) {
+      return {
+        llm: "LLM providers", tts: "TTS providers",
+        stt: "STT providers", stream: "Stream platforms",
+      }[kind] || kind;
     },
 
     providerConfirmDelete(p) {
@@ -1526,6 +1628,10 @@ function app() {
           running: !!job.running,
           returncode: job.returncode ?? null,
           log: job.log || "",
+          voices_dir: d.voices_dir || "",
+          voice_count: d.voice_count || 0,
+          voices: d.voices || [],
+          job: d.job || { running: false, kind: "", voice: "", progress: 0, returncode: null, log: "" },
         };
         return this.kokoro;
       } catch (e) {
@@ -1568,6 +1674,83 @@ function app() {
           this.kokoroBusy = false;
         }
       }, 2000);
+    },
+
+    // ----- Kokoro ready-made voices (download the ones you want) -----
+    async downloadKokoroVoice() {
+      const voice = (this.kokoroDownloadVoice || "").trim();
+      if (!voice || this.kokoroVoiceBusy) return;
+      this.kokoroVoiceBusy = true;
+      this.kokoro.job = { ...this.kokoro.job, running: true, kind: "download", voice, log: `downloading ${voice}…` };
+      try {
+        const r = await fetch("/api/tts/kokoro/download", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ voice }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok && r.status !== 409) {
+          this.kokoro.job = { ...this.kokoro.job, running: false, log: "✗ " + (d.detail || ("HTTP " + r.status)) };
+          this.kokoroVoiceBusy = false;
+          return;
+        }
+        this.kokoroDownloadVoice = "";
+        await this.loadKokoroStatus();
+        this._pollKokoroVoiceJob();
+      } catch (e) {
+        this.kokoro.job = { ...this.kokoro.job, running: false, log: "✗ " + e };
+        this.kokoroVoiceBusy = false;
+      }
+    },
+    _pollKokoroVoiceJob() {
+      if (this._kokoroVoicePoll) clearInterval(this._kokoroVoicePoll);
+      this.kokoroVoiceBusy = true;
+      this._kokoroVoicePoll = setInterval(async () => {
+        const s = await this.loadKokoroStatus();
+        if (!s || !s.job || !s.job.running) {
+          clearInterval(this._kokoroVoicePoll);
+          this._kokoroVoicePoll = null;
+          this.kokoroVoiceBusy = false;
+          // A finished download adds a voice to voices/kokoro/ — refresh the list.
+          if (this.kokoroCatalog.voices.length) this.loadKokoroCatalog(true);
+        }
+      }, 1000);
+    },
+    kokoroIsLocal(name) {
+      return (this.kokoro.voices || []).some(v => v.name === name)
+        || (this.kokoroCatalog.voices || []).some(v => v.name === name && v.local);
+    },
+    async loadKokoroCatalog(refresh = false) {
+      if (this.kokoroCatalog.loading) return;
+      this.kokoroCatalog.loading = true;
+      this.kokoroCatalog.msg = "loading the voice list…";
+      try {
+        const r = await fetch("/api/tts/kokoro/catalog" + (refresh ? "?refresh=true" : ""));
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.kokoroCatalog.msg = "✗ " + (d.detail || `HTTP ${r.status}`);
+          return;
+        }
+        this.kokoroCatalog.voices = d.voices || [];
+        this.kokoroCatalog.msg = `${this.kokoroCatalog.voices.length} voices available`;
+      } catch (e) {
+        this.kokoroCatalog.msg = "✗ " + e;
+      } finally {
+        this.kokoroCatalog.loading = false;
+      }
+    },
+    kokoroCatalogResults() {
+      const q = (this.kokoroCatalog.query || "").trim().toLowerCase();
+      const out = [];
+      for (const v of this.kokoroCatalog.voices) {
+        if (q && !v.name.toLowerCase().includes(q)) continue;
+        out.push(v);
+        if (out.length >= 120) break;   // cap the DOM; refine the search for more
+      }
+      return out;
+    },
+    downloadKokoroCatalogVoice(v) {
+      this.kokoroDownloadVoice = v.name;
+      this.downloadKokoroVoice();
     },
 
     // ----- Piper (optional local TTS) — install + per-voice downloads -----
