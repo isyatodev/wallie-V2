@@ -235,6 +235,22 @@ a { color: var(--accent-hot); }
 .sync-badge.ok { color: var(--ok-ink); border-color: var(--ok-line); background: var(--ok-soft); }
 .sync-badge.warn { color: var(--warn-ink); border-color: var(--warn-line); background: var(--warn-soft); }
 
+/* Provider-block health, from the last "test all": visible from every section.
+   busy = the sweep is running, ok = every block answered, err = at least one
+   failed (or the sweep could not run). */
+.health-badge {
+  font-family: inherit;
+  font-size: var(--fs-2xs); font-weight: 700; letter-spacing: .4px;
+  padding: 3px 7px; border-radius: var(--radius-pill);
+  border: 1px solid var(--line); background: var(--bg-1); color: var(--fg-2);
+  white-space: nowrap; cursor: pointer;
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.health-badge:hover { border-color: var(--line-strong); }
+.health-badge.ok { color: var(--ok-ink); border-color: var(--ok-line); background: var(--ok-soft); }
+.health-badge.err { color: var(--err-ink); border-color: var(--err-line); background: var(--err-soft); }
+.health-badge.busy { color: var(--warn-ink); border-color: var(--warn-line); background: var(--warn-soft); }
+
 .topbar-right { display: flex; align-items: center; gap: 8px; }
 .status-pill {
   display: flex; align-items: center; gap: 8px;
@@ -1277,6 +1293,16 @@ input.switch:checked::after { left: 19px; background: var(--accent); box-shadow:
 .memory-feed .memory-row.undone { opacity: .45; }
 .memory-feed .memory-row.undone .memory-text > span { text-decoration: line-through; }
 @keyframes memIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+
+/* ---- <provider-blocks>: one component for every block selector/manager ---- */
+/* The host is a custom element and takes its props as attributes, so there is
+   no class to target — style it by tag. Pickers (Engine, Vision, Voice,
+   Hearing, Memory, Thoughts) share .provider-block-row; manager rows keep the
+   three-column .block-fields grid. */
+provider-blocks { display: block; }
+.provider-block-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.provider-block-row select { flex: 1 1 220px; min-width: 0; }
+.provider-block-row .hint { margin: 0; }
 
 /* ---- Provider blocks (API Keys page) + Speaker ID (Voice page) ---- */
 .speakers-list { display: flex; flex-direction: column; gap: 6px; }

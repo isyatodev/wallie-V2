@@ -357,6 +357,13 @@ function app() {
     providers: [],
     providerCategories: ["llm", "vision", "tts", "stt", "memory", "thoughts"],
     providerBusy: false,      providerMsg: "",
+    // "test all" on the API Keys page: one sweep over every block, and the
+    // snapshot the top-bar health badge reads (null = never tested here).
+    testingAll: false,        providerTestSummary: "",
+    providerHealth: null,
+    // Per-picker "test" results, keyed by the cfg path the picker binds
+    // (cfg.llm.provider_ref, …) so two pickers on screen never share one.
+    pickerTestBusy: {},       pickerTestMsg: {},
     // Which collapsible groups on the API Keys page are open, keyed
     // "provider:<category>" / "secret:<kind>". Absent = the default.
     groupState: {},
@@ -730,6 +737,9 @@ function app() {
         if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
         const data = await r.json().catch(() => ({}));
         this.providers = this.providers.filter(x => x.id !== id);
+        // The sweep's snapshot named the blocks that existed then — a delete
+        // makes its counts a lie.
+        this.providerHealth = null;
         const refs = (data.cleared_refs?.length ? data.cleared_refs : (localRefs || []));
         if (refs.length) {
           this.providerMsg = `deleted — also cleared: ${refs.join(", ")}`;
@@ -765,8 +775,10 @@ function app() {
         this.providerMsg = refs.length ? `saved — also cleared: ${refs.join(", ")}` : "saved";
         await this.loadSecrets();   // new blocks immediately get their key field
         await this.loadConfig();    // re-sync cfg (dropdowns read block ids)
+        return true;
       } catch (e) {
         this.providerMsg = e.message || "fail";
+        return false;
       } finally {
         this.providerBusy = false;
         // Ref-cleanup notices need longer on screen than a plain "saved".
@@ -780,15 +792,173 @@ function app() {
       await this.providerSaveAll();
       this.providerBusy = true;
       try {
-        const r = await fetch(`/api/providers/${encodeURIComponent(p.id)}/test`, { method: "POST" });
-        const data = await r.json();
-        this.providerMsg = data.ok ? (data.preview ? `ok: ${data.preview}` : (data.note || "ok")) : (data.error || "fail");
+        const { text } = await this.providerProbe(p);
+        this.providerMsg = text;
       } catch (e) {
         this.providerMsg = e.message || "fail";
       } finally {
         this.providerBusy = false;
         setTimeout(() => this.providerMsg = "", 4000);
       }
+    },
+
+    async providerTestAll() {
+      // One click for the whole page: persist first (the server only probes
+      // blocks that are in the profile), then probe every block in parallel —
+      // sequentially, the run would cost the sum of every endpoint timeout.
+      const saved = await this.providerSaveAll();
+      if (!saved) {
+        this.providerHealth = { state: "error", at: Date.now(), total: 0, failed: [], error: "the blocks could not be saved" };
+        this._expireProviderTestMsg("✗ couldn't save the blocks — fix the error above first", 6000);
+        return;
+      }
+      const blocks = (this.providers || []).filter(p => p.id);
+      if (!blocks.length) {
+        this.providerHealth = null;
+        this._expireProviderTestMsg("no blocks to test — add one first", 3000);
+        return;
+      }
+      this.testingAll = true;
+      this.providerBusy = true;
+      this.providerHealth = { state: "testing", at: Date.now(), total: blocks.length, failed: [] };
+      this._expireProviderTestMsg(`testing ${blocks.length} block${blocks.length === 1 ? "" : "s"}…`, 0);
+      try {
+        const results = await Promise.all(blocks.map(async (p) => {
+          try {
+            return { block: p, ...(await this.providerProbe(p)) };
+          } catch (e) {
+            return { block: p, ok: false, text: e.message || "fail" };
+          }
+        }));
+        const failed = results.filter(r => !r.ok);
+        const okCount = results.length - failed.length;
+        // The failures are the actionable part: name the block and keep the
+        // server's reason, truncated so one 500-char HTML body can't swallow
+        // the summary.
+        const failedItems = failed.map(r => ({
+          name: r.block.name || r.block.id,
+          error: String(r.text || "fail").slice(0, 90),
+        }));
+        const detail = failedItems.map(f => `“${f.name}” (${f.error})`).join(" · ");
+        const head = failed.length
+          ? `${okCount} ok · ${failed.length} failed: ${detail}`
+          : `all ${okCount} block${okCount === 1 ? "" : "s"} ok`;
+        this.providerHealth = {
+          state: failed.length ? "failed" : "ok",
+          at: Date.now(), total: results.length, failed: failedItems,
+        };
+        this._expireProviderTestMsg(`${failed.length ? "✗ " : "✓ "}${head}`, failed.length ? 12000 : 4000);
+      } finally {
+        // The "testing…" line is pinned (ms=0) so it cannot time out mid-run;
+        // if something threw before the result was written, replace it here
+        // instead of leaving the page saying it is still testing forever.
+        if (String(this.providerTestSummary).startsWith("testing ")) {
+          this.providerHealth = { state: "error", at: Date.now(), total: 0, failed: [], error: "the sweep stopped early" };
+          this._expireProviderTestMsg("✗ the sweep stopped early — see the console", 6000);
+        }
+        this.testingAll = false;
+        this.providerBusy = false;
+      }
+    },
+
+    providerHealthBadge() {
+      // The badge is a snapshot of the last "test all", not a live probe — the
+      // title carries the time so a green pill is never read as "just checked".
+      const h = this.providerHealth;
+      if (!h) return { text: "", cls: "", title: "" };
+      const at = new Date(h.at).toLocaleTimeString();
+      const blocks = (n) => `${n} block${n === 1 ? "" : "s"}`;
+      if (h.state === "testing") {
+        return { text: `testing ${blocks(h.total)}…`, cls: "busy",
+          title: "Probing every provider block — this badge updates when the sweep finishes." };
+      }
+      if (h.state === "error") {
+        return { text: "✗ blocks unchecked", cls: "err",
+          title: `Last check failed: ${h.error || "unknown error"} (${at}). Click to open API Keys.` };
+      }
+      if (h.state === "ok") {
+        return { text: `✓ ${blocks(h.total)} ok`, cls: "ok",
+          title: `Last check ${at}: all ${blocks(h.total)} answered. Click to open API Keys.` };
+      }
+      const names = (h.failed || []).map(f => `“${f.name}” (${f.error})`).join(" · ");
+      return { text: `✗ ${h.failed.length} of ${h.total} failing`, cls: "err",
+        title: `Last check ${at}: ${names}. Click to fix in API Keys.` };
+    },
+
+    openProviderHealth() {
+      // The fix lives where the failures are listed: API Keys, above the blocks.
+      this.section = "secrets";
+    },
+
+    _expireProviderTestMsg(text, ms) {
+      // Failed blocks need time to be read. ms=0 pins the text until the next
+      // sweep replaces it (the "testing…" line).
+      this.providerTestSummary = text;
+      if (!ms) return;
+      setTimeout(() => {
+        if (this.providerTestSummary === text) this.providerTestSummary = "";
+      }, ms);
+    },
+
+    async providerProbe(p) {
+      // The one live probe shared by the manager rows and every picker's test
+      // button. The server tests the *saved* block (it reads the profile), so
+      // a caller holding unsaved edits has to save before asking.
+      const r = await fetch(`/api/providers/${encodeURIComponent(p.id)}/test`, { method: "POST" });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) return { ok: false, text: data.detail || data.error || `HTTP ${r.status}` };
+      const text = data.ok
+        ? (data.preview ? `ok: ${data.preview}` : (data.note || "ok"))
+        : (data.error || "fail");
+      return { ok: !!data.ok, text };
+    },
+
+    providerTestTarget(category, ref) {
+      // Same order as wallie._resolve_provider: the block named by the ref →
+      // the first block of the category → the block called "default" → none
+      // (the legacy per-subsystem fields take over, and there is nothing to
+      // probe). This is the block the subsystem would actually call.
+      const blocks = this.providers || [];
+      const wanted = String(ref || "").trim();
+      const hit = wanted ? blocks.find(p => p.id === wanted) : null;
+      return hit
+        || blocks.find(p => p.category === category)
+        || blocks.find(p => p.id === "default")
+        || null;
+    },
+
+    async providerTestPick(refPath, category, ref) {
+      // Picker "test": probe the resolved block without saving. Saving every
+      // block to check one endpoint would silently commit edits made on other
+      // pages — the manager row's save-first test stays the manager's job.
+      const block = this.providerTestTarget(category, ref);
+      if (!block) {
+        this._expirePickerTest(refPath, "no block to test — add one first", 3000);
+        return;
+      }
+      if (!block.id) {
+        this._expirePickerTest(refPath, "save the block first — the test probes the saved config", 4500);
+        return;
+      }
+      this.pickerTestBusy[refPath] = true;
+      this.pickerTestMsg[refPath] = "testing…";
+      try {
+        const { ok, text } = await this.providerProbe(block);
+        this._expirePickerTest(refPath, `${ok ? "✓" : "✗"} “${block.name || block.id}” ${text}`, 6000);
+      } catch (e) {
+        this._expirePickerTest(refPath, `✗ ${e.message || "fail"}`, 6000);
+      } finally {
+        this.pickerTestBusy[refPath] = false;
+      }
+    },
+
+    _expirePickerTest(refPath, text, ms) {
+      // Only clear if this is still the message on screen: a second test can
+      // finish before the first one's timer fires.
+      this.pickerTestMsg[refPath] = text;
+      setTimeout(() => {
+        if (this.pickerTestMsg[refPath] === text) delete this.pickerTestMsg[refPath];
+      }, ms);
     },
 
     staleRef(ref, category) {
@@ -1159,6 +1329,7 @@ function app() {
       await this.loadProfiles();
       await this.loadVoiceLibrary();   // saved voices are per profile
       await this.loadVoicePartners();  // ...and so is the voice partner
+      this.providerHealth = null;      // the badge described the previous profile's blocks
       this.notePartnerSync(data.partner_sync);
     },
 

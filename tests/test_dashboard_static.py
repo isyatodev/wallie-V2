@@ -138,6 +138,114 @@ def test_partner_badge_shortcut_points_at_a_real_handler_and_section():
 
 
 # ---------------------------------------------------------------------------
+# One provider-block component
+# ---------------------------------------------------------------------------
+
+def _provider_block_usages(html: str) -> list[dict[str, str]]:
+    return [dict(re.findall(r'([a-z-]+)="([^"]*)"', raw))
+            for raw in re.findall(r"<provider-blocks\b([^>]*)>", html)]
+
+
+def test_provider_blocks_render_from_one_component():
+    """Engine, Vision and API Keys must use the same <provider-blocks>.
+
+    Eight hand-rolled copies of the selector is how one of them silently
+    forgets to warn about a deleted block, or the manager's inline key editor
+    drifts from the picker's. These assertions pin the single component: the
+    markup exists once (templates in index.html), every call site names a real
+    mode and ref, and the API Keys manager is not a second implementation.
+    """
+    html = _read("index.html")
+    module = _read("provider-blocks.js")
+
+    # Loaded before app.js, so the elements are upgraded before Alpine boots.
+    assert '<script src="/static/provider-blocks.js"></script>' in html
+    assert html.index("/static/provider-blocks.js") < html.index("/static/app.js")
+
+    usages = _provider_block_usages(html)
+    assert usages, "<provider-blocks> disappeared from the markup"
+
+    pickers: dict[str, int] = {}
+    managers = 0
+    for attrs in usages:
+        assert attrs.get("mode") in ("picker", "manager"), attrs
+        if attrs["mode"] == "manager":
+            managers += 1
+            continue
+        assert attrs.get("label"), attrs
+        pickers[attrs.get("ref", "")] = pickers.get(attrs.get("ref", ""), 0) + 1
+        features = set((attrs.get("features") or "").split())
+        assert features <= {"key", "new"}, attrs
+        # The module only knows how to resolve the vision block's key itself.
+        if "key" in features:
+            assert attrs.get("category") == "vision" or attrs.get("key-block"), attrs
+
+    # One place per subsystem, and Vision is the one that exists twice
+    # (the Engine shortcut and the Vision section's own controls).
+    assert pickers == {
+        "cfg.llm.provider_ref": 1,
+        "cfg.llm.vision_provider_ref": 2,
+        "cfg.tts.provider_ref": 1,
+        "cfg.hearing.provider_ref": 1,
+        "cfg.memory.provider_ref": 1,
+        "cfg.random_thoughts.provider_ref": 1,
+    }
+    assert managers == 1, "the API Keys manager must be the same component"
+
+    # The category decides which blocks the picker lists — a mismatch would
+    # offer LLM blocks to the STT engine. stt is the one name that does not
+    # match its config section (Hearing), which is exactly why it is pinned.
+    expected_categories = {
+        "cfg.llm.provider_ref": "llm",
+        "cfg.llm.vision_provider_ref": "vision",
+        "cfg.tts.provider_ref": "tts",
+        "cfg.hearing.provider_ref": "stt",
+        "cfg.memory.provider_ref": "memory",
+        "cfg.random_thoughts.provider_ref": "thoughts",
+    }
+    for attrs in usages:
+        if attrs["mode"] != "picker":
+            continue
+        assert attrs.get("category") == expected_categories[attrs["ref"]], attrs
+
+    # No hand-rolled selector is left: every stale-ref warning in the markup
+    # comes from the picker template, and the ref selects are parameterized.
+    assert html.count("applySuggestedRef(") == 1
+    assert html.count("staleRef(") == 2      # the x-if guard + its message
+    assert not re.search(r'x-model="cfg\.[a-z_]+\.provider_ref"', html)
+    assert 'x-model="%%ref%%"' in html
+
+    # Templates the module clones, and the placeholders it must fill.
+    for tpl_id in ("tpl-provider-picker", "tpl-provider-manager", "tpl-provider-key"):
+        assert f'<template id="{tpl_id}">' in html, tpl_id
+        assert f'"{tpl_id}"' in module, tpl_id
+    assert 'customElements.define("provider-blocks", ProviderBlocks)' in module
+    assert "provider-key-slot" in module
+
+    # Template ids are getElementById targets: a duplicate silently shadows
+    # the real template (and leaves the stale copy's directives in the page,
+    # where Alpine tries to evaluate them).
+    ids = re.findall(r'<template id="([^"]+)">', html)
+    assert len(ids) == len(set(ids)), sorted({i for i in ids if ids.count(i) > 1})
+
+    # Placeholders belong to the templates only. A stray copy outside them is
+    # live markup: Alpine parses %%block%% as an expression and the component
+    # never renders it.
+    tpl_start = html.index("provider-blocks: one markup source")
+    tpl_end = html.index('<script src="/static/provider-blocks.js">')
+    assert "%%" not in html[:tpl_start], "a placeholder escaped into live markup"
+    assert "%%" not in html[tpl_end:], "a placeholder escaped past the templates"
+
+    used = set(re.findall(r"%%([A-Za-z]+)%%", html))
+    declared_block = re.search(r"PLACEHOLDERS = \[([^\]]+)\]", module)
+    assert declared_block, "the module no longer declares its placeholders"
+    declared = set(re.findall(r'"([A-Za-z]+)"', declared_block.group(1)))
+    assert used, "no placeholder found — did the templates change shape?"
+    assert used <= declared, sorted(used - declared)
+    assert used == declared, "a declared placeholder is no longer used"
+
+
+# ---------------------------------------------------------------------------
 # Asset cache policy
 # ---------------------------------------------------------------------------
 

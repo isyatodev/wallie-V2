@@ -872,7 +872,7 @@ Ground rules inherited from upstream:
 - **Code is English-only.** Comments, logs, variables — all English. UI can be localized.
 - **Single pipeline, single history.** Don't add parallel generation paths. That road has been walked.
 - **Lazy imports for optional deps.** Groq users shouldn't need `anthropic` installed.
-- Before submitting: run `python -m pytest tests/` (covers the config, provider-resolution and dashboard-route layers) and `node --check dashboard/static/app.js` — the dashboard has no build step, so that syntax check is the whole "compile".
+- Before submitting: run `python -m pytest tests/` (covers the config, provider-resolution and dashboard-route layers) and `node --check` on both `dashboard/static/app.js` and `dashboard/static/provider-blocks.js` (the `<provider-blocks>` selector/manager component) — the dashboard has no build step, so those syntax checks are the whole "compile".
 
 ---
 
