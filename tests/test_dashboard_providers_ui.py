@@ -21,6 +21,10 @@ def _js() -> str:
     return (STATIC / "app.js").read_text(encoding="utf-8")
 
 
+def _style() -> str:
+    return (STATIC / "style.css").read_text(encoding="utf-8")
+
+
 def _defines(js: str, name: str) -> bool:
     return bool(re.search(rf"\b{name}\s*\(", js))
 
@@ -213,8 +217,8 @@ def test_topbar_badge_reports_the_last_test_all():
 
     A green pill with no timestamp is a promise the dashboard cannot keep, so
     the title carries the time; and the badge starts hidden, so nobody reads
-    "all ok" before any block was ever probed. Clicking lands on the page that
-    fixes a red one.
+    "all ok" before any block was ever probed. Clicking opens the panel that
+    lists the failures.
     """
     html = _html()
     js = _js()
@@ -242,9 +246,11 @@ def test_topbar_badge_reports_the_last_test_all():
 
     click = re.search(r"openProviderHealth\(\) \{(.*?)\n    \},", js, re.S)
     assert click, "openProviderHealth not found in app.js"
-    target = re.search(r'this\.section = "([^"]+)"', click.group(1))
-    assert target, "the badge no longer navigates anywhere"
-    section_id = target.group(1)
+    assert "providerHealthOpen" in click.group(1), "the badge no longer opens the panel"
+    # The rows that fix a red one stay one click away, from inside the panel.
+    shortcut = re.search(r"@click=\"providerHealthOpen = false; section = '([^']+)'\"", html)
+    assert shortcut, "the panel lost its shortcut to the failing rows"
+    section_id = shortcut.group(1)
     assert f"section==='{section_id}'" in html
     assert f'id: "{section_id}"' in js       # reachable from the nav too
 
@@ -253,6 +259,123 @@ def test_topbar_badge_reports_the_last_test_all():
     assert switch and "providerHealth = null" in switch.group(1)
     delete = re.search(r"async providerDelete\(id, localRefs\) \{(.*?)\n    \},", js, re.S)
     assert delete and "providerHealth = null" in delete.group(1)
+
+
+def test_health_panel_lists_every_failure_and_retests_only_those():
+    """The badge's panel is the complete failure list + a targeted retest.
+
+    A red badge is only a count; the panel names every failing block with the
+    server's reason, and "retest N failed" re-probes exactly those ids — the
+    healthy blocks already answered and the broken endpoints are the slow
+    part. Saving stays first (the server probes the saved profile), and the
+    sweep must record ids or the retest has nothing to target.
+    """
+    html = _html()
+    js = _js()
+
+    # Panel: opens from the badge state, closed by backdrop click or ESC.
+    assert 'x-show="providerHealthOpen && providerHealth"' in html
+    assert '@click.self="providerHealthOpen = false"' in html
+    assert '@keydown.escape.window="providerHealthOpen = false"' in html
+    # The complete list — every failed entry, not a truncated preview.
+    assert '<template x-for="f in providerHealth.failed"' in html
+    assert '<strong x-text="f.name"></strong>' in html
+    assert '<small class="hint" x-text="f.error"></small>' in html
+    # The row is also the jump to the block it names.
+    assert '@click="openProviderBlock(f)"' in html
+    # The retest button: only there while failures exist, idle during a sweep.
+    assert '@click="providerRetestFailed()"' in html
+    assert ':disabled="providerBusy || testingAll"' in html
+
+    retest = re.search(r"async providerRetestFailed\(\) \{(.*?)\n    \},", js, re.S)
+    assert retest, "providerRetestFailed not found in app.js"
+    body = retest.group(1)
+    # Save-first with abort, exactly like the full sweep.
+    assert "providerSaveAll()" in body
+    assert "if (!saved)" in body
+    # Subset only: failed ids resolve to current blocks and nothing else.
+    assert "Promise.all" in body
+    assert "p.id === f.id" in body
+    assert "providerProbe(p)" in body
+    assert "if (!failed.length || this.testingAll) return" in body   # no double sweep
+    # The snapshot stays truthful: testing first, partial scope remembered.
+    assert 'state: "testing"' in body
+    assert "retested: targets.length" in body
+    # ids come from the full sweep — without them the retest can't aim.
+    sweep = re.search(r"async providerTestAll\(\) \{(.*?)\n    \},", js, re.S)
+    assert sweep, "providerTestAll not found in app.js"
+    assert "id: r.block.id" in sweep.group(1)
+
+
+def test_failure_row_jumps_to_that_block_row_in_api_keys():
+    """Clicking a failure in the panel lands on the block that produced it.
+
+    The category group must be opened first (a collapsed group is
+    display:none, so there is nothing to scroll to), and the scroll waits for
+    the reveal frame — measuring a still-hidden row goes nowhere, which is the
+    exact reason scrollToMirror exists.
+    """
+    html = _html()
+    js = _js()
+
+    jump = re.search(r"openProviderBlock\(f\) \{(.*?)\n    \},", js, re.S)
+    assert jump, "openProviderBlock not found in app.js"
+    body = jump.group(1)
+    assert "providerHealthOpen = false" in body     # panel closes
+    assert 'this.section = "secrets"' in body       # lands on API Keys
+    assert '["provider:" + p.category]' in body     # its category opens
+    assert "scrollToBlock(f.id)" in body
+    # A block deleted since the sweep says so instead of scrolling nowhere.
+    assert "no longer exists" in body
+
+    scroll = re.search(r"scrollToBlock\(id\) \{(.*?)\n    \},", js, re.S)
+    assert scroll, "scrollToBlock not found in app.js"
+    sb = scroll.group(1)
+    assert 'getElementById("block-row-" + id)' in sb
+    assert "scrollIntoView" in sb and '"center"' in sb
+    assert 'classList.add("row-focus")' in sb       # flash where it landed
+    assert "$nextTick" in sb and "requestAnimationFrame" in sb
+
+    # The anchor: manager rows carry an id the scroll can find.
+    assert ':id="p.id ? ' in html and "'block-row-'" in html
+    # The flash class has a rule (guard also checks this; assert the pairing).
+    assert ".secret-row.row-focus" in _style()
+
+
+def test_provider_health_survives_a_reload():
+    """The last sweep is kept in localStorage and comes back after F5.
+
+    Scoped per profile (a switch never bleeds into another profile), every
+    write captured by one watcher instead of eleven assignment sites, an
+    in-flight "testing" never persisted (a reload can't finish it), and a
+    cleared badge clears its own slot.
+    """
+    js = _js()
+
+    init = re.search(r"async init\(\) \{(.*?)\n    \},", js, re.S)
+    assert init, "init not found in app.js"
+    ib = init.group(1)
+    assert '$watch("providerHealth", (v) => this.persistProviderHealth(v))' in ib
+    assert "restoreProviderHealth()" in ib
+    # Restored only once the profile's providers are known.
+    assert ib.index("await this.loadProviders();") < ib.index("restoreProviderHealth()")
+
+    save = re.search(r"persistProviderHealth\(v\) \{(.*?)\n    \},", js, re.S)
+    assert save, "persistProviderHealth not found in app.js"
+    vb = save.group(1)
+    assert "localStorage.setItem" in vb
+    assert "JSON.parse" in vb                         # corrupt storage = no crash
+    assert "all[this.activeProfile] = v" in vb        # one slot per profile
+    assert 'state === "testing"' in vb               # not a result to restore
+    assert "delete all[" in vb                        # null clears the slot
+
+    restore = re.search(r"restoreProviderHealth\(\) \{(.*?)\n    \},", js, re.S)
+    assert restore, "restoreProviderHealth not found in app.js"
+    rb = restore.group(1)
+    assert "localStorage.getItem" in rb
+    assert 'includes(h.state)' in rb                  # only ok/failed/error come back
+    assert "Array.isArray(h.failed)" in rb
+    assert "this.providerHealth = h" in rb
 
 
 # ---------------------------------------------------------------------------

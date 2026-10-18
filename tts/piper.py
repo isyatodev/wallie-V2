@@ -2,10 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from .base import TTSError, TTSProvider
+
+
+def _params(fn: Any) -> set[str]:
+    try:
+        return set(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):   # builtins / C callables
+        return set()
 
 
 class PiperTTS(TTSProvider):
@@ -59,37 +67,79 @@ class PiperTTS(TTSProvider):
     def _synthesize_blocking(self, text: str) -> list[bytes]:
         out: list[bytes] = []
         try:
-            iterator = self._voice.synthesize(
-                text,
-                length_scale=self._length_scale,
-                noise_scale=self._noise_scale,
-                noise_w=self._noise_w,
-            )
-            for chunk in iterator:
-                buf: Any = getattr(chunk, "audio_int16_bytes", None)
-                if buf is None:
-                    if isinstance(chunk, (bytes, bytearray)):
-                        buf = bytes(chunk)
-                    else:
-                        arr = getattr(chunk, "audio_float_array", None)
-                        if arr is not None:
-                            import numpy as np
-                            buf = (arr * 32767).astype(np.int16).tobytes()
+            for chunk in self._start_synthesis(text):
+                buf = self._pcm(chunk)
                 if buf:
-                    out.append(bytes(buf))
+                    out.append(buf)
             return out
-        except (AttributeError, TypeError):
-            pass
-        # Legacy fallback.
-        try:
-            for chunk in self._voice.synthesize_stream_raw(
-                text, length_scale=self._length_scale
-            ):
-                if chunk:
-                    out.append(bytes(chunk))
+        except TTSError:
+            raise
         except Exception as e:
             raise TTSError(f"piper: synthesis failed: {e}") from e
-        return out
+
+    # -- piper-tts API dispatch --------------------------------------------
+    # piper-tts 1.3+ (piper1-gpl) moved tuning into a SynthesisConfig and
+    # dropped `synthesize_stream_raw`; 1.2.x still has the kwargs/stream API.
+    # Inspect the installed build instead of calling both blind: the old
+    # TypeError-then-retry chain hid the real failure and then blamed the
+    # missing legacy method — "'PiperVoice' object has no attribute
+    # 'synthesize_stream_raw'" on every synthesis with piper-tts >= 1.3.
+    def _start_synthesis(self, text: str) -> Any:
+        synthesize = getattr(self._voice, "synthesize", None)
+        if synthesize is not None and "syn_config" in _params(synthesize):
+            return synthesize(text, self._synthesis_config())
+        legacy = getattr(self._voice, "synthesize_stream_raw", None)
+        if legacy is not None:
+            return legacy(text, **self._knobs_for(legacy))
+        if synthesize is None:
+            raise TTSError("piper: this piper-tts build exposes no synthesize()")
+        # Unknown layout: pass only the tuning kwargs it accepts, loudly.
+        return synthesize(text, **self._knobs_for(synthesize))
+
+    def _knobs_for(self, fn: Any) -> dict[str, Any]:
+        """The tuning knobs `fn` actually accepts — 1.8 renamed `noise_w`
+        to `noise_w_scale`, so filter by real parameter names."""
+        params = _params(fn)
+        knobs: dict[str, Any] = {}
+        if "length_scale" in params:
+            knobs["length_scale"] = self._length_scale
+        if "noise_scale" in params:
+            knobs["noise_scale"] = self._noise_scale
+        if "noise_w_scale" in params:
+            knobs["noise_w_scale"] = self._noise_w
+        elif "noise_w" in params:
+            knobs["noise_w"] = self._noise_w
+        return knobs
+
+    def _synthesis_config(self) -> Any:
+        try:
+            from piper.config import SynthesisConfig
+        except ImportError as e:
+            raise TTSError(
+                "piper: this piper-tts wants a syn_config but piper.config "
+                "could not be imported"
+            ) from e
+        return SynthesisConfig(**self._knobs_for(SynthesisConfig))
+
+    @staticmethod
+    def _pcm(chunk: Any) -> bytes:
+        """Little-endian int16 mono PCM from one chunk, whatever shape the
+        installed piper-tts hands back (raw bytes, AudioChunk, float array)."""
+        if isinstance(chunk, (bytes, bytearray)):
+            return bytes(chunk)
+        buf = getattr(chunk, "audio_int16_bytes", None)
+        if callable(buf):
+            buf = buf()
+        if isinstance(buf, (bytes, bytearray)) and buf:
+            return bytes(buf)
+        arr = getattr(chunk, "audio_float_array", None)
+        if arr is None:
+            return b""
+        import numpy as np
+        a = np.asarray(arr, dtype=np.float32)
+        if a.size == 0:
+            return b""
+        return (np.clip(a, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
     async def aclose(self) -> None:
         self._voice = None  # type: ignore

@@ -111,6 +111,11 @@ async def test_stop_without_start_is_safe():
 @pytest.mark.asyncio
 async def test_reconnect_backoff_values(monkeypatch):
     """The reconnect loop uses exponential backoff with a cap, not a tight loop."""
+    # The real loop sleeps backoff * (0.5 + random()). Two consecutive draws
+    # are NOT guaranteed to grow (P(next <= prev) ~= 6%), so freeze the jitter
+    # to its midpoint and assert the exact exponential schedule instead.
+    import random as _random
+    monkeypatch.setattr(_random, "random", lambda: 0.5)
     m = _RecordingMonitor(socket_token="tok")
     seen: list[float] = []
 
@@ -137,4 +142,5 @@ async def test_reconnect_backoff_values(monkeypatch):
     # Either it finished (stop was set inside fake_sleep) or it was cut by the
     # outer timeout — either way backoff delays must have grown, not spun.
     assert len(seen) >= 2
+    assert seen[:2] == [1.0, 2.0]   # 1s then 2s, jitter frozen at *1.0
     assert seen[1] > seen[0]

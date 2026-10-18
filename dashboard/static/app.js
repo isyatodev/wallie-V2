@@ -361,6 +361,7 @@ function app() {
     // snapshot the top-bar health badge reads (null = never tested here).
     testingAll: false,        providerTestSummary: "",
     providerHealth: null,
+    providerHealthOpen: false,   // the badge's failure-list panel
     // Per-picker "test" results, keyed by the cfg path the picker binds
     // (cfg.llm.provider_ref, …) so two pickers on screen never share one.
     pickerTestBusy: {},       pickerTestMsg: {},
@@ -423,6 +424,8 @@ function app() {
     wizard: { open: false, step: 1, path: "", busy: false, pickedKokoro: false, keyDrafts: {}, keyMsg: {}, keyBusy: {} },
 
     async init() {
+      // Whatever the badge last said is what a reload should come back to.
+      this.$watch("providerHealth", (v) => this.persistProviderHealth(v));
       await this.loadProfiles();
       await this.loadConfig();
       this.loadAudioDevices(); // so the Output-device dropdown shows the saved pick
@@ -431,6 +434,7 @@ function app() {
       await this.refreshStatus();
       await this.loadSecrets();
       await this.loadProviders();
+      this.restoreProviderHealth(); // the badge survives a reload (localStorage)
       await this.loadSpeakers();
       await this.loadLtm();
       await this.loadVoiceLibrary();
@@ -836,6 +840,7 @@ function app() {
         // server's reason, truncated so one 500-char HTML body can't swallow
         // the summary.
         const failedItems = failed.map(r => ({
+          id: r.block.id,   // ids are what the panel's "retest failed" targets
           name: r.block.name || r.block.id,
           error: String(r.text || "fail").slice(0, 90),
         }));
@@ -861,6 +866,74 @@ function app() {
       }
     },
 
+    async providerRetestFailed() {
+      // Re-probe only the blocks that failed: after fixing a key, the healthy
+      // ones already answered and the broken endpoints are the slow part.
+      const health = this.providerHealth;
+      const failed = (health && health.failed) || [];
+      if (!failed.length || this.testingAll) return;
+      // Same contract as the full sweep: the server probes the SAVED profile,
+      // so persist what is on screen first and abort if that fails.
+      const saved = await this.providerSaveAll();
+      if (!saved) {
+        this._expireProviderTestMsg("✗ couldn't save the blocks — fix the error above first", 6000);
+        return;
+      }
+      // Blocks deleted since the sweep simply drop out of the retest.
+      const targets = failed
+        .map(f => (this.providers || []).find(p => p.id === f.id))
+        .filter(p => p && p.id);
+      if (!targets.length) {
+        this.providerHealth = { state: "ok", at: Date.now(), total: health.total || 0, failed: [] };
+        this._expireProviderTestMsg("✓ the failing blocks no longer exist", 4000);
+        return;
+      }
+      this.testingAll = true;
+      this.providerBusy = true;
+      // Keep the failed list on screen while it runs — the panel's button must
+      // not vanish mid-retest — and report the subset as the one being probed.
+      this.providerHealth = { state: "testing", at: Date.now(), total: targets.length, failed };
+      this._expireProviderTestMsg(
+        `retesting ${targets.length} failed block${targets.length === 1 ? "" : "s"}…`, 0);
+      try {
+        const results = await Promise.all(targets.map(async (p) => {
+          try {
+            return { block: p, ...(await this.providerProbe(p)) };
+          } catch (e) {
+            return { block: p, ok: false, text: e.message || "fail" };
+          }
+        }));
+        const still = results.filter(r => !r.ok);
+        const okCount = results.length - still.length;
+        const items = still.map(r => ({
+          id: r.block.id,
+          name: r.block.name || r.block.id,
+          error: String(r.text || "fail").slice(0, 90),
+        }));
+        const detail = items.map(f => `“${f.name}” (${f.error})`).join(" · ");
+        const head = still.length
+          ? `${okCount} ok · ${still.length} still failing: ${detail}`
+          : `${targets.length} of ${targets.length} retested · all clear`;
+        // total stays the whole page: the untouched blocks keep their result,
+        // and `retested` lets the badge title say the sweep was partial.
+        this.providerHealth = {
+          state: still.length ? "failed" : "ok",
+          at: Date.now(), total: health.total || targets.length,
+          failed: items, retested: targets.length,
+        };
+        this._expireProviderTestMsg(`${still.length ? "✗ " : "✓ "}${head}`, still.length ? 12000 : 4000);
+      } finally {
+        // Same guard as the full sweep: a pinned "retesting …" line replaced
+        // here instead of being left on screen forever.
+        if (String(this.providerTestSummary).startsWith("retesting ")) {
+          this.providerHealth = { state: "error", at: Date.now(), total: 0, failed: [], error: "the retest stopped early" };
+          this._expireProviderTestMsg("✗ the retest stopped early — see the console", 6000);
+        }
+        this.testingAll = false;
+        this.providerBusy = false;
+      }
+    },
+
     providerHealthBadge() {
       // The badge is a snapshot of the last "test all", not a live probe — the
       // title carries the time so a green pill is never read as "just checked".
@@ -874,20 +947,94 @@ function app() {
       }
       if (h.state === "error") {
         return { text: "✗ blocks unchecked", cls: "err",
-          title: `Last check failed: ${h.error || "unknown error"} (${at}). Click to open API Keys.` };
+          title: `Last check failed: ${h.error || "unknown error"} (${at}). Click for details.` };
       }
       if (h.state === "ok") {
+        const note = h.retested
+          ? ` ${h.retested} retested since the sweep; the rest kept their last result.`
+          : "";
         return { text: `✓ ${blocks(h.total)} ok`, cls: "ok",
-          title: `Last check ${at}: all ${blocks(h.total)} answered. Click to open API Keys.` };
+          title: `Last check ${at}: all ${blocks(h.total)} answered.${note} Click for details.` };
       }
       const names = (h.failed || []).map(f => `“${f.name}” (${f.error})`).join(" · ");
       return { text: `✗ ${h.failed.length} of ${h.total} failing`, cls: "err",
-        title: `Last check ${at}: ${names}. Click to fix in API Keys.` };
+        title: `Last check ${at}: ${names}. Click for the full list.` };
     },
 
     openProviderHealth() {
-      // The fix lives where the failures are listed: API Keys, above the blocks.
+      // The badge opens the failure list in place; "fix in API Keys" inside
+      // the panel is the jump to the rows that repair a red one.
+      this.providerHealthOpen = !this.providerHealthOpen;
+    },
+
+    openProviderBlock(f) {
+      // A failure row IS the shortcut: close the panel and land on that block's
+      // own row. The category group must be opened first or the row is
+      // display:none and there is nothing to scroll to.
+      this.providerHealthOpen = false;
+      const p = (this.providers || []).find(x => x.id === f.id);
+      if (!p) {
+        this.providerMsg = `“${f.name}” no longer exists — it was deleted`;
+        setTimeout(() => { if (String(this.providerMsg).startsWith(`“${f.name}”`)) this.providerMsg = ""; }, 5000);
+        this.section = "secrets";
+        return;
+      }
       this.section = "secrets";
+      this.groupState = { ...this.groupState, ["provider:" + p.category]: true };
+      this.scrollToBlock(f.id);
+    },
+
+    // Same reason as scrollToMirror: the section and the group are only
+    // revealed a frame AFTER the state flips, so scrolling right away would
+    // measure a still-hidden row. Timer fallback for a backgrounded tab.
+    scrollToBlock(id) {
+      const go = () => {
+        const el = document.getElementById("block-row-" + id);
+        if (el && el.getBoundingClientRect().height > 0) {
+          el.scrollIntoView({ block: "center" });
+          el.classList.add("row-focus");           // flash where it landed
+          clearTimeout(el._focusTmr);
+          el._focusTmr = setTimeout(() => el.classList.remove("row-focus"), 1800);
+        }
+      };
+      this.$nextTick(() => requestAnimationFrame(() => requestAnimationFrame(go)));
+      setTimeout(go, 300);
+    },
+
+    // localStorage: one slot per profile, try/catch like the setup wizard —
+    // storage-disabled browsers must not break the dashboard.
+    persistProviderHealth(v) {
+      try {
+        const KEY = "wallie.provider_health.v1";
+        const all = JSON.parse(localStorage.getItem(KEY) || "{}");
+        if (v) {
+          // An in-flight sweep is not a result: keep whatever was there.
+          if (v.state === "testing") return;
+          all[this.activeProfile] = v;
+          this._healthProfile = this.activeProfile;
+        } else {
+          // A cleared badge clears the slot it was saved under.
+          delete all[this._healthProfile !== undefined ? this._healthProfile : this.activeProfile];
+        }
+        localStorage.setItem(KEY, JSON.stringify(all));
+      } catch {}
+    },
+
+    restoreProviderHealth() {
+      // Only real results come back: a restored "testing" would claim a sweep
+      // that can never finish, and a malformed entry is worse than no badge.
+      try {
+        const KEY = "wallie.provider_health.v1";
+        const all = JSON.parse(localStorage.getItem(KEY) || "{}");
+        const h = all[this.activeProfile];
+        if (!h || typeof h !== "object" || typeof h.at !== "number") return;
+        if (!["ok", "failed", "error"].includes(h.state)) return;
+        if (typeof h.total !== "number") return;
+        if (!Array.isArray(h.failed)) h.failed = [];
+        if (h.state === "failed" && !h.failed.length) return;
+        this._healthProfile = this.activeProfile;
+        this.providerHealth = h;
+      } catch {}
     },
 
     _expireProviderTestMsg(text, ms) {

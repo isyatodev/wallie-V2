@@ -76,11 +76,59 @@
       </select>
     </div>
     <!-- Last "test all" snapshot. Green means every block answered at that
-         moment; clicking opens the page that fixes a red one. Hidden until the
-         first sweep, so it never claims a health nobody checked. -->
+         moment; clicking opens the panel below — every failing block with the
+         server's reason, plus a retest for just those. Hidden until the first
+         sweep, so it never claims a health nobody checked. -->
     <button type="button" class="health-badge" x-show="providerHealth" x-cloak
             :class="providerHealthBadge().cls" :title="providerHealthBadge().title"
             @click="openProviderHealth()" x-text="providerHealthBadge().text"></button>
+    <div class="modal-backdrop" x-show="providerHealthOpen && providerHealth" style="display:none"
+         @click.self="providerHealthOpen = false"
+         @keydown.escape.window="providerHealthOpen = false">
+      <div class="modal" style="max-width:660px" @click.stop>
+        <div class="modal-title">
+          <span>Provider blocks — last test</span>
+          <button type="button" class="mini-btn" @click="providerHealthOpen = false">close</button>
+        </div>
+        <template x-if="providerHealth && providerHealth.state === 'testing'">
+          <p class="muted modal-lead"
+             x-text="'Testing ' + providerHealth.total + ' block' + (providerHealth.total === 1 ? '' : 's') + '…'"></p>
+        </template>
+        <template x-if="providerHealth && providerHealth.state === 'error'">
+          <p class="muted modal-lead"
+             x-text="'The sweep did not run: ' + (providerHealth.error || 'unknown error')"></p>
+        </template>
+        <template x-if="providerHealth && providerHealth.state === 'ok'">
+          <p class="muted modal-lead"
+             x-text="'✓ ' + providerHealth.total + ' block' + (providerHealth.total === 1 ? '' : 's') + ' answered at ' + new Date(providerHealth.at).toLocaleTimeString()"></p>
+        </template>
+        <template x-if="providerHealth && providerHealth.failed && providerHealth.failed.length">
+          <div>
+            <p class="muted modal-lead" x-show="providerHealth.state === 'failed'"
+               x-text="'✗ ' + providerHealth.failed.length + ' of ' + providerHealth.total + ' failing — checked at ' + new Date(providerHealth.at).toLocaleTimeString()"></p>
+            <div class="health-failures" style="max-height:46vh;overflow-y:auto">                <template x-for="f in providerHealth.failed" :key="f.id || f.name">
+                  <!-- The row itself jumps to the block: name + reason are the
+                       whole click target, cursor/hover live in the CSS. -->
+                  <button type="button" class="health-failure" @click="openProviderBlock(f)"
+                          :title="'Open “' + f.name + '” in API Keys'">
+                    <strong x-text="f.name"></strong>
+                    <small class="hint" x-text="f.error"></small>
+                  </button>
+                </template>
+            </div>
+          </div>
+        </template>
+        <div style="display:flex;justify-content:space-between;gap:.6rem;margin-top:.8rem">
+          <button type="button" class="mini-btn"
+                  @click="providerHealthOpen = false; section = 'secrets'">fix in API Keys</button>
+          <template x-if="providerHealth && providerHealth.failed && providerHealth.failed.length">
+            <button type="button" class="mini-btn" :disabled="providerBusy || testingAll"
+                    @click="providerRetestFailed()"
+                    x-text="testingAll ? 'testing…' : 'retest ' + providerHealth.failed.length + ' failed'"></button>
+          </template>
+        </div>
+      </div>
+    </div>
     <div class="status-pill" :class="running ? 'on' : 'off'">
       <span class="dot"></span>
       <span x-text="running ? 'LIVE' : 'IDLE'"></span>
@@ -3029,7 +3077,7 @@
             <div class="cat-body" x-show="groupOpen('provider', cat)">
               <div class="secrets-list">
                 <template x-for="(p, i) in providerBlocks(cat)" :key="p._localKey || (p.id || 'new') + '-' + i">
-                  <div class="secret-row">
+                  <div class="secret-row" :id="p.id ? 'block-row-' + p.id : null">
                     <div class="secret-label">
                       <input x-model="p.name" placeholder="name (e.g. Main LLM)" />
                       <small class="hint" x-text="p.id ? 'key: ' + providerKeyEnv(p) : 'key assigned on save'"></small>
