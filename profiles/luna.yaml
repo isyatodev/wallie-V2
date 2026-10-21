@@ -1,7 +1,12 @@
 profile_name: luna
 dashboard_theme: cyan
 voice_partner: ''
-providers: []
+providers:
+- id: unorouter
+  name: UnoRouter
+  category: llm
+  base_url: https://api.unorouter.com/v1
+  model: gemini-3.6-flash:free
 speaker_id:
   enabled: false
   threshold: 0.68
@@ -66,8 +71,8 @@ persona:
   enable_callbacks: true
   initiates: false
 llm:
-  provider: groq
-  model: llama-3.3-70b-versatile
+  provider: gemini
+  model: gemini-3.8-flash
   temperature: 0.85
   top_p: 0.95
   max_tokens: 350
@@ -79,7 +84,7 @@ llm:
   ollama_keep_alive: 5m
   openai_compatible_base_url: ''
   openai_compatible_timeout: 25.0
-  provider_ref: ''
+  provider_ref: unorouter
   vision_provider: main
   vision_provider_ref: ''
   vision_model: ''
@@ -87,8 +92,8 @@ llm:
   vision_openai_compatible_timeout: 30.0
   vision_max_tokens: 200
 tts:
-  provider: piper
-  voice_id: ''
+  provider: fish
+  voice_id: 1d76aed89caa49e28d9c7ff6d35a9f3c
   sample_rate: 16000
   output_device: Alto-falantes (VB-Audio Virtual Cable)
   el_model_id: eleven_turbo_v2_5
@@ -305,7 +310,7 @@ captions:
   show_avatar_name: false
 memory:
   enabled: true
-  extractor: openai_compatible
+  extractor: main
   provider_ref: ''
   openai_compatible_base_url: ''
   model: ''

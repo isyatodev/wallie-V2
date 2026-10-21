@@ -717,6 +717,17 @@ class CaptionsConfig(BaseModel):
     show_avatar_name: bool = False      # prefix lines with the persona name
 
 
+class TrainingNotifyConfig(BaseModel):
+    """How a finished Piper training run announces itself.
+
+    The run happens in a detached process, so the dashboard may be closed when
+    it ends — the settings travel with the run (train-config.json) and only the
+    Discord URL stays in .env (TRAIN_DISCORD_WEBHOOK).
+    """
+    windows: bool = True       # Windows toast / tray balloon on this machine
+    discord: bool = False      # message to the Discord webhook, when set
+
+
 class AppConfig(BaseModel):
     profile_name: str = "default"
     # Dashboard accent theme: "cyan" | "amber" | "rose". Stored per profile so
@@ -766,6 +777,7 @@ class AppConfig(BaseModel):
     captions: CaptionsConfig = Field(default_factory=CaptionsConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     random_thoughts: RandomThoughtsConfig = Field(default_factory=RandomThoughtsConfig)
+    training_notify: TrainingNotifyConfig = Field(default_factory=TrainingNotifyConfig)
 
 
 # -------------------------------------------------------------------

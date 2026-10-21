@@ -1214,6 +1214,217 @@
         <small class="hint" x-show="voiceLabCloneMsg" x-text="voiceLabCloneMsg" style="flex-basis:100%;"></small>
       </div>
 
+      <h3 class="subhead" style="margin-top:26px;">Convert to a local engine</h3>
+      <p class="hint" style="margin:4px 0 10px;">
+        A cloned voice's <b>.json</b> (the <b>⤓</b> above) carries its name and id — not the model:
+        Fish and ElevenLabs never hand the weights over, and Piper/Kokoro cannot learn a voice from
+        an id. What crosses the border is <b>audio</b>: this makes that voice read a fixed corpus and
+        packages the takes for <b>Piper</b> or <b>Kokoro</b>. Nothing is trained here — build the
+        model from the package, then <b>attach</b> it and it becomes a saved local voice.
+      </p>
+      <div class="test-strip">
+        <label class="btn tiny ghost" :class="{ 'is-disabled': !!voiceLabBusy }"
+               title="read a voice .json — a Wallie backup, a Fish model dump or an ElevenLabs voice dump">
+          ⤒ voice .json
+          <input type="file" accept=".json,application/json" @change="portPickFile($event)"
+                 :disabled="!!voiceLabBusy" style="display:none;" />
+        </label>
+        <select x-model="voicePort.savedName" @change="portPickSaved()" :disabled="!!voiceLabBusy">
+          <option value="">— or a saved voice of this profile —</option>
+          <template x-for="p in portLibrary()" :key="'port-lib-' + p.name">
+            <option :value="p.name" x-text="p.name + ' · ' + p.provider"></option>
+          </template>
+        </select>
+        <small class="hint" x-text="voicePort.filename"></small>
+        <small class="hint" x-show="voicePort.msg" x-text="voicePort.msg" style="flex-basis:100%;"></small>
+      </div>
+
+      <div class="speakers-list voice-lab" x-show="voicePort.sources.length">
+        <template x-for="(s, i) in voicePort.sources" :key="'port-src-' + i">
+          <div class="speaker-row" :class="{ picked: voicePort.picked === i }">
+            <input type="radio" name="port-source" :checked="voicePort.picked === i"
+                   @change="voicePort.picked = i" :disabled="!s.supported"
+                   :title="s.supported ? 'convert this voice' : s.reason" />
+            <span x-text="s.name"></span>
+            <small class="hint" x-text="(s.provider || '?') + (s.voice_id ? ' : ' + s.voice_id : '')"></small>
+            <small class="hint err" x-show="!s.supported" x-text="s.reason"></small>
+            <small class="hint hint-ok" x-show="s.supported" x-text="s.notes"></small>
+          </div>
+        </template>
+      </div>
+
+      <div class="test-strip" x-show="voicePort.sources.length">
+        <select x-model="voicePort.target">
+          <template x-for="t in voicePort.targets" :key="'port-t-' + t.id">
+            <option :value="t.id" x-text="t.label + (t.installed ? '' : ' — not installed yet')"></option>
+          </template>
+        </select>
+        <select x-model="voicePort.lang">
+          <template x-for="l in voicePort.languages" :key="'port-l-' + l.id">
+            <option :value="l.id" x-text="'corpus: ' + l.label + ' (' + l.lines + ' lines)'"></option>
+          </template>
+        </select>
+        <input type="number" :min="voicePort.minMinutes" :max="voicePort.maxMinutes" step="1"
+               x-model.number="voicePort.minutes"
+               title="minutes of speech to capture — the provider bills every one of them" />
+        <button class="btn tiny primary" @click="portConvert()"
+                :disabled="!!voiceLabBusy || !portSource()"
+                x-text="voiceLabBusy === 'port' ? 'capturing…' : '↻ convert'"></button>
+        <small class="hint" style="flex-basis:100%;" x-text="portTargetHint()"></small>
+      </div>
+
+      <div class="port-report" x-show="voicePort.report">
+        <template x-if="voicePort.report">
+          <div>
+            <div class="test-strip">
+              <b x-text="voicePort.report.name + ' → ' + voicePort.report.target"></b>
+              <small class="hint" x-text="voicePort.report.clips + ' clips · ' + voicePort.report.seconds + 's · ' + voicePort.report.sample_rate + ' Hz'"></small>
+              <audio controls preload="none" :src="voicePort.report.audition.url"></audio>
+            </div>
+            <small class="hint" x-text="voicePort.report.next"></small>
+            <small class="hint" x-text="'package: ' + voicePort.report.package"></small>
+            <small class="hint" x-text="voicePort.report.files.join(' · ')"></small>
+          </div>
+        </template>
+      </div>
+
+      <div class="test-strip" x-show="voicePort.report">
+        <label class="btn tiny ghost" :class="{ 'is-disabled': !!voiceLabBusy }"
+               title="the model you built from this package — Piper: .onnx + .onnx.json · Kokoro: .pt">
+          ⤒ attach model
+          <input type="file" multiple accept=".onnx,.json,.pt" @change="portAttachFiles($event)"
+                 :disabled="!!voiceLabBusy" style="display:none;" />
+        </label>
+        <input x-model="voicePort.attachName" placeholder="engine name (pt_BR-luna-medium / pf_luna)" />
+        <button class="btn tiny primary" @click="portAttach()"
+                :disabled="!!voiceLabBusy || !voicePort.attach.length"
+                x-text="voicePort.attach.length ? 'attach (' + voicePort.attach.length + ' files)' : 'attach'"></button>
+        <small class="hint" style="flex-basis:100%;" x-text="voicePort.attachMsg"></small>
+      </div>
+
+      <h3 class="subhead" style="margin-top:26px;">Train the Piper voice</h3>
+      <p class="hint" style="margin:4px 0 10px;">
+        The last mile, without a terminal: the dashboard runs the Piper trainer on a ported
+        package's <code>dataset/</code> and streams its output here — you can watch the epochs,
+        read the log and <b>stop</b> the run at any time. Needs <code>piper-tts[train]</code>
+        (torch + lightning) in the interpreter below; a separate venv is best if this Python does
+        other work. A <b>.ckpt</b> checkpoint fine-tunes far better than training from scratch.
+        When the run finishes, <b>attach</b> installs the <code>.onnx</code> as a saved voice.
+      </p>
+      <div class="test-strip">
+        <select x-model="voiceTrain.package" @change="trainPickPackage()"
+                :disabled="!!voiceTrain.busy || (voiceTrain.job && voiceTrain.job.running)">
+          <option value="">— pick a Piper package —</option>
+          <template x-for="p in voiceTrain.packages" :key="'tr-pkg-' + p.package">
+            <option :value="p.package"
+                    x-text="p.name + ' · ' + p.clips + ' clips · ' + p.seconds + 's · ' + p.lang"></option>
+          </template>
+        </select>
+        <button class="btn tiny ghost" @click="loadVoiceTrain()" :disabled="!!voiceTrain.busy">probe</button>
+        <small class="hint" x-show="!voiceTrain.packages.length" style="flex-basis:100%;">
+          No Piper package yet — convert a cloned voice to <b>Piper</b> above; its dataset is what gets trained.
+        </small>
+        <small class="hint" x-show="voiceTrain.msg" x-text="voiceTrain.msg" style="flex-basis:100%;"></small>
+      </div>
+
+      <div class="train-env">
+        <span :class="voiceTrain.env && voiceTrain.env.can_train ? 'ok' : 'miss'"
+              x-text="trainEnvLine()"></span>
+        <button class="btn tiny" x-show="voiceTrain.env && !voiceTrain.env.can_train"
+                @click="trainSetup()"
+                :disabled="!!voiceTrain.busy || (voiceTrain.job && voiceTrain.job.running)"
+                x-text="voiceTrain.job && voiceTrain.job.kind==='setup' && voiceTrain.job.running ? 'installing…' : 'install train deps'"></button>
+        <button class="btn tiny danger" x-show="voiceTrain.job && voiceTrain.job.running"
+                @click="cancelVoiceTrain()">■ stop</button>
+      </div>
+
+      <div class="train-env" x-show="voiceTrain.resume && !(voiceTrain.job && voiceTrain.job.running)">
+        <span class="hint">
+          ↻ this package has a run that stopped at epoch
+          <b x-text="voiceTrain.resume ? voiceTrain.resume.epoch : 0"></b>
+          of <b x-text="voiceTrain.resume ? voiceTrain.resume.epochs : 0"></b> — the checkpoints are still there.
+        </span>
+        <button class="btn tiny primary" @click="trainResume()" :disabled="!!voiceTrain.busy"
+                x-text="'↻ resume from epoch ' + (voiceTrain.resume ? voiceTrain.resume.epoch : 0)"></button>
+      </div>
+
+      <div class="test-strip" x-show="voiceTrain.package">
+        <input x-model="voiceTrain.voiceName" placeholder="pt_BR-luna-medium"
+               title="the engine name — Piper's loader wants <lang_REGION>-<voice>-<quality>" />
+        <input type="number" min="1" max="5000" step="10" x-model.number="voiceTrain.epochs"
+               title="epochs — more is better, slower; 200 is a sane first run" style="width:92px;" />
+        <input type="number" min="1" max="64" x-model.number="voiceTrain.batchSize"
+               title="batch size — lower it if memory runs out" style="width:78px;" />
+        <select x-model="voiceTrain.accelerator" title="CPU is slower but works everywhere">
+          <option value="auto">auto</option>
+          <option value="cpu">cpu</option>
+          <option value="gpu">gpu</option>
+        </select>
+        <label class="btn tiny ghost" title="interpreter + optional checkpoint">
+          ⚙ options
+          <input type="checkbox" x-model="voiceTrain.advanced" style="display:none;" />
+        </label>
+        <button class="btn tiny primary" @click="trainVoice()"
+                :disabled="!!voiceTrain.busy || (voiceTrain.job && voiceTrain.job.running) || !(voiceTrain.env && voiceTrain.env.can_train)"
+                x-text="voiceTrain.busy === 'start' ? 'starting…' : '🚂 train'"></button>
+        <small class="hint" style="flex-basis:100%;"
+               x-text="'name: ' + (voiceTrain.voiceName || '—') + ' · ' + voiceTrain.epochs + ' epochs · batch ' + voiceTrain.batchSize + ' · ' + voiceTrain.accelerator"></small>
+      </div>
+
+      <div class="train-env">
+        <label class="hint" title="a toast pops up on this machine even with the dashboard closed">
+          <input type="checkbox" x-model="cfg.training_notify.windows" @change="save()" />
+          notify me on Windows when the run ends
+        </label>
+        <label class="hint" title="posts the same message to your Discord webhook">
+          <input type="checkbox" x-model="cfg.training_notify.discord" @change="save()" />
+          also message Discord
+        </label>
+        <button class="btn tiny ghost"
+                x-show="cfg.training_notify.discord && !trainWebhookSet()"
+                @click="section = 'secrets'">set the webhook</button>
+        <small class="hint" x-show="trainNotifyLine()" x-text="trainNotifyLine()"></small>
+      </div>
+
+      <div class="test-strip" x-show="voiceTrain.advanced && voiceTrain.package">
+        <input x-model="voiceTrain.python" placeholder="training python (blank = this dashboard's)"
+               title="path to a python.exe/venv that has piper-tts[train]" @change="loadVoiceTrain()" />
+        <input x-model="voiceTrain.checkpoint" placeholder="optional .ckpt to fine-tune from"
+               title="a Piper training checkpoint, not the inference .onnx" />
+        <small class="hint" style="flex-basis:100%;">
+          A separate venv keeps torch out of the dashboard's Python; a checkpoint makes a short
+          dataset sound like a voice instead of noise.
+        </small>
+      </div>
+
+      <div class="dl-progress" x-show="voiceTrain.job && voiceTrain.job.running">
+        <div class="dl-bar"><span :style="'width:' + ((voiceTrain.job && voiceTrain.job.progress) || 0) + '%'"></span></div>
+        <small class="hint" x-text="trainStatusLine()"></small>
+      </div>
+      <pre class="ih-log train-log" x-show="voiceTrain.job && voiceTrain.job.log"
+           x-ref="trainlog" x-text="voiceTrain.job ? voiceTrain.job.log : ''"></pre>
+      <div class="train-env" x-show="voiceTrain.job && voiceTrain.job.log">
+        <label class="hint" title="keep the newest line in view">
+          <input type="checkbox" x-model="voiceTrain.follow" @change="_scrollTrainLog()" /> follow the log
+        </label>
+        <small class="hint" x-show="voiceTrain.job && !voiceTrain.job.running"
+               x-text="trainStatusLine()"></small>
+        <small class="hint" x-show="voiceTrain.job && voiceTrain.job.running && voiceTrain.job.pid"
+               x-text="'runs in its own process (pid ' + (voiceTrain.job ? (voiceTrain.job.pid || '') : '') + ') — closing the dashboard does not stop it'"></small>
+      </div>
+
+      <div class="port-report" x-show="!!trainResult().onnx">
+        <b x-text="'✓ trained · ' + ((voiceTrain.lastRun && voiceTrain.lastRun.voice_name) || '')"></b>
+        <small class="hint" x-text="'model: ' + trainResult().onnx"></small>
+        <small class="hint" x-text="'config: ' + trainResult().config"></small>
+        <div class="test-strip">
+          <button class="btn tiny primary" @click="trainAttach()"
+                  :disabled="!!voiceTrain.busy || !(voiceTrain.lastRun && voiceTrain.lastRun.attachable)"
+                  x-text="voiceTrain.lastRun && voiceTrain.lastRun.attachable ? '＋ attach as a local voice' : 'run did not finish'"></button>
+          <small class="hint" x-text="voiceTrain.attachMsg"></small>
+        </div>
+      </div>
+
       <h3 class="subhead" style="margin-top:26px;">A/B — compare two voices</h3>
       <p class="hint" style="margin:4px 0 10px;">
         Reads the <b>same line</b> with two voices so you can hear which one actually fits. The clips come
@@ -2575,7 +2786,7 @@
 
       <provider-blocks mode="manager"></provider-blocks>
 
-      <template x-for="kind in ['llm','tts','stt','stream']" :key="'sg-' + kind">
+      <template x-for="kind in ['llm','tts','stt','stream','notify']" :key="'sg-' + kind">
         <div class="cat-group">
           <button type="button" class="cat-head" :class="{ open: groupOpen('secret', kind) }"
                   @click="toggleGroup('secret', kind)">
@@ -2602,10 +2813,11 @@
                       <button class="btn tiny" @click="startEditSecret(s.env)">
                         <span x-text="s.is_set ? 'edit' : 'add'"></span>
                       </button>
-                      <button class="btn tiny" x-show="s.is_set && (kind==='llm' || kind==='tts' || s.dynamic)"
+                      <button class="btn tiny" x-show="s.is_set && (kind==='llm' || kind==='tts' || kind==='notify' || s.dynamic)"
                         @click="testProviderKey(envToProvider(s.env), s.env)"
-                        :disabled="secretBusy[s.env]">
-                        <span x-show="!secretBusy[s.env]">test</span>
+                        :disabled="!!secretBusy[s.env]"
+                        :title="kind==='notify' ? 'post a sample message to this webhook' : 'probe this key with a tiny request'">
+                        <span x-show="!secretBusy[s.env]" x-text="kind==='notify' ? 'send test' : 'test'"></span>
                         <span x-show="secretBusy[s.env]">…</span>
                       </button>
                     </div>

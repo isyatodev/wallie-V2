@@ -1144,7 +1144,10 @@ input.switch:checked::after { left: 19px; background: var(--accent); box-shadow:
   outline: none;
 }
 .secret-edit input::placeholder { color: var(--fg-3); opacity: 1; }
-.secret-msg { font-size: var(--fs-sm); color: var(--fg-2); font-family: var(--mono); }
+.secret-msg {
+  font-size: var(--fs-sm); color: var(--fg-2); font-family: var(--mono);
+  overflow-wrap: anywhere;       /* a rejection can be a long sentence + a URL */
+}
 @media (max-width: 720px) {
   .secret-row { grid-template-columns: 1fr; }
 }
@@ -1386,6 +1389,30 @@ provider-blocks { display: block; }
 .ab-card .ab-body { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; width: 100%; }
 .ab-card .hint.err { color: var(--err-ink); overflow-wrap: anywhere; }
 @media (max-width: 900px) { .ab-grid { grid-template-columns: 1fr; } }
+
+/* Voice port — the package a conversion produced: a card, not a row, because
+   it is read (path, counts, the next step) rather than clicked. */
+.port-report {
+  margin-top: 12px; display: flex; flex-direction: column; gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+  box-shadow: inset 0 1px 0 var(--sheen);
+}
+.port-report .hint { max-width: 100%; overflow-wrap: anywhere; margin: 0; }
+.port-report audio { width: 100%; height: 34px; }
+
+/* Piper training — environment line, progress and the live log. The log is the
+   star (hours of output), so it gets its own bounded scroll area. */
+.train-env {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 6px 0; font-size: var(--fs-sm); color: var(--fg-2);
+}
+.train-env .ok { color: var(--ok-ink); }
+.train-env .miss { color: var(--warn-ink); overflow-wrap: anywhere; }
+.train-env .hint { margin: 0; display: inline-flex; align-items: center; gap: 5px; }
+.train-log { max-height: 240px; }
 
 /* Voice Lab rows carry more metadata (provider:id, source, notes) than the
    speaker rows they reuse — wrap rather than overflow, and ellipsize notes. */

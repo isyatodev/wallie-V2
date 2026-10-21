@@ -162,6 +162,8 @@ function emptyCfg() {
     random_thoughts: { enabled: false, schedule: "fixed", interval_sec: 180.0, min_interval_sec: 90.0, max_interval_sec: 420.0, jitter: 0.35, style: "mix", generator: "main", openai_compatible_base_url: "", model: "", timeout: 12.0, seed_topics: [], seed_topics_text: "", memory_callback_chance: 0.35, memory_callback_kinds: ["long_term", "short_term"], provider_ref: "", only_when_quiet_sec: 20.0 },
     donations: { livepix_enabled: false, livepix_webhook_path: "/webhooks/livepix", livepix_enrich: true, livepix_verify_user_id: true, streamlabs_enabled: false, streamlabs_url: "https://sockets.streamlabs.com", streamlabs_reconnect_max_sec: 60.0, donation_reply_probability: 1.0, donation_cooldown_sec: 0.0 },
     topics: { mode: "ai_picks", topics: [], switch_min_sec: 90, switch_chance: 0.15 },
+    // How a detached Piper run announces its end (the webhook stays in .env).
+    training_notify: { windows: true, discord: false },
     orchestrator: {
       segment_target_sec: 12,
       dedupe_window: 8,
@@ -310,6 +312,25 @@ function app() {
     voiceLabSaveName: "",
     voiceLabRecordSeconds: 8,
     voiceLabRecording: false,
+    // Voice port — a cloned cloud voice carried over to a local engine. The
+    // .json only holds the id, so the port captures audio and packages it.
+    voicePort: {
+      targets: [], languages: [], minMinutes: 1, maxMinutes: 12,
+      target: "piper", lang: "pt", minutes: 3,
+      sources: [], picked: -1, savedName: "", filename: "",
+      report: null, attach: [], attachName: "", msg: "", attachMsg: "",
+    },
+    // Piper training — the dataset a port produced becomes a local voice. The
+    // job is polled while it runs; the run's own run.json keeps the exported
+    // model attachable even after a dashboard restart.
+    voiceTrain: {
+      env: null, packages: [], package: "", voiceName: "", epochs: 200,
+      batchSize: 8, accelerator: "auto", python: "", checkpoint: "",
+      advanced: false, busy: "", msg: "", attachMsg: "", follow: true,
+      job: null, lastRun: null, resume: null, resumeFrom: "",
+      defaultsLoaded: false, _nameFor: "",
+    },
+    _voiceTrainPoll: null,
     // Copy the whole saved-voice library (incl. local Piper/Kokoro voices) to
     // another profile so a character's voices travel with it.
     voiceExport: { target: "", msg: "" },
@@ -438,7 +459,12 @@ function app() {
       await this.loadSpeakers();
       await this.loadLtm();
       await this.loadVoiceLibrary();
+      await this.loadVoicePort();
       await this.loadLocalVoices();
+      // Training is heavy: only resume polling when a run is still alive.
+      this.loadVoiceTrain().then(d => {
+        if (d && d.job && d.job.running) this._pollVoiceTrain();
+      });
       // Kokoro badge: probe now, and keep polling if an install is mid-flight.
       this.loadKokoroStatus().then(s => { if (s && s.running) this._pollKokoroInstall(); });
       // Piper badge: same treatment (install + voice downloads share one job).
@@ -702,6 +728,7 @@ function app() {
       return {
         llm: "LLM providers", tts: "TTS providers",
         stt: "STT providers", stream: "Stream platforms",
+        notify: "Notifications",
       }[kind] || kind;
     },
 
@@ -1323,7 +1350,20 @@ function app() {
     async testProviderKey(provider, env) {
       this.secretBusy[env] = true;
       this.secretMsg[env] = "testing…";
+      // A failed test is the interesting case — Discord's rejection is a whole
+      // sentence, so leave it on screen long enough to actually read it.
+      let hold = 4000;
       try {
+        // The training webhook is not a provider: test it with a sample message.
+        if (env === "TRAIN_DISCORD_WEBHOOK") {
+          hold = 15000;
+          const r = await fetch("/api/voices/port/train/notify/test", { method: "POST" });
+          const data = await r.json().catch(() => ({}));
+          this.secretMsg[env] = data.ok
+            ? `✓ ${data.note || "sent"}`
+            : `✗ ${data.error || `HTTP ${r.status}`}`;
+          return;
+        }
         // Dynamic provider blocks get their own live probe.
         if (env && env.startsWith("PROVIDER_")) {
           const pid = env.removeprefix("PROVIDER_").removesuffix("_API_KEY").toLowerCase();
@@ -1344,7 +1384,7 @@ function app() {
         this.secretMsg[env] = `✗ ${e}`;
       } finally {
         this.secretBusy[env] = false;
-        setTimeout(() => { delete this.secretMsg[env]; }, 4000);
+        setTimeout(() => { delete this.secretMsg[env]; }, hold);
       }
     },
 
@@ -1474,7 +1514,9 @@ function app() {
       const data = await r.json().catch(() => ({}));
       await this.loadConfig();
       await this.loadProfiles();
-      await this.loadVoiceLibrary();   // saved voices are per profile
+      await this.loadVoiceLibrary();
+      await this.loadVoicePort();   // saved voices are per profile
+      await this.loadVoiceTrain();     // …and so are the ported packages
       await this.loadVoicePartners();  // ...and so is the voice partner
       this.providerHealth = null;      // the badge described the previous profile's blocks
       this.notePartnerSync(data.partner_sync);
@@ -3157,6 +3199,529 @@ function app() {
         this.voiceLabCloneMsg = "✗ " + e;
       } finally {
         this.voiceLabBusy = "";
+      }
+    },
+
+    // ----- Voice port — cloned cloud voice → a local Piper/Kokoro package -----
+    // Loaded once: the engine list, corpus languages and the capture limits.
+    // The saved voices come from the library already on hand, so the two can
+    // never disagree about what exists.
+    async loadVoicePort() {
+      try {
+        const r = await fetch("/api/voices/port");
+        if (!r.ok) return;
+        const d = await r.json();
+        this.voicePort.targets = d.targets || [];
+        this.voicePort.languages = d.languages || [];
+        this.voicePort.minMinutes = d.min_minutes || 1;
+        this.voicePort.maxMinutes = d.max_minutes || 12;
+        if (!this.voicePort.targets.some(t => t.id === this.voicePort.target)) {
+          this.voicePort.target = (this.voicePort.targets[0] || {}).id || "piper";
+        }
+        if (!this.voicePort.languages.some(l => l.id === this.voicePort.lang)) {
+          this.voicePort.lang = d.default_lang || "pt";
+        }
+      } catch {}
+    },
+
+    // Only voices the cloud can actually speak with: a piper/kokoro preset is
+    // already local, and a preset without a voice id has nothing to speak.
+    portLibrary() {
+      return this.voiceLab.presets.filter(p =>
+        ["fish", "elevenlabs"].includes((p.provider || "").toLowerCase())
+        && (p.voice_id || "").trim());
+    },
+
+    portSource() {
+      return this.voicePort.sources[this.voicePort.picked] || null;
+    },
+
+    // What the chosen engine will produce — and the name its loader demands,
+    // which is the one thing a trained model gets wrong.
+    portTargetHint() {
+      const t = this.voicePort.targets.find(x => x.id === this.voicePort.target);
+      if (!t) return "";
+      const src = this.portSource();
+      const who = src ? `“${src.name}”` : "pick a voice above";
+      return `${who} → ${t.produces} · attach name like ${t.name_hint}`;
+    },
+
+    async portPickFile(event) {
+      const file = (event.target.files || [])[0];
+      event.target.value = "";            // the same file can be re-picked
+      if (!file) return;
+      this.voicePort.filename = file.name;
+      this.voicePort.savedName = "";
+      this.voicePort.msg = `reading ${file.name}…`;
+      try {
+        await this._portInspect({ content: await file.text() });
+      } catch (e) {
+        this.voicePort.msg = "✗ could not read " + file.name + ": " + e;
+      }
+    },
+
+    async portPickSaved() {
+      const name = (this.voicePort.savedName || "").trim();
+      if (!name) return;
+      this.voicePort.filename = "";
+      await this._portInspect({ name });
+    },
+
+    // Reads the .json on the server (the format owner) and lists the voices in
+    // it, with the reason any of them cannot be ported.
+    async _portInspect(body) {
+      this.voicePort.sources = [];
+      this.voicePort.picked = -1;
+      this.voicePort.report = null;
+      this.voicePort.attach = [];
+      this.voicePort.attachMsg = "";
+      try {
+        const r = await fetch("/api/voices/port/inspect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voicePort.msg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        this.voicePort.sources = d.sources || [];
+        // Default to a voice that can actually be ported, so the panel opens on
+        // a plan that works instead of a red row.
+        this.voicePort.picked = this.voicePort.sources.findIndex(s => s.supported);
+        const n = this.voicePort.sources.length;
+        this.voicePort.msg = n === 1
+          ? `found “${this.voicePort.sources[0].name}” — pick an engine and convert`
+          : `${n} voices in that file — pick one`;
+      } catch (e) {
+        this.voicePort.msg = "✗ " + e;
+      }
+    },
+
+    async portConvert() {
+      const src = this.portSource();
+      if (this.voiceLabBusy || !src) return;
+      if (!src.supported) {
+        this.voicePort.msg = "✗ " + src.reason;
+        return;
+      }
+      const minutes = Math.max(this.voicePort.minMinutes,
+        Math.min(this.voicePort.maxMinutes, Number(this.voicePort.minutes) || 1));
+      // Capturing speaks with the user's paid account — ask before spending it.
+      const ok = confirm(
+        `Convert “${src.name}” to ${this.voicePort.target}?\n\n`
+        + `This SPEAKS with your ${src.provider} voice: about ${minutes} minute(s) of `
+        + "audio, billed by the provider. Only the audio crosses over — the model "
+        + "itself has to be built from the package.");
+      if (!ok) return;
+      this.voiceLabBusy = "port";
+      this.voicePort.msg =
+        `capturing ~${minutes} min with “${src.name}” — one clip per corpus line…`;
+      try {
+        const r = await fetch("/api/voices/port", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            provider: src.provider,
+            voice_id: src.voice_id,
+            target: this.voicePort.target,
+            name: src.name,
+            minutes,
+            lang: this.voicePort.lang,
+          }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voicePort.msg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        this.voicePort.report = d;
+        this.voicePort.attachName = d.attach_name || "";
+        this.voicePort.attach = [];
+        this.voicePort.attachMsg = "";
+        this.voicePort.msg = `✓ ${d.clips} clips · ${d.seconds}s packaged for ${d.target}`;
+        // A fresh Piper package is immediately trainable — select it so the
+        // Train panel does not need a manual refresh after the conversion.
+        if (d.target === "piper" && d.package) {
+          this.voiceTrain.package = d.package;
+          this.voiceTrain.voiceName = d.attach_name || this.voiceTrain.voiceName;
+          this.voiceTrain._nameFor = d.package;
+          this.loadVoiceTrain();
+        }
+      } catch (e) {
+        this.voicePort.msg = "✗ " + e;
+      } finally {
+        this.voiceLabBusy = "";
+      }
+    },
+
+    // The .onnx/.pt is read here and posted as base64: the dashboard has no
+    // multipart parser, and the server owns the engine naming rules.
+    async portAttachFiles(event) {
+      const files = Array.from(event.target.files || []);
+      event.target.value = "";
+      this.voicePort.attach = [];
+      this.voicePort.attachMsg = "";
+      for (const f of files) {
+        if (f.size > 40 * 1024 * 1024) {
+          this.voicePort.attachMsg = `✗ ${f.name} is larger than 40 MB`;
+          continue;
+        }
+        try {
+          this.voicePort.attach.push({ filename: f.name, data: await this._readBase64(f) });
+        } catch (e) {
+          this.voicePort.attachMsg = "✗ " + e;
+        }
+      }
+      // Guess the engine name from what was picked, so a correctly named model
+      // needs no typing at all.
+      const onnx = this.voicePort.attach.find(f => /\.onnx$/i.test(f.filename));
+      const pack = this.voicePort.attach.find(f => /\.pt$/i.test(f.filename));
+      if (onnx) this.voicePort.attachName = onnx.filename.replace(/\.onnx$/i, "");
+      else if (pack) this.voicePort.attachName = pack.filename.replace(/\.pt$/i, "");
+      if (this.voicePort.attach.length && !this.voicePort.attachMsg) {
+        this.voicePort.attachMsg =
+          `${this.voicePort.attach.length} file(s) ready — press attach`;
+      }
+    },
+
+    async portAttach() {
+      if (this.voiceLabBusy || !this.voicePort.attach.length) return;
+      const src = this.portSource();
+      this.voiceLabBusy = "attach";
+      this.voicePort.attachMsg = "installing the model…";
+      try {
+        const r = await fetch("/api/voices/port/attach", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            target: this.voicePort.target,
+            name: (this.voicePort.attachName || "").trim(),
+            display_name: src ? src.name : "",
+            source_provider: src ? src.provider : "",
+            files: this.voicePort.attach,
+          }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voicePort.attachMsg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        this.voicePort.attachMsg = `✓ “${d.name}” installed · ${d.path}`;
+        this.voicePort.attach = [];
+        this.voiceLab.presets = d.presets || this.voiceLab.presets;
+        this._pruneVoicePick();
+        this.loadLocalVoices();        // the Voice page's per-engine pickers
+      } catch (e) {
+        this.voicePort.attachMsg = "✗ " + e;
+      } finally {
+        this.voiceLabBusy = "";
+      }
+    },
+
+    // ----- Piper training — the last mile of the port -----
+    // The server owns the recipe and the child process; this side only asks
+    // for the job's snapshot (progress + log tail) and renders it.
+    async loadVoiceTrain() {
+      try {
+        const qs = new URLSearchParams();
+        if ((this.voiceTrain.package || "").trim()) qs.set("package", this.voiceTrain.package.trim());
+        if ((this.voiceTrain.python || "").trim()) qs.set("python", this.voiceTrain.python.trim());
+        const r = await fetch("/api/voices/port/train" + (qs.toString() ? "?" + qs : ""));
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceTrain.msg = "✗ " + this._apiError(d, r.status);
+          return null;
+        }
+        this.voiceTrain.env = d.env || null;
+        this.voiceTrain.packages = d.packages || [];
+        this.voiceTrain.job = d.job || null;
+        if (d.defaults && !this.voiceTrain.defaultsLoaded) {
+          this.voiceTrain.epochs = d.defaults.epochs;
+          this.voiceTrain.batchSize = d.defaults.batch_size;
+          this.voiceTrain.accelerator = d.defaults.accelerator;
+          this.voiceTrain.defaultsLoaded = true;
+        }
+        const sel = d.selected || null;
+        if (sel) {
+          this.voiceTrain.package = sel.package;
+          // Only adopt the suggested name when the user has not typed one.
+          if (this.voiceTrain._nameFor !== sel.package || !(this.voiceTrain.voiceName || "").trim()) {
+            this.voiceTrain.voiceName = sel.voice_name;
+            this.voiceTrain._nameFor = sel.package;
+          }
+          this.voiceTrain.lastRun = sel.last_run || null;
+          this.voiceTrain.resume = sel.resume || null;
+        } else {
+          this.voiceTrain.lastRun = null;
+          this.voiceTrain.resume = null;
+        }
+        this._scrollTrainLog();
+        return d;
+      } catch (e) {
+        this.voiceTrain.msg = "✗ " + e;
+        return null;
+      }
+    },
+
+    trainSelected() {
+      return this.voiceTrain.packages.find(p => p.package === this.voiceTrain.package) || null;
+    },
+
+    trainPickPackage() {
+      const pkg = this.trainSelected();
+      this.voiceTrain.msg = "";
+      this.voiceTrain.attachMsg = "";
+      if (pkg) {
+        this.voiceTrain.voiceName = pkg.voice_name;
+        this.voiceTrain._nameFor = pkg.package;
+        this.voiceTrain.lastRun = pkg.last_run || null;
+        this.voiceTrain.resume = pkg.resume || null;
+        this._scrollTrainLog();
+      } else {
+        this.voiceTrain.lastRun = null;
+        this.voiceTrain.resume = null;
+      }
+      this.loadVoiceTrain();
+    },
+
+    trainEnvLine() {
+      const e = this.voiceTrain.env;
+      if (!e) return "probing the training interpreter…";
+      if (e.can_train) {
+        return `✓ ${e.flavor_label} · python ${e.version} · torch + lightning`;
+      }
+      return "✗ " + (e.hint || "no trainer found");
+    },
+
+    trainStatusLine() {
+      const j = this.voiceTrain.job;
+      if (!j) return "";
+      if (!j.running) {
+        if (j.error) return "✗ " + j.error;
+        if (j.status === "cancelled") return "■ cancelled";
+        return "";
+      }
+      const bits = [j.phase_label || "working…", Math.round(j.progress || 0) + "%"];
+      if (j.epochs) bits.push(`epoch ${j.epoch}/${j.epochs}`);
+      const elapsed = this.trainElapsed();
+      if (elapsed) bits.push(elapsed);
+      return bits.join(" · ");
+    },
+
+    // The supervisor announces the end of a run by itself; this only reports
+    // what it managed to do, next to the finished run.
+    trainNotifyLine() {
+      const n = (this.voiceTrain.job && this.voiceTrain.job.notified) || {};
+      const bits = [];
+      if (n.windows) bits.push(n.windows === "shown" ? "notified on Windows" : "Windows: " + n.windows);
+      if (n.discord) bits.push(n.discord === "sent" ? "Discord message sent" : "Discord: " + n.discord);
+      return bits.length ? "🔔 " + bits.join(" · ") : "";
+    },
+
+    trainWebhookSet() {
+      const row = this.secretRow("TRAIN_DISCORD_WEBHOOK");
+      return !!(row && row.is_set);
+    },
+
+    trainElapsed() {
+      const j = this.voiceTrain.job;
+      if (!j || !j.started_at) return "";
+      const end = j.finished_at || (Date.now() / 1000);
+      const total = Math.max(0, Math.round(end - j.started_at));
+      const m = Math.floor(total / 60);
+      return m ? `${m}m ${total % 60}s` : `${total}s`;
+    },
+
+    trainResult() {
+      const run = this.voiceTrain.lastRun;
+      const ex = (run && run.exported) || {};
+      return { onnx: ex.onnx || "", config: ex.config || "", run };
+    },
+
+    _scrollTrainLog() {
+      this.$nextTick(() => {
+        const el = this.$refs.trainlog;
+        if (el && this.voiceTrain.follow) el.scrollTop = el.scrollHeight;
+      });
+    },
+
+    _pollVoiceTrain() {
+      if (this._voiceTrainPoll) clearInterval(this._voiceTrainPoll);
+      this._voiceTrainPoll = setInterval(async () => {
+        const d = await this.loadVoiceTrain();
+        if (!d || !d.job || !d.job.running) {
+          clearInterval(this._voiceTrainPoll);
+          this._voiceTrainPoll = null;
+          this.voiceTrain.busy = "";
+          // "stopping…" describes a run that no longer exists.
+          if (this.voiceTrain.msg === "stopping…") this.voiceTrain.msg = "";
+          // The supervisor writes the terminal status, then announces it — a
+          // single late read is what shows "notified on Windows / Discord sent"
+          // (and the attach card) without the user pressing probe.
+          setTimeout(() => this.loadVoiceTrain(), 2500);
+        }
+      }, 1500);
+    },
+
+    // Continue a stopped run from its checkpoint: the epochs that already
+    // finished are not thrown away, and Lightning resumes the optimizer too.
+    trainResume() {
+      const r = this.voiceTrain.resume;
+      if (!r || this.voiceTrain.busy) return;
+      this.voiceTrain.resumeFrom = r.run_dir;
+      if (r.voice_name) {
+        this.voiceTrain.voiceName = r.voice_name;
+        this.voiceTrain._nameFor = this.voiceTrain.package;
+      }
+      // Never ask for fewer epochs than the stopped run was aiming at.
+      this.voiceTrain.epochs = Math.max(
+        Number(this.voiceTrain.epochs) || 0,
+        Number(r.epochs) || 0,
+        (Number(r.epoch) || 0) + 1,
+      );
+      this.trainVoice(true);
+    },
+
+    async trainVoice(resuming = false) {
+      const job = this.voiceTrain.job;
+      if (this.voiceTrain.busy || (job && job.running)) return;
+      const pkg = this.trainSelected();
+      if (!pkg) {
+        this.voiceTrain.msg = "✗ pick a package first — convert a voice to Piper above";
+        return;
+      }
+      const resumeFrom = resuming ? (this.voiceTrain.resumeFrom || "") : "";
+      const name = (this.voiceTrain.voiceName || "").trim();
+      const ok = confirm(
+        (resumeFrom
+          ? `Resume training “${name}” from its last checkpoint?\n\n`
+            + `It continues to epoch ${this.voiceTrain.epochs} instead of starting over.\n\n`
+          : `Train “${name}” from ${pkg.clips} clips (${pkg.seconds}s)?\n\n`)
+        + `${this.voiceTrain.epochs} epochs · batch ${this.voiceTrain.batchSize} · `
+        + `${this.voiceTrain.accelerator}\n\n`
+        + "This is real CPU/GPU work (minutes, sometimes much longer) — it runs in the "
+        + "background and you can stop it any time. Close games/heavy apps if the "
+        + "machine feels slow.");
+      if (!ok) return;
+      this.voiceTrain.busy = "start";
+      this.voiceTrain.msg = "starting the trainer…";
+      try {
+        const r = await fetch("/api/voices/port/train", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            package: pkg.package,
+            voice_name: name,
+            epochs: this.voiceTrain.epochs,
+            batch_size: this.voiceTrain.batchSize,
+            accelerator: this.voiceTrain.accelerator,
+            python: (this.voiceTrain.python || "").trim(),
+            checkpoint: (this.voiceTrain.checkpoint || "").trim(),
+            resume_from: resumeFrom,
+          }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceTrain.msg = "✗ " + this._apiError(d, r.status);
+          this.voiceTrain.busy = "";
+          return;
+        }
+        this.voiceTrain.job = d.job || null;
+        this.voiceTrain.msg = "";
+        this.voiceTrain.resumeFrom = "";   // one-shot: later runs start fresh
+        this._pollVoiceTrain();
+      } catch (e) {
+        this.voiceTrain.msg = "✗ " + e;
+        this.voiceTrain.busy = "";
+      }
+    },
+
+    async cancelVoiceTrain() {
+      if (!this.voiceTrain.job || !this.voiceTrain.job.running) return;
+      if (!confirm("Stop the training run?\n\nThe process is terminated; a partial "
+        + "checkpoint stays in the run folder, but no .onnx is exported.")) return;
+      this.voiceTrain.busy = "cancel";
+      try {
+        const r = await fetch("/api/voices/port/train/cancel", { method: "POST" });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceTrain.msg = "✗ " + this._apiError(d, r.status);
+          this.voiceTrain.busy = "";
+          return;
+        }
+        this.voiceTrain.job = d.job || this.voiceTrain.job;
+        this.voiceTrain.msg = "stopping…";
+      } catch (e) {
+        this.voiceTrain.msg = "✗ " + e;
+        this.voiceTrain.busy = "";
+      }
+    },
+
+    async trainSetup() {
+      const job = this.voiceTrain.job;
+      if (this.voiceTrain.busy || (job && job.running)) return;
+      const env = this.voiceTrain.env || {};
+      const ok = confirm(
+        `Install the Piper trainer into\n${env.python || "this interpreter"}?\n\n`
+        + `${env.setup_command || "python -m pip install --upgrade \"piper-tts[train]\""}\n\n`
+        + "This downloads torch + lightning (a few GB) and can take a while. "
+        + "The log shows the progress; stop is available.");
+      if (!ok) return;
+      this.voiceTrain.busy = "setup";
+      this.voiceTrain.msg = "";
+      try {
+        const r = await fetch("/api/voices/port/train/setup", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ python: (this.voiceTrain.python || "").trim() }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceTrain.msg = "✗ " + this._apiError(d, r.status);
+          this.voiceTrain.busy = "";
+          return;
+        }
+        this.voiceTrain.job = d.job || null;
+        this._pollVoiceTrain();
+      } catch (e) {
+        this.voiceTrain.msg = "✗ " + e;
+        this.voiceTrain.busy = "";
+      }
+    },
+
+    async trainAttach() {
+      const pkg = this.trainSelected();
+      const run = this.voiceTrain.lastRun;
+      if (this.voiceTrain.busy || !pkg || !run || !run.attachable) return;
+      this.voiceTrain.busy = "attach";
+      this.voiceTrain.attachMsg = "installing the trained voice…";
+      try {
+        const r = await fetch("/api/voices/port/train/attach", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            package: pkg.package,
+            run_dir: run.run_dir,
+            name: run.voice_name || "",
+            display_name: pkg.name,
+          }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceTrain.attachMsg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        this.voiceTrain.attachMsg = `✓ “${d.name}” installed · ${d.path}`;
+        this.voiceLab.presets = d.presets || this.voiceLab.presets;
+        this._pruneVoicePick();
+        this.loadLocalVoices();        // the Voice page's per-engine pickers
+        await this.loadVoiceTrain();
+      } catch (e) {
+        this.voiceTrain.attachMsg = "✗ " + e;
+      } finally {
+        this.voiceTrain.busy = "";
       }
     },
 

@@ -170,6 +170,11 @@ SECRET_FIELDS: dict[str, dict[str, str]] = {
         "url": "https://streamlabs.com/dashboard#/settings/api-settings",
         "hint": "API Settings → API Tokens → Socket API Token (simplest)",
     },
+    "TRAIN_DISCORD_WEBHOOK": {
+        "label": "Discord webhook (training)", "kind": "notify",
+        "url": "https://support.discord.com/hc/en-us/articles/228383668",
+        "hint": "server settings → integrations → webhooks → copy URL; a finished/failed training run posts here",
+    },
 }
 
 

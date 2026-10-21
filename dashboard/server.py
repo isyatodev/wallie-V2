@@ -41,7 +41,7 @@ from config import (
 )
 from core import Orchestrator, Persona
 from llm import build_provider
-from tts import build_tts
+from tts import build_tts, piper_train
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -236,6 +236,10 @@ class DashboardState:
             "returncode": None,
             "log": "",
         }
+        # Piper training job (Voice Lab). One at a time: training saturates the
+        # CPU/GPU. Its run.json on disk keeps a finished voice attachable even
+        # after the dashboard restarts.
+        self.voice_train: dict[str, Any] = piper_train.new_job()
 
     def emit_memory_event(self, payload: dict[str, Any]) -> None:
         """Sink for MemoryCapture.on_captured — pushes each AI-captured fact
@@ -477,6 +481,73 @@ class VoicePartnerBody(BaseModel):
     it. This only stores the choice; nothing is copied by setting it."""
 
     partner: str = ""
+
+
+class VoicePortInspectBody(BaseModel):
+    """Find the voices named in a ``.json`` (or in one saved voice).
+
+    The dashboard reads the file in the browser and posts its text, so the
+    server stays the single owner of the format — same contract as the backup
+    import above.
+    """
+
+    content: str = ""      # the .json text (Wallie backup / Fish / ElevenLabs dump)
+    name: str = ""         # …or a saved voice of this profile
+
+
+class VoicePortBody(BaseModel):
+    """Capture a cloned cloud voice and package it for a local engine."""
+
+    provider: str          # "fish" | "elevenlabs"
+    voice_id: str
+    target: str = "piper"  # "piper" | "kokoro"
+    name: str = ""         # display name (also the package folder stem)
+    minutes: float = 3.0   # how much speech to capture
+    lang: str = "pt"       # corpus language (pt | en)
+
+
+class VoicePortAttachBody(BaseModel):
+    """Install a model produced from a port and register it as a local voice."""
+
+    target: str
+    name: str = ""                 # engine file name (pt_BR-luna-medium / pf_luna)
+    display_name: str = ""         # what the library row should say
+    source_provider: str = ""      # the cloud provider it came from, for the note
+    files: list[VoiceSampleBody] = []
+
+
+class VoiceTrainStartBody(BaseModel):
+    """Train a Piper voice from the dataset a port produced.
+
+    This is a long child process (minutes on GPU, hours on CPU), so the route
+    starts it in the background and the panel polls the job for the log and the
+    progress. ``python`` picks the interpreter that owns the trainer — the
+    dashboard's own by default, or a separate venv with ``piper-tts[train]``.
+    """
+
+    package: str = ""               # ported package folder (must be a Piper port)
+    voice_name: str = ""            # <lang_REGION>-<voice>-<quality>
+    epochs: int = 200
+    batch_size: int = 8
+    accelerator: str = "auto"       # auto | cpu | gpu
+    python: str = ""                # training interpreter (blank = this one)
+    checkpoint: str = ""            # optional .ckpt to fine-tune from
+    resume_from: str = ""           # …or continue a stopped run from its last .ckpt
+
+
+class VoiceTrainAttachBody(BaseModel):
+    """Install the .onnx/.onnx.json a finished run exported."""
+
+    package: str
+    run_dir: str
+    name: str = ""                  # engine name (blank = the run's voice name)
+    display_name: str = ""          # what the library row should say
+
+
+class VoiceTrainSetupBody(BaseModel):
+    """Install the trainer (torch + lightning) into the chosen interpreter."""
+
+    python: str = ""
 
 
 class TestProviderBody(BaseModel):
@@ -1421,6 +1492,254 @@ def _build_app(
             "preset": preset.to_dict() if preset else None,
             **_voice_library_payload(cfg.profile_name),
         }
+
+    # ---------- Voice port — carry a cloned voice over to a local engine ----------
+    from tts import voice_port as _vport
+
+    @app.get("/api/voices/port")
+    def api_voices_port_panel() -> dict[str, Any]:
+        """Targets, corpus languages and the saved voices that can be ported."""
+        cfg = load_profile()
+        return {"ok": True, **_vport.panel_payload(cfg.profile_name)}
+
+    @app.post("/api/voices/port/inspect")
+    def api_voices_port_inspect(body: VoicePortInspectBody) -> dict[str, Any]:
+        """Every voice named in the uploaded ``.json``, with the reason any of
+        them cannot be ported (missing id, missing key, already local)."""
+        cfg = load_profile()
+        sources: list[dict[str, Any]] = []
+        try:
+            if (body.name or "").strip():
+                wanted = body.name.strip().lower()
+                preset = next(
+                    (p for p in _vlab.load_library(cfg.profile_name)
+                     if p.name.lower() == wanted),
+                    None,
+                )
+                if preset is None:
+                    raise HTTPException(404, f"no saved voice named {body.name}")
+                sources = [s.to_dict() for s in _vport.parse_sources(preset.to_dict())]
+            else:
+                payload = _vlab.parse_bundle_text(body.content)
+                sources = [
+                    s.to_dict()
+                    for s in _vport.parse_sources(payload, text=body.content)
+                ]
+        except _vport.VoicePortError as e:
+            raise HTTPException(400, str(e))
+        except _vlab.VoiceLabError as e:
+            raise HTTPException(400, str(e))
+        return {
+            "ok": True,
+            "sources": sources,
+            **_vport.panel_payload(cfg.profile_name),
+        }
+
+    @app.post("/api/voices/port")
+    async def api_voices_port(body: VoicePortBody) -> dict[str, Any]:
+        """Capture the cloud voice reading a corpus and package it for Piper or
+        Kokoro.
+
+        This SPEAKS with the user's provider account (one request per clip), so
+        the UI preflights it first: no key, no voice id or a local provider never
+        reaches the provider.
+        """
+        from config import get_runtime
+        from tts.base import TTSError
+
+        cfg = load_profile()
+        try:
+            return await _vport.convert(
+                profile=cfg.profile_name,
+                provider=body.provider,
+                voice_id=body.voice_id,
+                name=(body.name or "").strip(),
+                target=body.target,
+                minutes=body.minutes,
+                lang=body.lang,
+                secrets=get_runtime().secrets,
+            )
+        except _vport.VoicePortError as e:
+            raise HTTPException(400, str(e))
+        except TTSError as e:
+            # The provider refused a clip: say so, keep the message the user can act on.
+            logger.warning(f"voice port: capture failed: {e}")
+            raise HTTPException(400, f"capture failed: {str(e)[:220]}")
+
+    @app.post("/api/voices/port/attach")
+    def api_voices_port_attach(body: VoicePortAttachBody) -> dict[str, Any]:
+        """Copy a trained model into the engine's voices folder and register it
+        as a saved local voice, so it shows up in the pickers."""
+        import base64 as _b64
+
+        cfg = load_profile()
+        files: list[tuple[str, bytes]] = []
+        for i, f in enumerate(body.files, 1):
+            raw = (f.data or "").split(",", 1)[-1]
+            try:
+                blob = _b64.b64decode(raw, validate=False)
+            except Exception:
+                raise HTTPException(400, f"{f.filename or i} is not valid base64")
+            files.append((f.filename or f"file{i}", blob))
+        try:
+            result = _vport.attach(
+                profile=cfg.profile_name,
+                target=body.target,
+                files=files,
+                name=body.name,
+                display_name=body.display_name,
+                source_provider=body.source_provider,
+            )
+        except _vport.VoicePortError as e:
+            raise HTTPException(400, str(e))
+        except _lvoices.LocalVoiceError as e:
+            raise HTTPException(400, str(e))
+        return {**result, **_voice_library_payload(cfg.profile_name)}
+
+    # ---------- Piper training — the last mile of a ported package ----------
+    @app.get("/api/voices/port/train")
+    async def api_voice_train_status(package: str = "", python: str = "") -> dict[str, Any]:
+        """The training environment, every trainable package, and the job.
+
+        ``python`` selects the interpreter to probe, so the panel can check a
+        separate venv without changing what the dashboard itself runs on.
+        """
+        data = await piper_train.status_payload(python)
+        # Adopt a detached run from disk: this is what makes a fresh dashboard
+        # reconnect to training that kept going while it was closed.
+        job = piper_train.sync_job(state.voice_train)
+        selected = None
+        wanted = (package or "").strip() or (str(job.get("package") or "").strip()
+                                             if job.get("running") else "")
+        if wanted:
+            try:
+                selected = piper_train.package_spec(wanted)
+            except piper_train.TrainError as e:
+                raise HTTPException(400, str(e))
+        elif data["packages"]:
+            selected = data["packages"][0]
+        return {
+            "ok": True,
+            **data,
+            "selected": selected,
+            "job": job,
+        }
+
+    @app.post("/api/voices/port/train")
+    async def api_voice_train_start(body: VoiceTrainStartBody) -> dict[str, Any]:
+        """Start training (and the ONNX export) in the background."""
+        if state.voice_train["running"]:
+            raise HTTPException(409, "a training run is already in progress")
+        try:
+            options = piper_train.validate_start(
+                package=body.package,
+                voice_name=body.voice_name,
+                epochs=body.epochs,
+                batch_size=body.batch_size,
+                accelerator=body.accelerator,
+                python=body.python,
+                checkpoint=body.checkpoint,
+                resume_from=body.resume_from,
+            )
+        except piper_train.TrainError as e:
+            raise HTTPException(400, str(e))
+        # Probe here (not in the supervisor) so a missing trainer is a 400 on the
+        # request, and pass the flavour along: the detached process must agree.
+        env = await piper_train.probe(options["python"], force=True)
+        if not env["can_train"]:
+            raise HTTPException(400, env["hint"])
+        options["flavor"] = env["flavor"]
+        options["resume_from"] = body.resume_from
+        # Snapshotted into the run: the supervisor may finish with no dashboard
+        # watching, and the Discord URL itself stays in .env, never in the run.
+        notify = load_profile().training_notify
+        options["notify"] = {"windows": bool(notify.windows),
+                             "discord": bool(notify.discord)}
+        # The run gets its own session and process: closing/reloading the
+        # dashboard (or losing it) no longer interrupts training.
+        job = piper_train.start_run(state.voice_train, options)
+        return {"ok": True, "started": True, "detached": True, "job": job}
+
+    @app.post("/api/voices/port/train/notify/test")
+    def api_voice_train_notify_test() -> dict[str, Any]:
+        """Post a sample message to the Discord webhook from API Keys.
+
+        The URL is a credential that fails silently: a deleted or mistyped
+        webhook only surfaces when a run ends, hours later. This sends one real
+        message and hands back Discord's own rejection ("Unknown Webhook",
+        HTTP 401…), so a typo is a five-second fix instead of a lost run.
+        """
+        from tts import train_notify
+
+        try:
+            ok, detail = train_notify.send_test()
+        except Exception as e:  # noqa: BLE001 — show it, never a bare 500
+            return {"ok": False, "error": str(e)[:200]}
+        if ok:
+            return {"ok": True, "note": detail}
+        return {"ok": False, "error": detail}
+
+    @app.post("/api/voices/port/train/cancel")
+    async def api_voice_train_cancel() -> dict[str, Any]:
+        """Stop the trainer, detached or not (also after a dashboard restart)."""
+        stopped = piper_train.cancel_job(state.voice_train)
+        if not stopped:
+            stopped = await piper_train.cancel(state.voice_train)
+        if not stopped:
+            raise HTTPException(409, "no training run is in progress")
+        return {
+            "ok": True,
+            "cancelled": True,
+            "job": piper_train.sync_job(state.voice_train),
+        }
+
+    @app.post("/api/voices/port/train/setup")
+    async def api_voice_train_setup(body: VoiceTrainSetupBody) -> dict[str, Any]:
+        """Install ``piper-tts[train]`` (torch + lightning) with a visible log."""
+        if state.voice_train["running"]:
+            raise HTTPException(409, "a training run is already in progress")
+        wanted = (body.python or "").strip()
+        if wanted and not Path(wanted).is_file():
+            raise HTTPException(400, f"training interpreter not found: {wanted}")
+        piper_train.begin(
+            state.voice_train,
+            kind="setup",
+            python=piper_train.interpreter(wanted),
+            epochs=0,          # setup has no epochs; keep them out of the status line
+        )
+        asyncio.create_task(
+            piper_train.run_setup(state.voice_train, wanted),
+            name="piper-train-setup",
+        )
+        return {
+            "ok": True,
+            "started": True,
+            "job": piper_train.snapshot(state.voice_train),
+        }
+
+    @app.post("/api/voices/port/train/attach")
+    def api_voice_train_attach(body: VoiceTrainAttachBody) -> dict[str, Any]:
+        """Register the model a finished run exported as a saved local voice.
+
+        The files stay on disk, so this works after a dashboard restart too —
+        nothing large is pushed through the browser.
+        """
+        cfg = load_profile()
+        try:
+            result = piper_train.attach_run(
+                profile=cfg.profile_name,
+                package=body.package,
+                run_dir=body.run_dir,
+                name=body.name,
+                display_name=body.display_name,
+            )
+        except piper_train.TrainError as e:
+            raise HTTPException(400, str(e))
+        except _vport.VoicePortError as e:
+            raise HTTPException(400, str(e))
+        except _lvoices.LocalVoiceError as e:
+            raise HTTPException(400, str(e))
+        return {**result, **_voice_library_payload(cfg.profile_name)}
 
     @app.post("/api/voices/record")
     async def api_voices_record(body: VoiceRecordBody) -> dict[str, Any]:
