@@ -549,6 +549,10 @@ def new_job() -> dict[str, Any]:
         "log": "",
         "steps": [],
         "exported": {},
+        # Auto-port: the supervisor installs the .onnx itself when the run was
+        # started with an attach spec (server-side, no dashboard needed).
+        "attached": {},
+        "attach_error": "",
     }
 
 
@@ -567,7 +571,7 @@ def begin(job: dict[str, Any], *, kind: str, package: str = "", voice_name: str 
         voice_name=voice_name, package=package, run_dir="", flavor=flavor,
         python=python, started_at=time.time(), finished_at=None, error="",
         cancelled=False, resumed_from=dict(resumed_from or {}), log="",
-        steps=[], exported={}, notified={},
+        steps=[], exported={}, notified={}, attached={}, attach_error="",
     )
     job["_saved_epoch"] = -1          # per-run cache for the epoch checkpoint write
 
@@ -1416,7 +1420,9 @@ def supervise(run_dir: Path | str) -> None:
 
     persist()
     asyncio.run(main())
-    # The dashboard may not be running: the run says how it ended by itself.
+    # The dashboard may not be running: the run finishes its own last mile and
+    # says how it ended by itself.
+    auto_attach(run_dir, job, config.get("attach") or {})
     _announce(run_dir, job, config.get("notify") or {})
     persist()
 
@@ -1470,6 +1476,9 @@ def start_run(job: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
         # Carried with the run: the supervisor may finish long after the
         # dashboard that started it is gone.
         "notify": dict(options.get("notify") or {}),
+        # Auto-port: where the finished .onnx should be installed. Empty = the
+        # user attaches by hand, exactly as before.
+        "attach": dict(options.get("attach") or {}),
     }
     _write_json(run_dir / RUN_CONFIG_FILE, config)
     try:
@@ -1650,6 +1659,61 @@ def attach_run(
         source_provider=str((manifest.get("source") or {}).get("provider") or ""),
         files=[(onnx.name, onnx.read_bytes()), (config.name, config.read_bytes())],
     )
+
+
+def auto_attach(
+    run_dir: Path | str,
+    job: dict[str, Any],
+    spec: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Install a finished run's export as a saved voice — from the supervisor.
+
+    The run may end hours after the dashboard that started it is gone, so the
+    install spec travels in ``train-config.json`` instead of depending on a
+    browser. Best effort by design: a failure is recorded (``attach_error``) and
+    never turns a finished training run into a failed one — the .onnx stays
+    attachable by hand in the Train panel.
+    """
+    spec = spec or {}
+    job["attached"] = {}
+    job["attach_error"] = ""
+    if not spec:
+        return {"attached": {}, "error": ""}
+    run_dir = Path(run_dir)
+    profile = str(spec.get("profile") or "").strip()
+    if job.get("status") != "done":
+        job["attach_error"] = (
+            "the run did not finish — there is no model to install automatically"
+        )
+    elif not profile:
+        job["attach_error"] = (
+            "no profile in the run config — attach the .onnx from the Train panel"
+        )
+    else:
+        try:
+            result = attach_run(
+                profile=profile,
+                package=str(job.get("package") or ""),
+                run_dir=str(run_dir),
+                name=str(spec.get("name") or ""),
+                display_name=str(spec.get("display_name") or ""),
+            )
+        except Exception as e:  # noqa: BLE001 — manual attach stays available
+            job["attach_error"] = f"automatic install failed: {str(e)[:240]}"
+        else:
+            job["attached"] = {
+                "name": str(result.get("name") or ""),
+                "path": str(result.get("path") or ""),
+                "profile": profile,
+            }
+    # run.json is what a restarted dashboard reads; keep the install state there
+    # too, so the Train panel can say "already installed" instead of offering it.
+    record = _read_json(run_dir / "run.json")
+    if record is not None:
+        record["attached"] = job["attached"]
+        record["attach_error"] = job["attach_error"]
+        _write_json(run_dir / "run.json", record)
+    return {"attached": job["attached"], "error": job["attach_error"]}
 
 
 # ---------------------------------------------------------------------------

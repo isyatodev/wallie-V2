@@ -319,6 +319,15 @@ function app() {
       target: "piper", lang: "pt", minutes: 3,
       sources: [], picked: -1, savedName: "", filename: "",
       report: null, attach: [], attachName: "", msg: "", attachMsg: "",
+      // Capture ends in a trained, installed voice: the dataset goes straight to
+      // the trainer and the run attaches the .onnx when it exports it.
+      autoTrain: true,
+      // The offline path: audio the user already has, decoded and packaged
+      // here. No provider, no key — the saved voice only supplies the name.
+      local: {
+        files: [], texts: "", transcribe: true, autoTrain: true,
+        msg: "", saved: null, info: null,
+      },
     },
     // Piper training — the dataset a port produced becomes a local voice. The
     // job is polled while it runs; the run's own run.json keeps the exported
@@ -328,7 +337,7 @@ function app() {
       batchSize: 8, accelerator: "auto", python: "", checkpoint: "",
       advanced: false, busy: "", msg: "", attachMsg: "", follow: true,
       job: null, lastRun: null, resume: null, resumeFrom: "",
-      defaultsLoaded: false, _nameFor: "",
+      defaultsLoaded: false, _nameFor: "", _attachedSeen: "",
     },
     _voiceTrainPoll: null,
     // Copy the whole saved-voice library (incl. local Piper/Kokoro voices) to
@@ -3290,6 +3299,8 @@ function app() {
         // Default to a voice that can actually be ported, so the panel opens on
         // a plan that works instead of a red row.
         this.voicePort.picked = this.voicePort.sources.findIndex(s => s.supported);
+        const picked = this.portSource();
+        this.portLoadLocal(picked ? picked.name : "");
         const n = this.voicePort.sources.length;
         this.voicePort.msg = n === 1
           ? `found “${this.voicePort.sources[0].name}” — pick an engine and convert`
@@ -3309,11 +3320,14 @@ function app() {
       const minutes = Math.max(this.voicePort.minMinutes,
         Math.min(this.voicePort.maxMinutes, Number(this.voicePort.minutes) || 1));
       // Capturing speaks with the user's paid account — ask before spending it.
+      const learns = this.voicePort.target === "piper" && !!this.voicePort.autoTrain;
       const ok = confirm(
         `Convert “${src.name}” to ${this.voicePort.target}?\n\n`
         + `This SPEAKS with your ${src.provider} voice: about ${minutes} minute(s) of `
-        + "audio, billed by the provider. Only the audio crosses over — the model "
-        + "itself has to be built from the package.");
+        + "audio, billed by the provider. Only the audio crosses over — "
+        + (learns
+          ? "the trainer then builds the model from it and installs the voice when it finishes."
+          : "the model itself has to be built from the package."));
       if (!ok) return;
       this.voiceLabBusy = "port";
       this.voicePort.msg =
@@ -3329,6 +3343,7 @@ function app() {
             name: src.name,
             minutes,
             lang: this.voicePort.lang,
+            auto_train: !!this.voicePort.autoTrain,
           }),
         });
         const d = await r.json().catch(() => ({}));
@@ -3336,21 +3351,188 @@ function app() {
           this.voicePort.msg = "✗ " + this._apiError(d, r.status);
           return;
         }
-        this.voicePort.report = d;
-        this.voicePort.attachName = d.attach_name || "";
-        this.voicePort.attach = [];
-        this.voicePort.attachMsg = "";
-        this.voicePort.msg = `✓ ${d.clips} clips · ${d.seconds}s packaged for ${d.target}`;
-        // A fresh Piper package is immediately trainable — select it so the
-        // Train panel does not need a manual refresh after the conversion.
-        if (d.target === "piper" && d.package) {
-          this.voiceTrain.package = d.package;
-          this.voiceTrain.voiceName = d.attach_name || this.voiceTrain.voiceName;
-          this.voiceTrain._nameFor = d.package;
-          this.loadVoiceTrain();
+        let note = `✓ ${d.clips} clips · ${d.seconds}s packaged for ${d.target}`;
+        const train = d.train || {};
+        if (train.started) {
+          note += ` · training started in the background (${train.epochs} epochs)`
+            + " — the voice installs itself when it finishes";
+        } else if (train.reason) {
+          note += ` · not auto-trained: ${train.reason}`;
+        }
+        this._applyPortReport(d, note);
+        if (train.started) {
+          this.voiceTrain.job = train.job || this.voiceTrain.job;
+          this._pollVoiceTrain();
         }
       } catch (e) {
         this.voicePort.msg = "✗ " + e;
+      } finally {
+        this.voiceLabBusy = "";
+      }
+    },
+
+    // The report's own "press Train below" line stops being true once the port
+    // already started the run — say what the background job is doing instead.
+    portNextLine() {
+      const r = this.voicePort.report || {};
+      const t = r.train || {};
+      if (t.started) {
+        return `training “${r.name}” in the background (${t.epochs} epochs) — `
+          + "the .onnx installs itself when the run exports it";
+      }
+      if (r.target === "piper" && t.reason) {
+        return (r.next || "") + ` · auto-train skipped: ${t.reason}`;
+      }
+      return r.next || "";
+    },
+
+    // Both convert paths end in the same package shape, so the report, the
+    // attach strip and the Train panel are driven from one place.
+    _applyPortReport(d, msg) {
+      this.voicePort.report = d;
+      this.voicePort.attachName = d.attach_name || "";
+      this.voicePort.attach = [];
+      this.voicePort.attachMsg = "";
+      this.voicePort.msg = msg;
+      // A fresh Piper package is immediately trainable — select it so the Train
+      // panel does not need a manual refresh after the conversion.
+      if (d.target === "piper" && d.package) {
+        this.voiceTrain.package = d.package;
+        this.voiceTrain.voiceName = d.attach_name || this.voiceTrain.voiceName;
+        this.voiceTrain._nameFor = d.package;
+        this.loadVoiceTrain();
+      }
+    },
+
+    // ----- local audio path (no provider, no key) -----
+    // ``keep`` refreshes only the saved-clip scan — used after a build, when
+    // the success note must survive and the picked files have been consumed.
+    async portLoadLocal(name, keep = false) {
+      if (!keep) {
+        this.voicePort.local.files = [];
+        this.voicePort.local.texts = "";
+        this.voicePort.local.msg = "";
+      }
+      if (!name) {
+        this.voicePort.local.info = null;
+        this.voicePort.local.saved = null;
+        return;
+      }
+      if (!keep) this.voicePort.local.msg = "reading the clips already saved for this voice…";
+      try {
+        const r = await fetch("/api/voices/port/local?name=" + encodeURIComponent(name));
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voicePort.local.msg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        this.voicePort.local.info = d;
+        this.voicePort.local.saved = d.saved || null;
+        if (!keep) this.voicePort.local.msg = "";
+      } catch (e) {
+        this.voicePort.local.msg = "✗ " + e;
+      }
+    },
+
+    async portLocalFiles(event) {
+      const files = Array.from(event.target.files || []);
+      event.target.value = "";
+      const limitMb = (this.voicePort.local.info && this.voicePort.local.info.max_file_mb) || 40;
+      for (const f of files) {
+        if (f.size > limitMb * 1024 * 1024) {
+          this.voicePort.local.msg = `✗ ${f.name} is larger than ${limitMb} MB — split it`;
+          continue;
+        }
+        try {
+          this.voicePort.local.files.push({ filename: f.name, data: await this._readBase64(f) });
+        } catch (e) {
+          this.voicePort.local.msg = "✗ " + e;
+        }
+      }
+      if (this.voicePort.local.files.length) {
+        this.voicePort.local.msg = `${this.voicePort.local.files.length} file(s) picked — press build`;
+      }
+    },
+
+    portLocalKb() {
+      const bytes = this.voicePort.local.files.reduce(
+        (n, f) => n + Math.round((f.data || "").length * 3 / 4), 0);
+      return Math.round(bytes / 1024);
+    },
+
+    portLocalTranscriber() {
+      const t = (this.voicePort.local.info || {}).transcriber;
+      if (!t) return "";
+      if (!t.available) return `✗ ${t.engine || "Whisper"} unavailable`;
+      if (!t.cached) return `✗ Whisper ${t.model} not cached`;
+      return `· Whisper ${t.model} ready (offline)`;
+    },
+
+    portLocalSavedLine() {
+      const s = this.voicePort.local.saved;
+      if (!s || !s.clips) {
+        return "no clips imported for this voice yet — the ones you pick are kept in voices/local-src/ for next time";
+      }
+      const secs = s.seconds ? ` · ${s.seconds}s` : "";
+      return `${s.clips} clip(s) already saved${secs} in ${s.dir} — reused on every build`;
+    },
+
+    async portLocalBuild() {
+      const src = this.portSource();
+      if (this.voiceLabBusy || !src) return;
+      const texts = (this.voicePort.local.texts || "")
+        .split("\n").map(s => s.trim());
+      while (texts.length && !texts[texts.length - 1]) texts.pop();
+      this.voiceLabBusy = "local";
+      this.voicePort.local.msg = this.voicePort.local.files.length
+        ? `packaging ${this.voicePort.local.files.length} file(s) locally — nothing leaves this machine…`
+        : "packaging the clips already saved for this voice…";
+      try {
+        const r = await fetch("/api/voices/port/local", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: src.name,
+            provider: src.provider,
+            voice_id: src.voice_id,
+            target: this.voicePort.target,
+            lang: this.voicePort.lang,
+            files: this.voicePort.local.files.map(f => ({ filename: f.filename, data: f.data })),
+            texts,
+            transcribe: !!this.voicePort.local.transcribe,
+            use_saved: true,
+            auto_train: !!this.voicePort.local.autoTrain,
+          }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voicePort.local.msg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        let note = `✓ ${d.clips} clips · ${d.seconds}s packaged locally — no provider was called`;
+        if (d.transcribed) note += ` · ${d.transcribed} line(s) from ${d.transcriber}`;
+        if ((d.warnings || []).length) note += ` · ${d.warnings[0]}`;
+        if ((d.skipped || []).length) {
+          note += ` · ${d.skipped.length} silent clip(s) skipped`;
+        }
+        const train = d.train || {};
+        if (train.started) {
+          note += ` · training started in the background (${train.epochs} epochs)`
+            + " — the voice installs itself when it finishes";
+        } else if (train.reason) {
+          note += ` · not auto-trained: ${train.reason}`;
+        }
+        this.voicePort.local.files = [];
+        this.voicePort.local.texts = "";
+        this.voicePort.local.msg = note;
+        this._applyPortReport(d, note);
+        if (train.started) {
+          this.voiceTrain.job = train.job || this.voiceTrain.job;
+          this._pollVoiceTrain();
+        }
+        await this.portLoadLocal(src.name, true);
+      } catch (e) {
+        this.voicePort.local.msg = "✗ " + e;
       } finally {
         this.voiceLabBusy = "";
       }
@@ -3437,6 +3619,16 @@ function app() {
         this.voiceTrain.env = d.env || null;
         this.voiceTrain.packages = d.packages || [];
         this.voiceTrain.job = d.job || null;
+        // The supervisor installs the model by itself; adopt it here so the
+        // library pickers (and the saved-voices list) show it without a reload.
+        const installed = (d.job && d.job.attached) || {};
+        if (installed.name && this.voiceTrain._attachedSeen !== (installed.path || installed.name)) {
+          this.voiceTrain._attachedSeen = installed.path || installed.name;
+          this.loadVoiceLibrary();
+          this.loadLocalVoices();
+          this.voiceTrain.attachMsg =
+            `✓ “${installed.name}” installed automatically — it is in the pickers now`;
+        }
         if (d.defaults && !this.voiceTrain.defaultsLoaded) {
           this.voiceTrain.epochs = d.defaults.epochs;
           this.voiceTrain.batchSize = d.defaults.batch_size;
@@ -3518,6 +3710,16 @@ function app() {
       if (n.windows) bits.push(n.windows === "shown" ? "notified on Windows" : "Windows: " + n.windows);
       if (n.discord) bits.push(n.discord === "sent" ? "Discord message sent" : "Discord: " + n.discord);
       return bits.length ? "🔔 " + bits.join(" · ") : "";
+    },
+
+    // The last mile, reported: an auto-port run installs its own .onnx, so the
+    // panel says where it landed instead of offering the attach button again.
+    trainAttachLine() {
+      const j = this.voiceTrain.job || {};
+      const a = j.attached || {};
+      if (a.name) return `✓ voice installed automatically as “${a.name}” · ${a.path}`;
+      if (j.attach_error) return "⚠ " + j.attach_error;
+      return "";
     },
 
     trainWebhookSet() {

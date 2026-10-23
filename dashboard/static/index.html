@@ -1267,10 +1267,60 @@
         <input type="number" :min="voicePort.minMinutes" :max="voicePort.maxMinutes" step="1"
                x-model.number="voicePort.minutes"
                title="minutes of speech to capture — the provider bills every one of them" />
+        <label class="hint" style="display:flex;align-items:center;gap:6px;flex:0 0 auto;"
+               title="trains the captured dataset right after the port and installs the .onnx when it finishes — Piper only, and needs the trainer deps (torch + lightning)">
+          <input type="checkbox" x-model="voicePort.autoTrain"
+                 :disabled="voicePort.target !== 'piper'" />
+          train + attach automatically
+        </label>
         <button class="btn tiny primary" @click="portConvert()"
                 :disabled="!!voiceLabBusy || !portSource()"
                 x-text="voiceLabBusy === 'port' ? 'capturing…' : '↻ convert'"></button>
         <small class="hint" style="flex-basis:100%;" x-text="portTargetHint()"></small>
+      </div>
+
+      <div class="test-strip" style="margin-top:16px;">
+        <b style="flex-basis:100%;">or from audio you already have — nothing leaves this machine</b>
+        <small class="hint" style="flex-basis:100%;">
+          No provider, no key, no credits: import clips you already own (your own recordings, samples you
+          downloaded, takes from a past session). They are decoded locally, trimmed, and cut to the
+          engine's rate; missing lines are transcribed by the <b>local Whisper</b> (never an API), and the
+          same <b>Piper dataset</b> comes out — the Train panel below finishes the voice.
+        </small>
+      </div>
+      <div class="test-strip">
+        <label class="btn tiny ghost" :class="{ 'is-disabled': !!voiceLabBusy }"
+               title="audio + optional transcripts — copied into voices/local-src/&lt;voice&gt;/ and reused next time">
+          ⤒ audio clips
+          <input type="file" multiple
+                 accept=".wav,.mp3,.m4a,.ogg,.opus,.flac,.webm,.aac,.mp4,.txt,.csv"
+                 @change="portLocalFiles($event)" :disabled="!!voiceLabBusy" style="display:none;" />
+        </label>
+        <label class="hint" style="display:flex;align-items:center;gap:6px;flex:0 0 auto;"
+               title="uses faster-whisper already in this interpreter, offline (the model must be cached)">
+          <input type="checkbox" x-model="voicePort.local.transcribe" />
+          transcribe locally
+        </label>
+        <label class="hint" style="display:flex;align-items:center;gap:6px;flex:0 0 auto;"
+               title="trains the dataset right after packaging and installs the .onnx when it finishes — needs the Piper trainer deps (torch + lightning)">
+          <input type="checkbox" x-model="voicePort.local.autoTrain" />
+          train + attach automatically
+        </label>
+        <button class="btn tiny primary" @click="portLocalBuild()"
+                :disabled="!!voiceLabBusy || !portSource()"
+                x-text="voiceLabBusy === 'local' ? 'building locally…' : '↻ build dataset (local)'"></button>
+        <button class="btn tiny ghost" x-show="voicePort.local.files.length" @click="voicePort.local.files = []"
+                :disabled="!!voiceLabBusy" title="forget the picked files (the saved clips stay)">clear</button>
+        <small class="hint" style="flex-basis:100%;" x-text="portLocalTranscriber()"></small>
+        <small class="hint" style="flex-basis:100%;" x-text="portLocalSavedLine()"></small>
+        <small class="hint" style="flex-basis:100%;"
+               x-text="voicePort.local.files.length + ' file(s) picked · ' + portLocalKb() + ' KB'"></small>
+        <textarea x-model="voicePort.local.texts" rows="2" style="flex:1 1 100%;min-width:0;"
+                  placeholder="optional: one transcript line per clip, in order — leave it empty and local Whisper writes them"></textarea>
+        <small class="hint" x-show="!portSource()" style="flex-basis:100%;">
+          pick a saved ElevenLabs/Fish voice above first — it names the local voice (its id is never called).
+        </small>
+        <small class="hint" x-show="voicePort.local.msg" x-text="voicePort.local.msg" style="flex-basis:100%;"></small>
       </div>
 
       <div class="port-report" x-show="voicePort.report">
@@ -1281,7 +1331,7 @@
               <small class="hint" x-text="voicePort.report.clips + ' clips · ' + voicePort.report.seconds + 's · ' + voicePort.report.sample_rate + ' Hz'"></small>
               <audio controls preload="none" :src="voicePort.report.audition.url"></audio>
             </div>
-            <small class="hint" x-text="voicePort.report.next"></small>
+            <small class="hint" x-text="portNextLine()"></small>
             <small class="hint" x-text="'package: ' + voicePort.report.package"></small>
             <small class="hint" x-text="voicePort.report.files.join(' · ')"></small>
           </div>
@@ -1384,6 +1434,8 @@
                 x-show="cfg.training_notify.discord && !trainWebhookSet()"
                 @click="section = 'secrets'">set the webhook</button>
         <small class="hint" x-show="trainNotifyLine()" x-text="trainNotifyLine()"></small>
+        <small class="hint hint-ok" style="flex-basis:100%;"
+               x-show="trainAttachLine()" x-text="trainAttachLine()"></small>
       </div>
 
       <div class="test-strip" x-show="voiceTrain.advanced && voiceTrain.package">

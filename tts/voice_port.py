@@ -574,11 +574,16 @@ def _write_wav(path: Path, pcm: bytes, sample_rate: int) -> None:
     path.write_bytes(voice_lab.pcm16_bytes_to_wav(pcm, sample_rate=sample_rate, channels=1))
 
 
-def _piper_readme(spec: dict[str, Any], lang: dict[str, Any], clips: int, seconds: float) -> str:
+def _piper_readme(
+    spec: dict[str, Any], lang: dict[str, Any], clips: int, seconds: float, origin: str = "",
+) -> str:
+    source = origin or (
+        f"Captured with Wallie's Voice Lab: {clips} clips, {seconds}s of speech, "
+        f"from a cloned {lang['label']} voice."
+    )
     return f"""# Piper package — {spec['name_hint']}
 
-Captured with Wallie's Voice Lab: {clips} clips, {seconds}s of speech, from a
-cloned {lang['label']} voice.
+{source}
 
 ## What is here
 
@@ -624,11 +629,16 @@ Bring the produced `.onnx` **and** its `.onnx.json` back to the Voice Lab's
 """
 
 
-def _kokoro_readme(spec: dict[str, Any], lang: dict[str, Any], clips: int, seconds: float) -> str:
+def _kokoro_readme(
+    spec: dict[str, Any], lang: dict[str, Any], clips: int, seconds: float, origin: str = "",
+) -> str:
+    source = origin or (
+        f"Captured with Wallie's Voice Lab: {clips} clips, {seconds}s of speech, "
+        f"from a cloned {lang['label']} voice."
+    )
     return f"""# Kokoro package — {spec['name_hint']}
 
-Captured with Wallie's Voice Lab: {clips} clips, {seconds}s of speech, from a
-cloned {lang['label']} voice.
+{source}
 
 ## What is here
 
@@ -673,8 +683,14 @@ def build_package(
     source: PortSource,
     lang: str,
     now: str = "",
+    origin: str = "",
 ) -> dict[str, Any]:
-    """Write the engine-specific package for already-captured takes."""
+    """Write the engine-specific package for already-captured takes.
+
+    ``origin`` replaces the README's default "captured with the provider" line:
+    a package built from audio the user already had (``tts.local_port``) must not
+    claim a provider ever spoke those clips.
+    """
     spec = target_spec(target)
     corpus = lang_spec(lang)
     now = now or _now_iso()
@@ -704,7 +720,7 @@ def build_package(
             rows.append(f"{rel}|{take['text'].replace('|', ',')}")
         (dataset / "metadata.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
         (pkg / "README.md").write_text(
-            _piper_readme(spec, corpus, len(takes), seconds), encoding="utf-8"
+            _piper_readme(spec, corpus, len(takes), seconds, origin), encoding="utf-8"
         )
         files += [f"dataset/wav/{len(takes)} clips @ {rate} Hz", "dataset/metadata.csv", "README.md"]
         next_step = (
@@ -721,7 +737,7 @@ def build_package(
                     rate,
                 )
         (pkg / "README.md").write_text(
-            _kokoro_readme(spec, corpus, len(takes), seconds), encoding="utf-8"
+            _kokoro_readme(spec, corpus, len(takes), seconds, origin), encoding="utf-8"
         )
         files += [f"corpus {len(takes)} clips @ {rate} Hz", "README.md"]
         next_step = (
@@ -744,6 +760,8 @@ def build_package(
             {"index": t["index"], "text": t["text"], "seconds": t["seconds"]} for t in takes
         ],
     }
+    if origin:
+        manifest["origin"] = origin
     (pkg / MANIFEST_FILE).write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -763,10 +781,11 @@ def build_package(
         "attach_name": spec["name_hint"],
         "attach_kind": spec["model_kind"],
         "warning": (
-            "captured audio, not the model — "
+            "audio, not the model — "
             + ("train the .onnx from this dataset" if spec["id"] == "piper"
                else "fine-tune the .pt from this corpus")
         ),
+        "origin": origin,
     }
 
 

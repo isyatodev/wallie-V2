@@ -1086,6 +1086,70 @@ def test_a_failing_notifier_never_breaks_the_run(dirs, fast_probe, monkeypatch):
     assert disk["notified"] == {}
 
 
+def test_supervise_installs_the_model_when_the_run_carries_an_attach_spec(
+    dirs, fast_probe, monkeypatch, profile,
+):
+    pkg = make_package()
+    options = pt.validate_start(package=str(pkg), voice_name="", epochs=2,
+                                batch_size=2, accelerator="cpu", python="",
+                                checkpoint="")
+    options["flavor"] = "piper1-gpl"
+    options["attach"] = {
+        "profile": "luna", "name": "", "display_name": "Luna local",
+    }
+
+    class _Popen:
+        pid = 4321
+
+    monkeypatch.setattr(pt, "_popen_supervisor", lambda *a, **k: _Popen())
+    run_dir = Path(pt.start_run(pt.new_job(), options)["run_dir"])
+    assert json.loads((run_dir / pt.RUN_CONFIG_FILE).read_text(encoding="utf-8"))["attach"] == {
+        "profile": "luna", "name": "", "display_name": "Luna local",
+    }
+
+    _fake_spawner(monkeypatch)
+    pt.supervise(run_dir)
+
+    disk = json.loads((run_dir / pt.JOB_FILE).read_text(encoding="utf-8"))
+    assert disk["status"] == "done", disk.get("error")
+    assert disk["attach_error"] == ""
+    attached = disk["attached"]
+    assert attached["name"] == "Luna local"
+    assert attached["profile"] == "luna"
+    assert Path(attached["path"]).is_file()
+    # The voice is in the library a picker reads, not just on disk.
+    assert "Luna local" in [p.name for p in voice_lab.load_library("luna")]
+    # …and the run remembers it, so a restarted dashboard shows the install.
+    record = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert record["attached"] == attached
+
+
+def test_a_failed_auto_attach_leaves_the_finished_run_attachable(
+    dirs, fast_probe, monkeypatch, profile,
+):
+    pkg = make_package()
+    options = pt.validate_start(package=str(pkg), voice_name="", epochs=2,
+                                batch_size=2, accelerator="cpu", python="",
+                                checkpoint="")
+    options["flavor"] = "piper1-gpl"
+    options["attach"] = {"profile": "luna", "name": "not-a-piper-name"}
+
+    class _Popen:
+        pid = 4321
+
+    monkeypatch.setattr(pt, "_popen_supervisor", lambda *a, **k: _Popen())
+    run_dir = Path(pt.start_run(pt.new_job(), options)["run_dir"])
+    _fake_spawner(monkeypatch)
+    pt.supervise(run_dir)
+
+    disk = json.loads((run_dir / pt.JOB_FILE).read_text(encoding="utf-8"))
+    assert disk["status"] == "done"
+    assert Path(disk["exported"]["onnx"]).is_file()
+    assert disk["attached"] == {}
+    assert "not a Piper voice name" in disk["attach_error"]
+    assert voice_lab.load_library("luna") == []
+
+
 def test_train_route_snapshots_the_profiles_notify_toggles(dirs, fast_probe, monkeypatch):
     pkg = make_package()
     seen: dict = {}

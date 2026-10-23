@@ -15,6 +15,13 @@ voices/
 .wallie_state.json
 profiles/*.memory.json
 profiles/*.localvoices.json
+# Personal profiles — kept on disk, never versioned (default.yaml stays as the template)
+profiles/luna.*
+profiles/conspiracy.*
+profiles/gremlin.*
+profiles/memes.*
+profiles/minecraft.*
+profiles/p-voices.*
 install_log.txt
 .mypy_cache/
 .pytest_cache/

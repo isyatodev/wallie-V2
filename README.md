@@ -5,8 +5,9 @@
 > belongs upstream. If you are looking for the canonical project, go there.
 >
 > This fork keeps the upstream engine and adds dashboard-level work on top: a **Voice Lab** with
-> provider voice cloning, **any-model vision testing**, a fuller **Kokoro** voice picker
-> (including pt-BR), and per-profile themes. See [What this fork adds](#what-this-fork-adds) —
+> provider voice cloning — and the way back down, turning a cloned voice (or audio you already own)
+> into a **trained local Piper/Kokoro model** — plus **any-model vision testing**, a fuller **Kokoro**
+> voice picker (including pt-BR), and per-profile themes. See [What this fork adds](#what-this-fork-adds) —
 > everything else in this document describes behavior inherited from upstream.
 
 <p align="center">
@@ -74,6 +75,9 @@ Everything below is fork-specific. If a feature is not listed here, assume it ca
 | **Voice mirroring** | **⇄ mirror** makes two profiles hold the same saved voices, **both ways**, showing the diff first. Same-named voices that differ are left alone by default — or you pick which side wins — and any overwrite asks before replacing | Dashboard → **Voice Lab** |
 | **Voice partner badge** | Mark a profile as another one's **voice partner** and the profile picker shows a **⇄ badge** whenever the two libraries drift apart (with the counts in the tooltip); click it to land in the Voice Lab with the diff already loaded. A **⇄** also marks the profile in the dropdown itself, and switching to a partnered profile syncs the missing voices both ways, saying what it copied | Dashboard → **Voice Lab** |
 | **Local voices in the library** | Piper/Kokoro voices saved on the **Voice** page live in the same per-profile library as the Voice Lab presets, so they show up in the A/B and travel with every copy, pull, backup and mirror | Dashboard → **Voice** / **Voice Lab** |
+| **Voice port** | Carry a cloned cloud voice **over to a local engine**: the saved voice reads a fixed corpus and the takes are packaged as a **Piper training dataset** (22.05 kHz wav + `metadata.csv`) or a **Kokoro corpus** (24 kHz). Only the audio crosses the border — the provider never hands over the weights | Dashboard → **Voice Lab** |
+| **Offline dataset import** | Build that same package from **audio you already own**: decoded, trimmed and cut to the engine's rate locally, missing lines filled by the **local Whisper**, every clip kept for the next build. No provider, no key, no network | Dashboard → **Voice Lab** |
+| **Train + attach** | Run the **Piper trainer from the dashboard** — live epoch progress and log, resume from a checkpoint, Windows/Discord notification when it ends — and let the run **install the exported `.onnx` by itself**. Both ports can do it automatically, with no dashboard open | Dashboard → **Voice Lab** → Train |
 | **Piper voice catalogue** | Browse the official `rhasspy/piper-voices` catalogue **inside the dashboard** — search by name, filter by language, see speakers/quality/size per voice — and download any of them with a live progress bar. No CLI needed | Dashboard → **Voice** |
 | **Piper tuning** | Speed (`length_scale`), **Expressiveness** (`noise_scale`) and **Pacing variety** (`noise_w`) as sliders, so a local voice can be tuned to taste instead of taking Piper's defaults | Dashboard → **Voice** |
 | **Kokoro languages** | A real language picker instead of US/UK only — including **Portuguese (Brazil)** (`pf_dora` / `pm_alex` / `pm_santa`), plus Spanish, French, Hindi, Italian, Japanese and Mandarin. Voice ids stay in sync with the language, and the voice field autocompletes per language | Dashboard → **Voice** |
@@ -97,7 +101,7 @@ work — see [Features](#features) and [Architecture](#architecture).
 
 ## The Voice Lab
 
-The fork's biggest addition. Dashboard → **Voice Lab** has two halves:
+The fork's biggest addition. Dashboard → **Voice Lab** has four parts:
 
 **1. Saved voices (presets).** A preset snapshots the Voice page's current settings — provider,
 voice id, speed, stability, the Kokoro language, and so on — under a name. Presets are stored per
@@ -207,6 +211,49 @@ A few honest notes:
 - Piper/Kokoro voices saved on the **Voice** page live in this same library — that is what makes them
   appear in the A/B and travel with every copy, pull, backup and mirror. (A pre-unification
   `profiles/<profile>.localvoices.json` is imported into it once and then removed.)
+
+### From a cloned voice to a local model
+
+The `.json` a voice exports carries its **name and id — not the model**. Fish Audio and ElevenLabs
+never hand the weights over, and Piper/Kokoro cannot learn a voice from an id. What *can* cross the
+border is **audio**, so the Voice Lab handles the rest of the journey on your machine:
+
+**1. Capture.** Pick a saved Fish/ElevenLabs voice, an engine, a corpus language (pt-BR or en) and
+how many minutes to capture. The voice reads a fixed corpus written for phoneme coverage; every
+clip is trimmed, normalised to mono 24 kHz and written to `voices/ported/<name>-<engine>/`. The
+plan is preflighted first (no key, no voice id or a local provider never reaches the provider) and
+the dashboard asks before spending, because the provider bills every clip. The originals are kept
+at the capture rate, so the same package can feed the *other* engine without a second capture;
+`manifest.json` records the clips, seconds, language and source, and the package's `README.md` says
+what to do next.
+
+**2. …or import audio you already have.** The same package is built with **no provider, no key and
+no network**: drop in recordings (wav / mp3 / m4a / ogg / opus / flac / webm / aac) and transcripts
+if you have them (a `.txt` with one line per clip, or a `name|text` csv). Missing lines are
+transcribed by the **local Whisper** already used for hearing, the clips are kept in
+`voices/local-src/<voice>/` and reused on the next build, and the manifest is marked
+`origin: local-audio` so it never claims a provider said those words. Silent or non-audio files are
+skipped with a reason instead of becoming dataset rows.
+
+**3. Train.** With a Piper package selected, **Train** runs the Piper trainer (torch + Lightning) as
+a background process: epochs, batch size and accelerator are yours, the log and epoch progress
+stream into the page, a stopped run resumes from its last checkpoint, and the end of the run can
+notify Windows and/or Discord. The trainer may live in a **separate interpreter** — the panel
+probes it, says what is missing and offers the install command instead of failing minutes later.
+
+**4. Install.** When the run exports its model, **attach** copies `pt_BR-<voice>-medium.onnx` +
+`.onnx.json` into `voices/` and registers it as a saved local voice, so it appears in the Voice page
+pickers, the A/B and every copy/pull/backup of the library. Kokoro is the exception: it cannot learn
+a voice from audio, so its package is a reference corpus and a `.pt` voicepack is attached by hand.
+
+**Automatic on both paths.** The **train + attach automatically** switch (on by default) belongs to
+both the capture and the local-import path. "Automatic" means no second click and no open tab: the
+dataset starts training in the same request, and the attach spec travels with the run, so the
+detached supervisor installs the voice even if the dashboard was closed long before it finished. A
+missing trainer is reported on a **successful** build — the dataset (and the credits that paid for
+it) are kept, with the reason and the install command in the panel — and an attach that fails
+leaves the finished run intact, with the `.onnx` still installable by hand. Attaching under an
+existing name replaces that preset, so a cloud voice and its local twin cannot share one name yet.
 
 ---
 
@@ -430,6 +477,39 @@ Not just a name and a system prompt. You design a *character*:
 - **Extra notes** — free text for anything the structured fields miss
 
 Save multiple personas. Switch between them with a dropdown. Themes are per profile too.
+
+### Where profiles live
+
+A profile is **one file**: `profiles/<name>.yaml`. Everything that character accumulates lives next
+to it under the same name:
+
+| File | What it holds |
+|---|---|
+| `profiles/<name>.yaml` | the profile — persona, LLM/TTS/chat settings, every toggle |
+| `profiles/<name>.voices.json` | its saved-voice library: Voice Lab presets, cloned voices, local Piper/Kokoro voices |
+| `profiles/<name>.longterm.json` | the durable facts it keeps across streams |
+| `profiles/<name>.memory.json` | the session-memory snapshot (per-person memories included) |
+
+**Only `profiles/default.yaml` is versioned** — it is the template. Your own profiles are listed in
+`.gitignore`, so the persona, its backstory, the voice ids you cloned and what the streamer
+remembers about your chat never end up in a commit, a fork or a PR. API keys are not in a profile
+at all: they live in `.env`, which is ignored too.
+
+**Creating one from the template.** The shortcut is the dashboard's profile picker:
+
+- **⊕** creates a fresh profile with the built-in defaults.
+- **⎘** clones the active profile — the **YAML only**. Its voice library and memories are *not*
+  copied, so pick (or clone) a voice again, or bring the voices over with the Voice Lab's ⤓/⇪.
+- By hand, `cp profiles/default.yaml profiles/my-streamer.yaml` starts from the shipped
+  template's values. The file name **is** the profile name (the `profile_name` key inside is set
+  from it when the file loads), and every `*.yaml` under `profiles/` appears in the picker on the
+  next page load — there is no registry to edit.
+
+A profile is plain text on purpose: keep it in a private repo, copy it to another machine, or edit
+it by hand before launching. Which one is active is remembered in `.wallie_state.json` (ignored as
+well). To move the *whole* character, copy the matching `.voices.json` and
+`.longterm.json` as well; deleting a profile from the picker removes only its `.yaml`, so those
+files stay on disk until you delete them yourself.
 
 ### Hours-long sessions without decay
 
@@ -680,6 +760,9 @@ wallie-v2/
 ├── llm/                   # LLM provider adapters (incl. generic OpenAI-compatible)
 ├── tts/
 │   ├── voice_lab.py       # ← fork: voice presets + provider-side cloning
+│   ├── voice_port.py      # ← fork: capture a cloud voice into a Piper/Kokoro package
+│   ├── local_port.py      # ← fork: the same package from local audio, fully offline
+│   ├── piper_train.py     # ← fork: dataset → trained Piper voice, then self-install
 │   └── ...                # TTS adapters (fish, elevenlabs, piper, kokoro, any gateway)
 ├── audio/                 # sounddevice player with alignment safety
 ├── vision/                # screen capture + change detection + activity classification
@@ -689,7 +772,7 @@ wallie-v2/
 ├── donations/             # LivePix + Streamlabs → normalized DonationEvent → orchestrator queue
 ├── avatar/                # VTube Studio WebSocket client
 ├── dashboard/             # FastAPI + Alpine.js (no build step)
-├── profiles/              # saved persona profiles (YAML) + per-profile voice libraries
+├── profiles/              # local profile YAMLs + per-profile voice libraries (only default.yaml ships)
 └── scripts/               # setup utilities
 ```
 
@@ -715,7 +798,7 @@ wallie-v2/
 | **Fish Audio** | ✅ | ✅ **via Voice Lab** | ~$15/M chars | Creates a private model from your clips |
 | **ElevenLabs** | ✅ | ✅ **via Voice Lab** | ~$30/M chars | Instant voice cloning |
 | **Kokoro** | ✅ (local) | ❌ | $0 | 8 languages incl. **pt-BR**; pick voice + language in Voice — saved voices land in the Voice Lab library |
-| **Piper** | ✅ (local) | ❌ | $0 | Fixed voices, fastest local option. One-click runtime install, the whole official catalogue downloadable from the dashboard, plus speed/expressiveness/pacing sliders |
+| **Piper** | ✅ (local) | ✅ **via Voice Lab training** | $0 | Fastest local option. One-click runtime install, the whole official catalogue downloadable from the dashboard, speed/expressiveness/pacing sliders — and a trainer that turns a captured or imported dataset into **your own** voice |
 | **OpenAI-Compatible (speech)** | ✅ | ❌ | any gateway | Depends on the gateway |
 
 ---
@@ -834,6 +917,25 @@ in-process for an hour), so it needs internet the first time — **refresh** ret
 download keeps its last progress and its message in the log under the box; the usual causes are no
 network, a proxy, or a wrong name. Names are `lang_REGION-voice-quality`
 (`pt_BR-faber-medium`), or just pick from the catalogue instead of typing.
+</details>
+
+<details>
+<summary><strong>The dataset trained but no new voice appeared</strong></summary>
+
+Open **Voice Lab → Train**: the job line reports what the run managed. `no Piper trainer found` or
+`lightning is missing` means the training deps are not in the interpreter that ran it — install
+`piper-tts[train]` (the panel shows the exact command and has the one-click install), or point the
+panel at a venv that has them. If the run finished with an `attach` error, the `.onnx` and
+`.onnx.json` are in its run folder and the **attach model** box installs them by hand; a failed
+attach never turns a finished training into a failed run, and it never deletes the dataset.
+</details>
+
+<details>
+<summary><strong>Auto-training was refused with "another training run is in progress"</strong></summary>
+
+Only one Piper run exists at a time — it owns the CPU/GPU and the run folder. A port that finds one
+running keeps its dataset and says so instead of queueing behind it. Wait for it, cancel it in the
+Train panel, then press **Train** on the new package; nothing was lost in the meantime.
 </details>
 
 ---

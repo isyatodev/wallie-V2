@@ -504,6 +504,32 @@ class VoicePortBody(BaseModel):
     name: str = ""         # display name (also the package folder stem)
     minutes: float = 3.0   # how much speech to capture
     lang: str = "pt"       # corpus language (pt | en)
+    # Train the dataset right after packaging and let the run install the .onnx
+    # when it finishes — same last mile the local path gets, no second click.
+    auto_train: bool = True
+
+
+class VoicePortLocalBody(BaseModel):
+    """Build a local package from audio the user already owns.
+
+    The offline sibling of :class:`VoicePortBody`: no provider is spoken to and
+    no key is read, so ``provider``/``voice_id`` only label the saved voice the
+    clips belong to. ``files`` may also carry the transcripts (a ``.txt`` with
+    one line per clip, or a ``name|text`` csv).
+    """
+
+    name: str = ""                 # saved voice the clips belong to
+    provider: str = ""             # fish | elevenlabs — a label, never called
+    voice_id: str = ""
+    target: str = "piper"
+    lang: str = "pt"
+    files: list[VoiceSampleBody] = []
+    texts: list[str] = []          # one line per clip, in upload order
+    transcribe: bool = True        # fill the gaps with local Whisper
+    use_saved: bool = True         # reuse clips imported for this voice before
+    # Train the dataset right after packaging and let the run install the .onnx
+    # when it finishes — the last mile with no second click.
+    auto_train: bool = True
 
 
 class VoicePortAttachBody(BaseModel):
@@ -719,6 +745,75 @@ async def _synthesize_pcm(tts_cfg: Any, tts_secrets: Any, text: str) -> _SynthRe
         raw = raw[:-1]
     res.pcm = raw
     return res
+
+
+async def _auto_train_after_import(
+    state: DashboardState,
+    cfg: Any,
+    result: dict[str, Any],
+    *,
+    enabled: bool,
+) -> dict[str, Any]:
+    """Train the dataset the port just produced, and install it on finish.
+
+    "Automatic" means no second click: defaults only (no confirm dialog), and the
+    attach spec travels with the run so the supervisor installs the voice even if
+    the dashboard that started it is long gone.
+
+    A missing trainer (torch/lightning) is reported on a **successful** build —
+    the dataset is still the result; training is the extra mile.
+    """
+    if not enabled:
+        return {"started": False, "reason": ""}
+    if result.get("target") != "piper":
+        return {"started": False, "reason": "only Piper learns a voice from a dataset"}
+    if state.voice_train.get("running") or piper_train.active_job():
+        return {
+            "started": False,
+            "reason": "another training run is in progress — use the Train panel",
+        }
+    try:
+        options = piper_train.validate_start(
+            package=str(result.get("package") or ""),
+            voice_name="",
+            epochs=piper_train.DEFAULT_EPOCHS,
+            batch_size=piper_train.DEFAULT_BATCH,
+            accelerator="auto",
+            python="",
+            checkpoint="",
+        )
+    except piper_train.TrainError as e:
+        return {"started": False, "reason": str(e)}
+    # Probe before launching: the run gets a detached process, and a missing
+    # lightning there would only surface as a failed job minutes later.
+    env = await piper_train.probe(options["python"])
+    if not env.get("can_train"):
+        return {
+            "started": False,
+            "reason": env.get("hint") or "no Piper trainer found in this interpreter",
+            "setup_command": env.get("setup_command", ""),
+        }
+    options["flavor"] = env["flavor"]
+    notify = cfg.training_notify
+    options["notify"] = {"windows": bool(notify.windows), "discord": bool(notify.discord)}
+    options["attach"] = {
+        "profile": cfg.profile_name,
+        "name": "",                       # the run's own engine name
+        "display_name": str(result.get("name") or ""),
+    }
+    job = piper_train.start_run(state.voice_train, options)
+    if job.get("status") == "error":
+        return {
+            "started": False,
+            "reason": job.get("error") or "the trainer process could not start",
+        }
+    return {
+        "started": True,
+        "job": job,
+        "voice_name": options["voice_name"],
+        "epochs": options["epochs"],
+        "batch_size": options["batch_size"],
+    }
 
 
 def _build_app(
@@ -1495,6 +1590,7 @@ def _build_app(
 
     # ---------- Voice port — carry a cloned voice over to a local engine ----------
     from tts import voice_port as _vport
+    from tts import local_port as _lport
 
     @app.get("/api/voices/port")
     def api_voices_port_panel() -> dict[str, Any]:
@@ -1542,14 +1638,15 @@ def _build_app(
 
         This SPEAKS with the user's provider account (one request per clip), so
         the UI preflights it first: no key, no voice id or a local provider never
-        reaches the provider.
+        reaches the provider. The dataset it writes is handed to the trainer in
+        the same request, so the captured voice finishes on its own.
         """
         from config import get_runtime
         from tts.base import TTSError
 
         cfg = load_profile()
         try:
-            return await _vport.convert(
+            result = await _vport.convert(
                 profile=cfg.profile_name,
                 provider=body.provider,
                 voice_id=body.voice_id,
@@ -1565,6 +1662,69 @@ def _build_app(
             # The provider refused a clip: say so, keep the message the user can act on.
             logger.warning(f"voice port: capture failed: {e}")
             raise HTTPException(400, f"capture failed: {str(e)[:220]}")
+        # Spent credits must still end in audio even when the trainer is missing:
+        # the reason rides along instead of failing the build.
+        result["train"] = await _auto_train_after_import(
+            state, cfg, result, enabled=body.auto_train,
+        )
+        return result
+
+    # ---------- Local voice port — the same package, built offline ----------
+    @app.get("/api/voices/port/local")
+    def api_voices_port_local_panel(name: str = "") -> dict[str, Any]:
+        """Imported clips, formats and whether local Whisper can run right now.
+
+        Read-only and cheap: it never loads a Whisper model, so opening the
+        panel costs nothing even when the model is not cached.
+        """
+        cfg = load_profile()
+        return {
+            "ok": True,
+            **_lport.panel_payload(name.strip(), cfg.hearing.model_size),
+        }
+
+    @app.post("/api/voices/port/local")
+    async def api_voices_port_local(body: VoicePortLocalBody) -> dict[str, Any]:
+        """Package audio already on this machine — no provider, no key, no network.
+
+        Blocking on purpose (ffmpeg + Whisper are CPU work); FastAPI runs sync
+        routes in its threadpool, so the dashboard stays responsive.
+        """
+        import base64 as _b64
+
+        cfg = load_profile()
+        files: list[tuple[str, bytes]] = []
+        for i, f in enumerate(body.files, 1):
+            raw = (f.data or "").split(",", 1)[-1]
+            try:
+                blob = _b64.b64decode(raw, validate=False)
+            except Exception:
+                raise HTTPException(400, f"{f.filename or i} is not valid base64")
+            files.append((f.filename or f"clip{i}", blob))
+        try:
+            # Decoding + optional Whisper are CPU work: keep the event loop free
+            # so the rest of the dashboard stays responsive during a big import.
+            result = await asyncio.to_thread(
+                _lport.prepare,
+                name=body.name,
+                provider=body.provider,
+                voice_id=body.voice_id,
+                target=body.target,
+                lang=body.lang,
+                files=files,
+                texts=body.texts,
+                transcribe=body.transcribe,
+                use_saved=body.use_saved,
+                model_size=cfg.hearing.model_size,
+            )
+        except _lport.LocalPortError as e:
+            raise HTTPException(400, str(e))
+        # A build that succeeded must stay a success even when the trainer is
+        # missing: the reason rides along for the panel to show.
+        result["train"] = await _auto_train_after_import(
+            state, cfg, result, enabled=body.auto_train,
+        )
+        return result
 
     @app.post("/api/voices/port/attach")
     def api_voices_port_attach(body: VoicePortAttachBody) -> dict[str, Any]:

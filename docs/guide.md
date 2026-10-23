@@ -744,15 +744,44 @@ Profiles let you save and switch between different streamer configurations.
 
 ### Creating Profiles
 
-- **New profile**: Click ＋ in the top bar → enter a name
-- **Clone profile**: Click ⎘ to duplicate the current profile
+- **New profile**: Click ＋ in the top bar → enter a name (starts from the built-in defaults)
+- **Clone profile**: Click ⎘ to duplicate the current profile — **the YAML only**, so the clone starts with an empty voice library and no memories
 - **Switch**: Use the dropdown in the top bar
-- **Delete**: Click 🗑 (can't delete the last profile)
+- **Delete**: Click 🗑 (can't delete the last profile) — this removes the profile's `.yaml` only
 
 ### What's Saved in a Profile
 
 Everything: persona, LLM config, TTS config, vision settings, chat settings, avatar config, engine tuning. API keys are NOT part of profiles — they're stored in `.env` and shared across all profiles.
 The **voice library** (`profiles/<profile>.voices.json`) belongs to the profile too — see [The Voice Lab](#the-voice-lab) to copy, export or mirror voices between profiles.
+
+### Where Profiles Live
+
+A profile is a plain file in `profiles/`, and everything that character accumulates sits next to it
+under the same name:
+
+| File | Contents |
+|---|---|
+| `profiles/<name>.yaml` | the profile: persona, LLM/TTS/chat settings, every toggle |
+| `profiles/<name>.voices.json` | its saved-voice library (Voice Lab presets, cloned and local voices) |
+| `profiles/<name>.longterm.json` | durable facts kept across streams |
+| `profiles/<name>.memory.json` | the session-memory snapshot, per-person memories included |
+
+**Only `profiles/default.yaml` ships with the repo.** It is the template, and `.gitignore` keeps every
+other profile out of git — persona, backstory, the voice ids you cloned and what the streamer
+remembers about your chat never end up in a commit, a fork or a PR. Which profile is active is
+remembered in `.wallie_state.json`, also ignored.
+
+To start one from the template by hand:
+
+```bash
+cp profiles/default.yaml profiles/my-streamer.yaml
+```
+
+The file name **is** the profile name (the `profile_name` key inside is set from it when the file
+loads), and any `*.yaml` in `profiles/` appears in the dropdown on the next page load — there is no
+registry to edit. Profiles are plain text on purpose: keep one in a private repo, copy it to another
+machine, or edit it before launching. To move the *whole* character, copy the matching
+`.voices.json` and `.longterm.json` as well.
 
 ### Use Cases
 

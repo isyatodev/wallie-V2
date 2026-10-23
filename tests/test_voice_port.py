@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from config import AppConfig, Runtime, Secrets
-from tts import kokoro_setup, local_voices, piper_setup, voice_lab
+from tts import kokoro_setup, local_voices, piper_setup, piper_train as pt, voice_lab
 from tts import voice_port as vp
 from tts.base import TTSError
 
@@ -405,7 +405,7 @@ def test_port_route_captures_and_packages(dirs, monkeypatch, fake_tts):
     with app as client:
         r = client.post("/api/voices/port", json={
             "provider": "fish", "voice_id": "v1", "target": "piper",
-            "name": "Luna", "minutes": 1, "lang": "pt",
+            "name": "Luna", "minutes": 1, "lang": "pt", "auto_train": False,
         })
         assert r.status_code == 200, r.text
         data = r.json()
@@ -422,6 +422,83 @@ def test_port_route_without_a_key_spends_nothing(dirs, monkeypatch, fake_tts):
         assert r.status_code == 400
         assert "FISH_API_KEY" in r.json()["detail"]
     assert fake_tts.texts == [], "no clip may be captured without a key"
+
+
+def _stub_trainer(monkeypatch, seen: dict, *, can_train: bool = True, hint: str = ""):
+    async def _probe(python="", *, force=False):
+        return {
+            "python": python, "can_train": can_train,
+            "flavor": "piper1-gpl" if can_train else "",
+            "hint": hint or ("ready" if can_train else "no trainer found"),
+            "setup_command": "python -m pip install piper-tts[train]",
+        }
+
+    def _start(job, options):
+        seen.update(options)
+        pt.begin(job, kind="train", package=options["package"],
+                 voice_name=options["voice_name"], epochs=options["epochs"],
+                 python=options["python"])
+        job.update(status="running", running=True, pid=1,
+                   run_dir=str(Path(options["package"]) / "train" / "run-x"))
+        return pt.snapshot(job)
+
+    monkeypatch.setattr(pt, "probe", _probe)
+    monkeypatch.setattr(pt, "start_run", _start)
+
+
+def test_capture_starts_the_training_and_carries_the_attach_spec(
+        dirs, monkeypatch, fake_tts):
+    """The captured dataset is not left waiting for a click."""
+    seen: dict = {}
+    _stub_trainer(monkeypatch, seen)
+    app = _app(dirs, monkeypatch, Secrets(fish_api_key="k"))
+    with app as client:
+        r = client.post("/api/voices/port", json={
+            "provider": "fish", "voice_id": "v1", "target": "piper",
+            "name": "Luna", "minutes": 1, "lang": "pt", "auto_train": True,
+        })
+        assert r.status_code == 200, r.text
+        data = r.json()
+    assert data["clips"] == 8
+    assert data["train"]["started"] is True
+    assert data["train"]["job"]["running"] is True
+    assert seen["package"] == data["package"]
+    assert seen["voice_name"].startswith("pt_BR-")
+    # The supervisor installs the model with no dashboard watching.
+    assert seen["attach"] == {"profile": "luna", "name": "", "display_name": "Luna"}
+
+
+def test_capture_without_a_trainer_still_keeps_the_dataset(
+        dirs, monkeypatch, fake_tts):
+    """Paid audio is never lost because torch is missing."""
+    _stub_trainer(monkeypatch, {}, can_train=False,
+                  hint="lightning is missing — install piper-tts[train]")
+    app = _app(dirs, monkeypatch, Secrets(fish_api_key="k"))
+    with app as client:
+        r = client.post("/api/voices/port", json={
+            "provider": "fish", "voice_id": "v1", "target": "piper",
+            "name": "Luna", "minutes": 1, "lang": "pt",
+        })
+        assert r.status_code == 200, r.text
+        data = r.json()
+    assert data["train"]["started"] is False
+    assert "lightning" in data["train"]["reason"]
+    assert (Path(data["package"]) / "dataset" / "metadata.csv").is_file()
+
+
+def test_capture_can_skip_the_training(dirs, monkeypatch, fake_tts):
+    calls: list = []
+    monkeypatch.setattr(pt, "start_run", lambda *a, **k: calls.append(a) or {})
+    app = _app(dirs, monkeypatch, Secrets(fish_api_key="k"))
+    with app as client:
+        r = client.post("/api/voices/port", json={
+            "provider": "fish", "voice_id": "v1", "target": "piper",
+            "name": "Luna", "minutes": 1, "lang": "pt", "auto_train": False,
+        })
+        assert r.status_code == 200, r.text
+        data = r.json()
+    assert data["train"] == {"started": False, "reason": ""}
+    assert calls == []
 
 
 def test_attach_route_registers_the_voice(dirs, monkeypatch):
@@ -453,11 +530,14 @@ def test_voice_lab_ships_the_port_panel():
     html = (REPO / "dashboard" / "static" / "index.html").read_text(encoding="utf-8")
     app = (REPO / "dashboard" / "static" / "app.js").read_text(encoding="utf-8")
     assert "Convert to a local engine" in html
-    for hook in ('@click="portConvert()"', 'portPickFile($event)', 'portAttach()'):
+    for hook in ('@click="portConvert()"', 'portPickFile($event)', 'portAttach()',
+                 "voicePort.autoTrain", "portNextLine()"):
         assert hook in html, hook
     for method in ("portPickFile", "portPickSaved", "portConvert", "portAttachFiles", "portAttach"):
         assert f"\n    {method}(" in app or f"async {method}(" in app, method
     assert "voicePort:" in app
     assert '"/api/voices/port"' in app
+    # The panel's own switch has to reach the request, or the route defaults win.
+    assert "auto_train: !!this.voicePort.autoTrain" in app
     assert '"/api/voices/port/inspect"' in app
     assert '"/api/voices/port/attach"' in app
