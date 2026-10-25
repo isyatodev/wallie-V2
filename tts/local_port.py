@@ -54,9 +54,6 @@ MAX_FILE_BYTES = 40 * 1024 * 1024
 # A single take longer than this is almost certainly a recording, not a sample;
 # Piper wants short clips. It is cut (and reported), never silently kept whole.
 MAX_CLIP_SECONDS = 60.0
-# Below this the voice is technically buildable but audibly thin — a warning,
-# not a refusal: the whole point is that the user's material decides.
-THIN_SECONDS = 30.0
 
 # ``upload | sidecar | whisper`` — how each clip got its transcript.
 TRANSCRIPT_SOURCES = ("you typed", "the file's sidecar", "local Whisper")
@@ -470,10 +467,21 @@ def prepare(
             f"{voice_port.MIN_CLIPS}; add more audio or fix the silent ones"
         )
     total = round(sum(float(t["seconds"]) for t in takes), 2)
-    if total < THIN_SECONDS:
+    if spec["id"] == "piper" and total < voice_port.MIN_TRAIN_SECONDS:
+        # The same verdict as the training preflight and the capture port: an
+        # 8-second dataset is not a thin voice, it is pure noise. Refusing here
+        # also keeps the Train panel from offering a run that cannot work.
+        raise LocalPortError(
+            f"only {len(takes)} clip(s) / {total}s of speech — a Piper voice needs "
+            f"at least {int(voice_port.MIN_TRAIN_SECONDS)}s (10+ minutes recommended). "
+            "Training on this would export noise, not a voice, so the package was "
+            "not built. Your clips were kept — add more and build it again."
+        )
+    if spec["id"] == "piper" and total < voice_port.RECOMMENDED_TRAIN_SECONDS:
         warnings.append(
-            f"only {total}s of speech — the voice will be recognizable but rough; "
-            f"{int(THIN_SECONDS)}s+ hears much better"
+            f"only {total}s of speech — understandable but rough; "
+            f"{int(voice_port.RECOMMENDED_TRAIN_SECONDS)}+ seconds (ideally 10–30 "
+            "minutes) sounds much better"
         )
 
     origin = (

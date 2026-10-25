@@ -767,6 +767,13 @@ async def _auto_train_after_import(
         return {"started": False, "reason": ""}
     if result.get("target") != "piper":
         return {"started": False, "reason": "only Piper learns a voice from a dataset"}
+    # A short capture is kept (it was paid for) but cannot become a voice; do not
+    # start a run whose only outcome is the trainer's "too small" verdict.
+    if result.get("trainable") is False:
+        return {
+            "started": False,
+            "reason": result.get("training_error") or "the dataset is too small to train",
+        }
     if state.voice_train.get("running") or piper_train.active_job():
         return {
             "started": False,

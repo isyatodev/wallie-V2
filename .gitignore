@@ -68,6 +68,11 @@ wallie_house.schem
 scripts/star_forecast.py
 # Experimental — pipelined screen player (not part of Wallie)
 scripts/run_screen_player.py
+
+# Cloud training bundles/outputs (contain private voice audio and large .onnx)
+dist/luna-cloud/
+dist/luna-cloud.zip
+dist/luna-cloud-output/
 control/depth.py
 control/detector.py
 control/navigator.py

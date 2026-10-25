@@ -27,10 +27,12 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import time
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -89,12 +91,28 @@ _PROBE_CODE = (
     "        return u.find_spec(m) is not None\n"
     "    except Exception:\n"
     "        return False\n"
+    "def ver(m):\n"
+    "    try:\n"
+    "        from importlib.metadata import version\n"
+    "        return version(m)\n"
+    "    except Exception:\n"
+    "        return ''\n"
+    "def piper_root():\n"
+    "    try:\n"
+    "        s = u.find_spec('piper')\n"
+    "        locs = list(s.submodule_search_locations or []) if s else []\n"
+    "        return str(locs[0]) if locs else ''\n"
+    "    except Exception:\n"
+    "        return ''\n"
     "print(json.dumps({\n"
     "    'version': platform.python_version(),\n"
     "    'gpl': h('piper.train'),\n"
     "    'legacy': h('piper_train'),\n"
     "    'torch': h('torch'),\n"
+    "    'torch_v': ver('torch'),\n"
+    "    'onnxscript': h('onnxscript'),\n"
     "    'lightning': h('lightning'),\n"
+    "    'piper_root': piper_root(),\n"
     "}))\n"
 )
 
@@ -131,8 +149,32 @@ def _probe_sync(python: str) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _torch_needs_onnxscript(torch_version: str) -> bool:
+    """torch >= 2.9 exports through dynamo, which imports ``onnxscript``.
+
+    piper's ``[train]`` extra only says ``torch>=2,<3``, so a fresh install
+    resolves to a torch whose default export path needs a package the extra
+    never declares. No torch at all (``""``) also counts: pip will pull the
+    latest, which is past 2.9.
+    """
+    try:
+        major, minor = (int(x) for x in re.split(r"[.+]", torch_version)[:2])
+    except (TypeError, ValueError):
+        return True
+    return (major, minor) >= (2, 9)
+
+
 def _env_payload(python: str, raw: dict[str, Any]) -> dict[str, Any]:
     flavor = "piper1-gpl" if raw.get("gpl") else ("legacy" if raw.get("legacy") else "")
+    root = str(raw.get("piper_root") or "")
+    # The legacy trainer has no Cython core to be missing; piper1-gpl's wheel
+    # ships without it (see ensure_monotonic_align), so check the slot itself.
+    monotonic = flavor != "piper1-gpl" or _core_installed(root)
+    # The ONNX export runs through torch.onnx.export; with torch >= 2.9 that
+    # imports onnxscript, which piper's [train] extra does not declare.
+    export_missing = (not raw.get("onnxscript")) and _torch_needs_onnxscript(
+        str(raw.get("torch_v") or "")
+    )
     missing: list[str] = []
     if not flavor:
         missing.append(TRAIN_EXTRA)
@@ -140,6 +182,8 @@ def _env_payload(python: str, raw: dict[str, Any]) -> dict[str, Any]:
         missing.append("torch")
     if not raw.get("lightning"):
         missing.append("lightning")
+    if export_missing:
+        missing.append("onnxscript")
     ok = not missing
     if ok:
         hint = (
@@ -147,6 +191,11 @@ def _env_payload(python: str, raw: dict[str, Any]) -> dict[str, Any]:
             + ("piper1-gpl (python -m piper.train)" if flavor == "piper1-gpl"
                else "legacy piper_train (rhasspy/piper)")
         )
+        if flavor == "piper1-gpl" and not monotonic:
+            hint += (
+                " — note: this wheel has no monotonic_align core (an upstream "
+                "packaging bug); training installs a pure-Python fallback"
+            )
     elif not flavor:
         hint = (
             f"no Piper trainer behind this interpreter — install {TRAIN_EXTRA} "
@@ -156,6 +205,11 @@ def _env_payload(python: str, raw: dict[str, Any]) -> dict[str, Any]:
         hint = (
             f"{flavor} is importable but {', '.join(m for m in missing if m != TRAIN_EXTRA)} "
             f"is missing — install {TRAIN_EXTRA} in that interpreter"
+        )
+    if export_missing:
+        hint += (
+            " — also onnxscript: torch 2.9+ exports the .onnx through it and "
+            "piper's train extra never installs it"
         )
     return {
         "python": python,
@@ -168,11 +222,15 @@ def _env_payload(python: str, raw: dict[str, Any]) -> dict[str, Any]:
         }[flavor],
         "torch": bool(raw.get("torch")),
         "lightning": bool(raw.get("lightning")),
+        "monotonic": monotonic,
+        "piper_root": root,
+        "export_missing": export_missing,
         "missing": missing,
         "can_train": ok,
         "error": str(raw.get("error") or "")[:200],
         "hint": hint,
-        "setup_command": f'"{python}" -m pip install --upgrade "{TRAIN_EXTRA}"',
+        "setup_command": f'"{python}" -m pip install --upgrade "{TRAIN_EXTRA}"'
+        + (" onnxscript" if export_missing else ""),
     }
 
 
@@ -197,6 +255,197 @@ async def probe(python: str = "", *, force: bool = False) -> dict[str, Any]:
 
 def clear_probe_cache() -> None:
     _probe_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# monotonic_align — the alignment core piper's wheel never ships
+# ---------------------------------------------------------------------------
+#
+# piper-tts (<=1.8.0, every platform) installs train/vits/monotonic_align
+# with only __init__.py + setup.py: the compiled Cython core is absent from
+# both the wheels and the sdist, so the first training step dies with
+# ModuleNotFoundError and no pip reinstall fixes it. tts.monotonic_core is a
+# numpy implementation of the same alignment search; when the slot is empty
+# it is copied in as core.py, and a locally compiled core extension would
+# still win, because extensions load before source files.
+
+def _core_installed(root: str) -> bool:
+    """Whether the trainer's alignment core slot has something importable."""
+    if not root:
+        return False
+    slot = Path(root) / "train" / "vits" / "monotonic_align" / "monotonic_align"
+    if not slot.is_dir():
+        return False
+    # core.py, core.pyd, core.cp312-win_amd64.pyd, core.cpython-312-…so —
+    # but never the unbuilt leftovers (core.c, core.pyx).
+    return any(p.suffix in {".py", ".pyd", ".so"} for p in slot.glob("core*"))
+
+
+def ensure_monotonic_align(python: str, root: str = "") -> dict[str, Any]:
+    """Install the pure-Python alignment core if the wheel left it out.
+
+    Idempotent, and it reports instead of raising: the caller decides
+    whether an empty core is fatal (it is, right before training). ``state``
+    is ``present`` (nothing to do), ``installed`` (wrote core.py), ``absent``
+    (no piper1-gpl install to heal) or ``error`` — with ``detail`` saying
+    why, e.g. a read-only site-packages.
+    """
+    root = (root or "").strip() or _piper_root(python)
+    if not root:
+        return {"state": "absent"}
+    base = Path(root) / "train" / "vits" / "monotonic_align"
+    if not base.is_dir():
+        return {"state": "absent"}
+    if _core_installed(root):
+        return {"state": "present"}
+    from . import monotonic_core  # numpy — kept out of the dashboard's import
+
+    slot = base / "monotonic_align"
+    try:
+        slot.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(monotonic_core.__file__, slot / "core.py")
+    except OSError as e:
+        return {"state": "error", "detail": str(e)[:200],
+                "target": str(slot / "core.py")}
+    return {"state": "installed", "target": str(slot / "core.py")}
+
+
+def _piper_root(python: str) -> str:
+    """The piper package root behind ``python`` (``""`` when not installed)."""
+    return str(_probe_sync(interpreter(python)).get("piper_root") or "")
+
+
+def ensure_export_compat(python: str, root: str = "") -> dict[str, Any]:
+    """Make piper's exporter work on torch >= 2.9 — its own call does not.
+
+    piper's ``export_onnx`` was written for the TorchScript exporter (it
+    passes ``dynamic_axes`` at opset 15) but omits ``dynamo``, so on torch
+    2.9+, where ``dynamo=True`` is the default, it runs the new exporter —
+    which refuses this model (a data-dependent ``assert`` in the spline
+    flow). Stock piper never mentions ``dynamo``, so the check is a plain
+    marker scan and the patch is idempotent; a piper that someday passes the
+    flag itself is left alone. Same report contract as
+    :func:`ensure_monotonic_align`; callers pass ``root`` from the probe (an
+    empty root means no known install, so nothing is touched).
+    """
+    root = (root or "").strip() or _piper_root(python)
+    if not root:
+        return {"state": "absent"}
+    src = Path(root) / "train" / "export_onnx.py"
+    if not src.is_file():
+        return {"state": "absent"}
+    try:
+        with open(src, "r", encoding="utf-8", newline="") as fh:
+            text = fh.read()
+        if "dynamo=" in text:
+            return {"state": "present"}
+        anchor = text.find("torch.onnx.export(")
+        if anchor < 0:
+            return {
+                "state": "error",
+                "detail": "export_onnx.py no longer calls torch.onnx.export( — "
+                          "this piper build needs dynamo=False and the file "
+                          "changed shape",
+                "target": str(src),
+            }
+        # Insert the flag as the call's first argument, in the file's own
+        # indentation and line endings, so everything else stays byte-identical.
+        nl = text.find("\n", anchor)
+        eol = "\r\n" if text[nl - 1:nl] == "\r" else "\n"
+        pos = nl + 1
+        indent = re.match(r"[ \t]*", text[pos:]).group(0)
+        line = (
+            f"{indent}dynamo=False,  # torch >= 2.9 defaults to dynamo, which "
+            f"cannot export this model (this call targets the legacy exporter){eol}"
+        )
+        with open(src, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text[:pos] + line + text[pos:])
+    except OSError as e:
+        return {"state": "error", "detail": str(e)[:200], "target": str(src)}
+    return {"state": "installed", "target": str(src)}
+
+
+def ensure_checkpoint_compat(python: str, root: str = "") -> dict[str, Any]:
+    """Drop piper's optional ``val_mos`` ModelCheckpoint callback.
+
+    piper's CLI always adds a second checkpoint callback monitoring
+    ``val_mos``. That metric is only logged when the UTMOS predictor scores a
+    test split, and this trainer deliberately sets
+    ``num_test_examples=0`` — so as soon as validation runs, Lightning raises
+    ``ModelCheckpoint(monitor='val_mos') could not find the monitored key`` at
+    the end of the first epoch. A run without a validation split (the old
+    three-clip case) never reaches the hook, which is why this stayed hidden.
+
+    The ``val_mel`` callback is the one used for resume and export, so the
+    optional callback is removed. Idempotent: a piper whose CLI no longer has
+    it is left alone. Same report contract as
+    :func:`ensure_export_compat`.
+    """
+    root = (root or "").strip() or _piper_root(python)
+    if not root:
+        return {"state": "absent"}
+    src = Path(root) / "train" / "__main__.py"
+    if not src.is_file():
+        return {"state": "absent"}
+    try:
+        text = src.read_text(encoding="utf-8")
+        if 'monitor="val_mos"' not in text:
+            return {"state": "present"}
+        patched, count = re.subn(
+            r'\n    ModelCheckpoint\(\n        monitor="val_mos",.*?\n    \),?\n',
+            "\n",
+            text,
+            count=1,
+            flags=re.S,
+        )
+        if not count:
+            return {
+                "state": "error",
+                "detail": "train/__main__.py has a val_mos callback this patch "
+                          "cannot locate — this piper build changed shape",
+                "target": str(src),
+            }
+        src.write_text(patched, encoding="utf-8")
+    except OSError as e:
+        return {"state": "error", "detail": str(e)[:200], "target": str(src)}
+    return {"state": "installed", "target": str(src)}
+
+
+def _heal_trainer(job: dict[str, Any], env: dict[str, Any]) -> None:
+    """Heal the trainer's known gaps during setup, leaving a trace."""
+    root = str(env.get("piper_root") or "")
+    if env.get("flavor") == "piper1-gpl" and not env.get("monotonic", True):
+        healed = ensure_monotonic_align(env["python"], root)
+        if healed["state"] == "installed":
+            job["log"] += (
+                "• installed the pure-Python monotonic_align fallback — piper's "
+                "wheel ships without the compiled core\n"
+            )
+        elif healed["state"] == "error":
+            job["log"] += (
+                f"⚠ could not write the alignment fallback: {healed['detail']}\n"
+            )
+    if root:
+        compat = ensure_export_compat("", root)
+        if compat["state"] == "installed":
+            job["log"] += (
+                "• patched piper's export with dynamo=False — torch 2.9+ "
+                "defaults to the exporter this model cannot pass\n"
+            )
+        elif compat["state"] == "error":
+            job["log"] += (
+                f"⚠ could not patch piper's export_onnx.py: {compat['detail']}\n"
+            )
+        ckpt = ensure_checkpoint_compat("", root)
+        if ckpt["state"] == "installed":
+            job["log"] += (
+                "• removed piper's optional val_mos checkpoint — this trainer "
+                "has no test split to score it\n"
+            )
+        elif ckpt["state"] == "error":
+            job["log"] += (
+                f"⚠ could not remove piper's val_mos checkpoint: {ckpt['detail']}\n"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +607,9 @@ def prepare_run(package: Path, run_dir: Path, flavor: str, voice_name: str) -> d
         "config_path": str(run_dir / f"{voice_name}.json"),
         "espeak": str(lang.get("espeak") or "en-us"),
         "sample_rate": rate,
+        # Measured from the clips the trainer will actually read, not trusted
+        # from the manifest: a missing/renamed WAV must not look like speech.
+        "seconds": dataset_seconds(dataset / "metadata.csv", dataset / "wav"),
     }
     if flavor == "piper1-gpl":
         csv_path = run_dir / "train.csv"
@@ -375,6 +627,42 @@ def count_csv_rows(csv_path: Path) -> int:
         if "|" in raw and raw.split("|", 1)[1].strip():
             count += 1
     return count
+
+
+def _wav_seconds(path: Path) -> float:
+    """Duration of one dataset clip (0.0 when it cannot be read as WAV)."""
+    try:
+        with wave.open(str(path), "rb") as w:
+            rate = w.getframerate()
+            return w.getnframes() / float(rate) if rate else 0.0
+    except (OSError, EOFError, wave.Error):
+        return 0.0
+
+
+def dataset_seconds(csv_path: Path, audio_dir: Path) -> float:
+    """Total speech in a Piper dataset, from the CSV rows the trainer reads.
+
+    The package manifest records what was captured, but training reads
+    ``metadata.csv`` + the WAVs, so this measures those. A row whose file is
+    missing (or is not a WAV) contributes nothing — that is exactly the case a
+    duration gate has to catch, and the trainer will skip it anyway.
+    """
+    total = 0.0
+    try:
+        lines = csv_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0.0
+    for raw in lines:
+        line = raw.strip()
+        if "|" not in line:
+            continue
+        name, _, text = line.partition("|")
+        if not text.strip():
+            continue
+        name = Path(name.strip()).name
+        if name:
+            total += _wav_seconds(audio_dir / name)
+    return round(total, 2)
 
 
 def preprocess_argv(env: dict[str, Any], prepared: dict[str, Any], run_dir: Path) -> list[str]:
@@ -449,12 +737,16 @@ def train_argv(
 def _validation_split(prepared: dict[str, Any]) -> float:
     """Hold out at least one clip, even on a 3-clip package.
 
-    piper1-gpl defaults to 0.1, which floors to zero for fewer than ten clips —
-    an empty val_dataloader makes Lightning refuse to start. A fraction that
-    guarantees one clip keeps the monitor usable.
+    piper1-gpl computes ``valid_set_size = int(n * validation_split)`` — it
+    floors. Asking for exactly ``1 / n`` is 0.3333… for three clips, which
+    floors to **zero**: the val_dataloader ends up empty, Lightning never runs
+    validation, ``val_mel``/``val_mos`` are never logged, ModelCheckpoint has
+    nothing to monitor and the run silently exports its last (worst) epoch.
+    Asking for 1.5 clips leaves the floor at one despite float error, while
+    staying within the 0.1–0.5 range piper expects.
     """
     clips = max(1, int(prepared.get("clips") or 0))
-    return min(0.5, max(0.1, 1.0 / clips))
+    return min(0.5, max(0.1, 1.5 / clips))
 
 
 def export_argv(env: dict[str, Any], checkpoint: Path, onnx: Path) -> list[str]:
@@ -541,6 +833,9 @@ def new_job() -> dict[str, Any]:
         "run_dir": "",
         "flavor": "",
         "python": "",
+        "clips": 0,
+        "seconds": 0.0,
+        "batch_size": DEFAULT_BATCH,
         "started_at": None,
         "finished_at": None,
         "error": "",
@@ -569,7 +864,8 @@ def begin(job: dict[str, Any], *, kind: str, package: str = "", voice_name: str 
         running=True, status="running", kind=kind, phase="", phase_label="starting…",
         progress=0, epoch=int((resumed_from or {}).get("epoch") or 0), epochs=epochs,
         voice_name=voice_name, package=package, run_dir="", flavor=flavor,
-        python=python, started_at=time.time(), finished_at=None, error="",
+        python=python, clips=0, seconds=0.0, batch_size=DEFAULT_BATCH,
+        started_at=time.time(), finished_at=None, error="",
         cancelled=False, resumed_from=dict(resumed_from or {}), log="",
         steps=[], exported={}, notified={}, attached={}, attach_error="",
     )
@@ -955,6 +1251,22 @@ async def run_train(
     def log(line: str) -> None:
         job["log"] = (job["log"] + line + "\n")[-MAX_LOG_CHARS:]
 
+    def log_failure(message: str) -> None:
+        """Put a failure where the user will look: the job and train.log.
+
+        The panel reads ``job["error"]``, but a restarted dashboard only reads
+        train.log for its log tail — an error that exists only in memory is
+        gone exactly when the user goes looking for it.
+        """
+        banner = "=" * 72
+        log(f"✗ TRAINING FAILED — {message}")
+        if log_file is not None:
+            try:
+                log_file.write(f"\n{banner}\nTRAINING FAILED\n{message}\n{banner}\n")
+                log_file.flush()
+            except OSError:
+                pass
+
     def notify() -> None:
         if on_change is None:
             return
@@ -984,6 +1296,51 @@ async def run_train(
         job["flavor"] = env["flavor"]
         if not env["can_train"]:
             raise TrainError(env["hint"] + " — press “install train deps” or set another interpreter")
+        if env["flavor"] == "piper1-gpl" and not env.get("monotonic", True):
+            # The wheel ships without the alignment core, so fit would die in
+            # its first training_step. Heal it before any prep, and refuse to
+            # start at all when the fallback cannot be written either.
+            healed = ensure_monotonic_align(
+                options["python"], str(env.get("piper_root") or "")
+            )
+            if healed["state"] == "installed":
+                log(
+                    "• piper's wheel ships without its monotonic_align core — "
+                    "installed the pure-Python alignment fallback (same MAS)"
+                )
+            elif healed["state"] == "error":
+                raise TrainError(
+                    "the trainer has no monotonic_align core and the fallback "
+                    f"could not be written ({healed['detail']}) — make the venv "
+                    "writable or build the core with MSVC, then start again"
+                )
+        if env["flavor"] == "piper1-gpl" and env.get("piper_root"):
+            # Export only runs an hour in; patch piper's call now, so a torch
+            # whose default exporter cannot pass this model fails the run
+            # before any training happens instead of after it.
+            compat = ensure_export_compat("", str(env["piper_root"]))
+            if compat["state"] == "installed":
+                log(
+                    "• patched piper's export with dynamo=False — torch 2.9+ "
+                    "defaults to the exporter this model cannot pass"
+                )
+            elif compat["state"] == "error":
+                raise TrainError(
+                    "piper's export must pass dynamo=False on torch 2.9+ and "
+                    f"export_onnx.py could not be patched ({compat['detail']})"
+                )
+            ckpt = ensure_checkpoint_compat("", str(env["piper_root"]))
+            if ckpt["state"] == "installed":
+                log(
+                    "• removed piper's optional val_mos checkpoint — this "
+                    "trainer has no test split to score it"
+                )
+            elif ckpt["state"] == "error":
+                raise TrainError(
+                    "piper's val_mos checkpoint would abort the first validation "
+                    f"epoch and train/__main__.py could not be patched "
+                    f"({ckpt['detail']})"
+                )
 
         pkg = Path(options["package"])
         run_dir = Path(run_dir) if run_dir is not None else new_run_dir(pkg)
@@ -1005,11 +1362,52 @@ async def run_train(
         )
 
         prepared = prepare_run(pkg, run_dir, env["flavor"], options["voice_name"])
-        if int(prepared.get("clips") or 0) < 3:
+        clips = int(prepared.get("clips") or 0)
+        seconds = float(prepared.get("seconds") or 0.0)
+        record.update(clips=clips, seconds=seconds)
+        job["clips"], job["seconds"] = clips, seconds
+        log(f"• dataset: {clips} clip(s) · {seconds:.1f}s of speech")
+        if clips < 3:
             raise TrainError(
                 "a Piper dataset needs at least 3 clips — re-run the conversion "
                 "with more minutes"
             )
+        if seconds < voice_port.MIN_TRAIN_SECONDS:
+            raise TrainError(
+                f"the dataset is too small to train a voice: {clips} clip(s) / "
+                f"{seconds:.1f}s of speech. This trainer starts from random weights, "
+                f"so it needs at least {int(voice_port.MIN_TRAIN_SECONDS)}s "
+                "(10+ minutes recommended); below that it only learns noise — that is "
+                "the robotic audio a run like this exports. Add more audio and build "
+                "the package again."
+            )
+        if seconds < voice_port.RECOMMENDED_TRAIN_SECONDS:
+            log(
+                f"⚠ {seconds:.1f}s is below the recommended "
+                f"{int(voice_port.RECOMMENDED_TRAIN_SECONDS)}s — the voice may still "
+                "sound rough when the run finishes"
+            )
+        # Mirror piper's own floor (valid_set_size = int(n * split)) so the batch
+        # can never swallow the whole train split. With 3 clips and batch_size 8
+        # the trainer logged "Train split (3) is not larger than batch_size (8)"
+        # and trained one ragged batch per epoch.
+        split = _validation_split(prepared) if env["flavor"] == "piper1-gpl" else 0.0
+        held_out = int(clips * split)
+        train_clips = max(1, clips - held_out)
+        requested_batch = int(options["batch_size"])
+        effective_batch = max(1, min(requested_batch, train_clips))
+        if effective_batch != requested_batch:
+            log(
+                f"• batch size {requested_batch} is larger than the "
+                f"{train_clips}-clip train split — using {effective_batch}"
+            )
+        options["batch_size"] = effective_batch
+        job["batch_size"] = effective_batch
+        record["batch_size"] = effective_batch
+        log(
+            f"• split: {train_clips} train / {held_out} validation clip(s) · "
+            f"batch {effective_batch}"
+        )
         job["package"] = str(pkg)
         steps: list[dict[str, str]] = []
         if env["flavor"] == "legacy":
@@ -1082,7 +1480,7 @@ async def run_train(
                 env, prepared, run_dir,
                 voice_name=options["voice_name"],
                 epochs=options["epochs"],
-                batch_size=options["batch_size"],
+                batch_size=effective_batch,
                 accelerator=options["accelerator"],
                 checkpoint=options["checkpoint"],
             ),
@@ -1148,7 +1546,7 @@ async def run_train(
     except TrainError as e:
         job.update(status="error", running=False, finished_at=time.time(),
                    phase="error", phase_label="failed", error=str(e))
-        log(f"✗ {e}")
+        log_failure(str(e))
         if run_dir is not None:
             _write_run(run_dir, {**record, "steps": job.get("steps") or [],
                                  "status": "error", "error": str(e),
@@ -1158,7 +1556,7 @@ async def run_train(
         msg = f"unexpected training failure: {str(e)[:220]}"
         job.update(status="error", running=False, finished_at=time.time(),
                    phase="error", phase_label="failed", error=msg)
-        log(f"✗ {msg}")
+        log_failure(msg)
         if run_dir is not None:
             _write_run(run_dir, {**record, "steps": job.get("steps") or [],
                                  "status": "error", "error": msg,
@@ -1189,13 +1587,19 @@ async def run_setup(job: dict[str, Any], python: str = "") -> None:
             job.update(status="done", running=False, finished_at=time.time(),
                        progress=100.0, phase="done", phase_label="ready", exported={})
             job["log"] = "✓ the trainer is already installed — nothing to do\n"
+            # "Installed" is exactly where the wheel-without-core state hides:
+            # finish the job, but fill the slot if it is still empty.
+            _heal_trainer(job, env)
             return
         # The command is exactly the one shown in the panel (nothing hidden);
         # only the tail of its output is kept, on the job itself.
-        job["log"] = f"$ {exe} -m pip install --upgrade {TRAIN_EXTRA}\n"
+        argv = [exe, "-m", "pip", "install", "--upgrade", TRAIN_EXTRA]
+        if env.get("export_missing"):
+            argv.append("onnxscript")
+        job["log"] = "$ " + " ".join(argv) + "\n"
         rc = await _stream(
             job,
-            [exe, "-m", "pip", "install", "--upgrade", TRAIN_EXTRA],
+            argv,
             cwd=piper_setup.REPO_ROOT,
             log_file=None,
             on_line=lambda line: job.__setitem__(
@@ -1215,6 +1619,8 @@ async def run_setup(job: dict[str, Any], python: str = "") -> None:
             job.update(status="error", error=env["hint"], phase="error",
                        phase_label="failed")
             job["log"] += f"\n✗ {env['hint']}\n"
+        else:
+            _heal_trainer(job, env)
     except _Cancelled:
         job.update(status="cancelled", running=False, finished_at=time.time(),
                    phase="cancelled", phase_label="cancelled")
@@ -1650,6 +2056,16 @@ def attach_run(
             "the .onnx and .onnx.json names must match (Piper loads them as a pair)"
         )
     manifest = voice_port.read_manifest(pkg)
+    seconds = float(record.get("seconds") or manifest.get("seconds") or 0.0)
+    if 0.0 < seconds < voice_port.MIN_TRAIN_SECONDS:
+        # Installing this would put noise in the voice picker under a real
+        # name, and the next test would sound broken instead of explaining why.
+        raise TrainError(
+            f"this run was trained on only {seconds:.1f}s of speech — the exported "
+            "model is noise, not a voice. A Piper voice needs at least "
+            f"{int(voice_port.MIN_TRAIN_SECONDS)}s (10+ minutes recommended). Add "
+            "more audio, train again, then attach that run."
+        )
     stem = (name or "").strip() or str(record.get("voice_name") or onnx.stem)
     return voice_port.attach(
         profile=profile,

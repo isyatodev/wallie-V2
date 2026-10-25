@@ -43,6 +43,9 @@ def dirs(tmp_path, monkeypatch):
     (tmp_path / "profiles").mkdir()
     monkeypatch.setattr(piper_setup, "DEFAULT_VOICES_DIR", tmp_path / "voices")
     monkeypatch.setattr(kokoro_setup, "DEFAULT_VOICES_DIR", tmp_path / "voices" / "kokoro")
+    # Packaging tests use short stubbed captures; the duration gate has its own
+    # test, which raises this back to the real minimum.
+    monkeypatch.setattr(vp, "MIN_TRAIN_SECONDS", 0.0)
     return tmp_path
 
 
@@ -147,7 +150,8 @@ def test_duplicates_inside_one_file_collapse():
 # ---------------------------------------------------------------------------
 
 def test_clips_cover_the_requested_minutes_and_stay_bounded():
-    assert vp.clips_for(1, "pt") == 8
+    # One minute is below the capture floor: it becomes two, not eight clips.
+    assert vp.clips_for(1, "pt") == vp.clips_for(vp.MIN_MINUTES, "pt") == 15
     assert vp.clips_for(999, "pt") == vp.MAX_CLIPS
     # Below the floor means the floor, not a negative clip count.
     assert vp.clips_for(-4, "pt") == vp.clips_for(vp.MIN_MINUTES, "pt")
@@ -174,7 +178,7 @@ def test_preflight_needs_the_provider_key_and_says_what_is_missing():
 
     plan = vp.preflight(provider="fish", voice_id="v1", target="piper",
                         seconds=60, lang="pt", secrets=Secrets(fish_api_key="k"))
-    assert plan["clips"] == 8
+    assert plan["clips"] == 15
     assert plan["target"]["sample_rate"] == 22050
     # The honest half: a port captures audio, it does not fetch the model.
     assert any("not its weights" in w for w in plan["warnings"])
@@ -227,27 +231,28 @@ async def test_convert_builds_a_piper_dataset(dirs, fake_tts):
         secrets=Secrets(fish_api_key="k"),
     )
     pkg = Path(report["package"])
+    expected = vp.clips_for(1, "pt")
     assert pkg.is_dir() and pkg.parent == vp.ported_dir()
-    assert report["clips"] == 8
+    assert report["clips"] == expected
     assert fake_tts.closed, "the provider must be closed even on the happy path"
-    assert len(fake_tts.texts) == 8
+    assert len(fake_tts.texts) == expected
 
     wavs = sorted((pkg / "dataset" / "wav").glob("*.wav"))
-    assert len(wavs) == 8
+    assert len(wavs) == expected
     ch, width, rate, frames = _wav_info(wavs[0])
     assert (ch, width, rate) == (1, 2, 22050)
     assert frames > 0
 
     rows = (pkg / "dataset" / "metadata.csv").read_text(encoding="utf-8").strip().splitlines()
-    assert len(rows) == 8
+    assert len(rows) == expected
     assert rows[0].startswith("wav/0001.wav|")
-    assert rows[0].split("|", 1)[1] == vp.corpus_lines("pt", 8)[0]
+    assert rows[0].split("|", 1)[1] == vp.corpus_lines("pt", expected)[0]
 
     manifest = json.loads((pkg / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["format"] == "wallie.port"
     assert manifest["source"]["provider"] == "fish"
     assert manifest["target"]["sample_rate"] == 22050
-    assert manifest["clips"] == 8
+    assert manifest["clips"] == expected
     # The originals are kept at the capture rate for a second engine.
     assert _wav_info(pkg / "corpus" / "0001.wav")[2] == vp.CAPTURE_SR
     assert report["audition"]["url"].startswith("data:audio/wav;base64,")
@@ -282,6 +287,39 @@ async def test_a_silent_clip_fails_the_port_instead_of_building_a_bad_dataset(di
             target="piper", minutes=1, lang="pt", secrets=Secrets(fish_api_key="k"),
         )
     assert "silent" in str(e.value)
+
+
+def test_a_piper_package_below_the_training_minimum_is_refused(dirs, monkeypatch):
+    """Short audio is not a thin voice — it is guaranteed noise."""
+    monkeypatch.setattr(vp, "MIN_TRAIN_SECONDS", 60.0)
+    takes = [
+        {"index": i, "text": "linha", "pcm": b"\x00\x01" * vp.CAPTURE_SR,
+         "seconds": 1.0}
+        for i in (1, 2, 3)
+    ]
+    with pytest.raises(vp.VoicePortError) as e:
+        vp.build_package(target="piper", name="Luna", takes=takes,
+                         source=vp.PortSource(name="luna"), lang="pt")
+    assert "noise" in str(e.value) and "at least 60s" in str(e.value)
+    # Refused before _clear_dir: an existing good package is left untouched.
+    assert not (vp.ported_dir() / "Luna-piper").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_short_capture_is_kept_but_marked_untrainable(dirs, fake_tts, monkeypatch):
+    """Credits were spent: keep the audio, refuse to pretend it can train."""
+    monkeypatch.setattr(vp, "MIN_TRAIN_SECONDS", 60.0)
+    report = await vp.convert(
+        profile="luna", provider="fish", voice_id="v1", name="Luna short",
+        target="piper", minutes=1, lang="pt",
+        secrets=Secrets(fish_api_key="k"),
+    )
+    assert report["trainable"] is False
+    assert "noise" in report["training_error"]
+    assert report["next"].startswith("✗ ")
+    pkg = Path(report["package"])
+    assert (pkg / "dataset" / "metadata.csv").is_file()
+    assert len(list((pkg / "dataset" / "wav").glob("*.wav"))) == report["clips"]
 
 
 def test_package_dir_never_escapes_the_ported_folder(dirs):
@@ -409,8 +447,27 @@ def test_port_route_captures_and_packages(dirs, monkeypatch, fake_tts):
         })
         assert r.status_code == 200, r.text
         data = r.json()
-        assert data["clips"] == 8
+        assert data["clips"] == vp.clips_for(1, "pt")
         assert Path(data["package"], "dataset", "metadata.csv").is_file()
+
+
+def test_a_short_capture_does_not_start_a_doomed_training_run(
+        dirs, monkeypatch, fake_tts):
+    monkeypatch.setattr(vp, "MIN_TRAIN_SECONDS", 60.0)
+    calls: list = []
+    monkeypatch.setattr(pt, "start_run", lambda *a, **k: calls.append(a) or {})
+    app = _app(dirs, monkeypatch, Secrets(fish_api_key="k"))
+    with app as client:
+        r = client.post("/api/voices/port", json={
+            "provider": "fish", "voice_id": "v1", "target": "piper",
+            "name": "Luna", "minutes": 1, "lang": "pt", "auto_train": True,
+        })
+        assert r.status_code == 200, r.text
+        data = r.json()
+    assert data["trainable"] is False
+    assert data["train"]["started"] is False
+    assert "noise" in data["train"]["reason"]
+    assert calls == []
 
 
 def test_port_route_without_a_key_spends_nothing(dirs, monkeypatch, fake_tts):
@@ -459,7 +516,7 @@ def test_capture_starts_the_training_and_carries_the_attach_spec(
         })
         assert r.status_code == 200, r.text
         data = r.json()
-    assert data["clips"] == 8
+    assert data["clips"] == vp.clips_for(1, "pt")
     assert data["train"]["started"] is True
     assert data["train"]["job"]["running"] is True
     assert seen["package"] == data["package"]

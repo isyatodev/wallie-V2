@@ -1,0 +1,24 @@
+STATUS: error
+ERROR: the ONNX export failed — the log has the exporter's reason
+FLAVOR: piper1-gpl EPOCH: 0
+EXPORTED: {}
+---- log tail ----
+Traceback (most recent call last):
+  File "C:\Users\Yato\Desktop\kansai\_smoke_train.py", line 26, in <module>
+    asyncio.run(main())
+  File "C:\Users\Yato\AppData\Local\Programs\Python\Python312\Lib\asyncio\runners.py", line 195, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Users\Yato\AppData\Local\Programs\Python\Python312\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Yato\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 691, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "C:\Users\Yato\Desktop\kansai\_smoke_train.py", line 22, in main
+    print("\n".join(job.get("log", "").splitlines()[-40:]))
+  File "C:\Users\Yato\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2717' in position 3416: character maps to <undefined>
+EXIT=1

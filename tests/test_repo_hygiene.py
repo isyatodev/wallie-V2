@@ -160,6 +160,8 @@ KEY_PATTERNS = {
 # justified; anything else that looks like a key belongs in .env, never in git.
 ALLOWED_DUMMY_KEYS = {
     ("tests/test_vision_test.py", "sk-abcdefghijklmnopqrstuvwxyz"),
+    # The allow-list itself contains the dummy, so the scan always finds it here.
+    ("tests/test_repo_hygiene.py", "sk-abcdefghijklmnopqrstuvwxyz"),
 }
 
 

@@ -78,11 +78,26 @@ PORTER_PROVIDERS: dict[str, str] = {"fish": "fish", "elevenlabs": "elevenlabs"}
 
 # How much audio a port can capture in one run. The corpus is cycled when the
 # requested minutes exceed it, which is normal for TTS datasets.
-MIN_MINUTES = 1.0
+# Two minutes is the shortest capture that reliably clears
+# MIN_TRAIN_SECONDS once the takes are trimmed (one minute is ~8 clips, which
+# can land under a minute of speech). Refusing after the provider was billed
+# would waste the capture, so the floor is raised before any clip is spoken.
+MIN_MINUTES = 2.0
 MAX_MINUTES = 12.0
 AVG_CLIP_SECONDS = 8.0
 MAX_CLIPS = 90
 MIN_CLIPS = 3
+
+# How much speech a Piper voice needs before training can possibly work. This
+# is a hard floor, not a style preference: the trainer here starts from random
+# weights, and below this it learns noise, not a voice (an 8-second dataset
+# exports pure robotic noise, which the Voice page then plays as if it were a
+# voice). Enforced when the package is built (this module and tts.local_port)
+# and again before a training run starts.
+MIN_TRAIN_SECONDS = 60.0
+# Below this the result is still rough; 10+ minutes is where a voice starts to
+# hold up. Reported as a warning, never enforced.
+RECOMMENDED_TRAIN_SECONDS = 600.0
 
 # Trimmed clips keep this much margin around the speech, so a hard cut never
 # clips the first or last phoneme.
@@ -425,6 +440,11 @@ def preflight(
             "the .onnx has to be trained from it — the Train panel below does that "
             "in the dashboard (progress, log, cancel)"
         )
+        warnings.append(
+            f"a trainable Piper voice needs at least {MIN_TRAIN_SECONDS:.0f}s of "
+            f"speech (10+ minutes recommended); this capture is planned at about "
+            f"{clips * AVG_CLIP_SECONDS:.0f}s — anything shorter exports noise"
+        )
     else:
         warnings.append(
             "Kokoro voices are learned style embeddings — the package is a 24 kHz "
@@ -610,9 +630,12 @@ progress and a stop button:
   last checkpoint** — the finished epochs are kept instead of retrained.
 * espeak voice: `{lang['espeak']}`; it is also recorded in `manifest.json`.
 * A `.ckpt` checkpoint fine-tunes far better than training from scratch.
-* {clips} clips ({seconds}s) is enough to hear the voice. A voice that has to
-  live on stream wants 10–30 minutes — re-run the port with more minutes (the
-  corpus is cycled, which is normal for TTS datasets).
+* {clips} clips ({seconds}s) is the training data. This trainer starts from
+  random weights, so **at least {MIN_TRAIN_SECONDS:.0f}s is required** and
+  {RECOMMENDED_TRAIN_SECONDS / 60:.0f}–30 minutes is where a voice starts to
+  sound like a person. Under the minimum the run only learns noise — re-run
+  the port with more minutes (the corpus is cycled, which is normal for TTS
+  datasets) or import more audio.
 
 The run writes `train/run-*/train.log`, its checkpoints and — on success —
 `<name>.onnx` + `.onnx.json`. Attach that pair from the same panel (or with the
@@ -684,16 +707,34 @@ def build_package(
     lang: str,
     now: str = "",
     origin: str = "",
+    enforce_minimum: bool = True,
 ) -> dict[str, Any]:
     """Write the engine-specific package for already-captured takes.
 
     ``origin`` replaces the README's default "captured with the provider" line:
     a package built from audio the user already had (``tts.local_port``) must not
     claim a provider ever spoke those clips.
+
+    ``enforce_minimum=False`` is for the capture path: the provider has already
+    been paid for that audio, so it is written even when it is too short to
+    train on. The caller then marks the package untrainable instead of
+    discarding the clips.
     """
     spec = target_spec(target)
     corpus = lang_spec(lang)
     now = now or _now_iso()
+    seconds = round(sum(float(t["seconds"]) for t in takes), 2)
+    # Refuse before touching the folder: a previous good package must survive a
+    # build that cannot produce a trainable one. The same verdict is repeated
+    # by tts.local_port and before a training run, so the message cannot be
+    # missed no matter which path the user takes.
+    if spec["id"] == "piper" and enforce_minimum and seconds < MIN_TRAIN_SECONDS:
+        raise VoicePortError(
+            f"only {len(takes)} clip(s) / {seconds:.1f}s of speech — a Piper voice "
+            f"needs at least {MIN_TRAIN_SECONDS:.0f}s (10+ minutes recommended). "
+            "Training on this would export noise, not a voice, so the package was "
+            "not built. Add more audio and build it again."
+        )
     pkg = ported_dir() / f"{slug(name)}-{spec['id']}"
     _clear_dir(pkg)
 
@@ -705,7 +746,6 @@ def build_package(
         "\n".join(t["text"] for t in takes) + "\n", encoding="utf-8"
     )
 
-    seconds = round(sum(float(t["seconds"]) for t in takes), 2)
     files: list[str] = [f"corpus/{len(takes)} clips", "corpus.txt"]
 
     if spec["id"] == "piper":
@@ -856,7 +896,26 @@ async def convert(
         source=source,
         lang=corpus["id"],
         now=now,
+        # Paid audio is never thrown away: a short capture is written anyway
+        # and reported as untrainable, so a second (longer) capture is the only
+        # thing needed — not re-buying the first one.
+        enforce_minimum=False,
     )
+    seconds = float(report.get("seconds") or 0.0)
+    trainable = spec["id"] != "piper" or seconds >= MIN_TRAIN_SECONDS
+    if not trainable:
+        report["trainable"] = False
+        report["training_error"] = (
+            f"the captured audio is only {seconds:.1f}s — a Piper voice needs at "
+            f"least {MIN_TRAIN_SECONDS:.0f}s (10+ minutes recommended). The package "
+            "was kept (the capture is already paid for), but training it would "
+            "export noise, not a voice — capture again with more minutes and "
+            "overwrite it."
+        )
+        report["next"] = "✗ " + report["training_error"]
+        report["warning"] = report["training_error"]
+    else:
+        report["trainable"] = True
     report.update({
         "plan": plan,
         "profile": profile,

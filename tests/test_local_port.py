@@ -43,6 +43,9 @@ def dirs(tmp_path, monkeypatch):
     (tmp_path / "profiles").mkdir()
     monkeypatch.setattr(piper_setup, "DEFAULT_VOICES_DIR", tmp_path / "voices")
     monkeypatch.setattr(kokoro_setup, "DEFAULT_VOICES_DIR", tmp_path / "voices" / "kokoro")
+    # These tests are about decoding/packaging, not how much audio a voice needs;
+    # the duration gate raises this back in its own test.
+    monkeypatch.setattr(vp, "MIN_TRAIN_SECONDS", 0.0)
     return tmp_path
 
 
@@ -212,6 +215,17 @@ def test_kokoro_does_not_require_a_transcript(dirs):
     report = lp.prepare(name="Luna", target="kokoro", files=_clips())
     assert report["clips"] == 3
     assert report["target"] == "kokoro"
+
+
+def test_too_little_audio_is_refused_before_building_a_noise_dataset(dirs, monkeypatch):
+    """An 8-second import used to become a trainable package and then noise."""
+    monkeypatch.setattr(vp, "MIN_TRAIN_SECONDS", 60.0)
+    with pytest.raises(lp.LocalPortError) as e:
+        lp.prepare(name="Luna", target="piper", files=_clips(3), texts=_texts(3))
+    assert "noise" in str(e.value) and "at least 60s" in str(e.value)
+    assert not (vp.ported_dir() / "Luna-piper" / "dataset").exists()
+    # The clips are still saved, so adding more and building again is one step.
+    assert lp.scan("Luna")["clips"] == 3
 
 
 def test_no_audio_and_too_few_clips_are_refused_with_a_next_step(dirs):

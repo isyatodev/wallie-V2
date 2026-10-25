@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import wave
 from pathlib import Path
 
 import pytest
@@ -44,19 +45,34 @@ def dirs(tmp_path, monkeypatch):
     (tmp_path / "profiles").mkdir()
     monkeypatch.setattr(piper_setup, "DEFAULT_VOICES_DIR", tmp_path / "voices")
     monkeypatch.setattr(kokoro_setup, "DEFAULT_VOICES_DIR", tmp_path / "voices" / "kokoro")
+    # Most tests are about argv/state, not audio length; they use tiny fake
+    # WAVs. The duration gate gets its own tests below, which raise this back.
+    monkeypatch.setattr(vp, "MIN_TRAIN_SECONDS", 0.0)
     pt.clear_probe_cache()
     return tmp_path
 
 
 def make_package(name: str = "Luna BR", clips: int = 4, lang: str = "pt",
-                 folder: str | None = None) -> Path:
-    """A Piper port exactly as ``voice_port.build_package`` leaves it."""
+                 folder: str | None = None, wav_seconds: float | None = None) -> Path:
+    """A Piper port exactly as ``voice_port.build_package`` leaves it.
+
+    ``wav_seconds`` writes real WAVs of that length (the duration gate reads
+    them); the default keeps the tiny placeholder bytes the argv tests need.
+    """
     pkg = vp.ported_dir() / (folder or f"{vp.slug(name)}-piper")
     wav_dir = pkg / "dataset" / "wav"
     wav_dir.mkdir(parents=True)
     rows = []
     for i in range(1, clips + 1):
-        (wav_dir / f"{i:04d}.wav").write_bytes(b"RIFF")
+        path = wav_dir / f"{i:04d}.wav"
+        if wav_seconds is None:
+            path.write_bytes(b"RIFF")
+        else:
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(22050)
+                w.writeframes(b"\x00\x01" * int(22050 * wav_seconds))
         rows.append(f"wav/{i:04d}.wav|line number {i}")
     (pkg / "dataset" / "metadata.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
     manifest = {
@@ -84,6 +100,9 @@ def fake_env(flavor: str = "piper1-gpl", python: str = "") -> dict:
         "flavor_label": flavor,
         "torch": True,
         "lightning": True,
+        "monotonic": True,
+        "piper_root": "",
+        "export_missing": False,
         "missing": [],
         "can_train": True,
         "error": "",
@@ -247,7 +266,7 @@ def test_default_voice_name_satisfies_pipers_loader():
 
 def test_env_payload_reports_what_is_missing():
     ready = pt._env_payload("py", {"version": "3.12", "gpl": True, "torch": True,
-                                   "lightning": True})
+                                   "lightning": True, "onnxscript": True})
     assert ready["can_train"] and ready["flavor"] == "piper1-gpl"
     assert ready["missing"] == []
 
@@ -291,8 +310,8 @@ def test_piper1_gpl_recipe_normalises_the_csv(dirs):
     assert "--data.espeak_voice" in argv and "pt-br" in argv
     assert "--data.config_path" in argv
     assert argv[argv.index("--data.batch_size") + 1] == "4"
-    # 4 clips: 0.1 would floor to an empty val split, so it holds out one clip.
-    assert float(argv[argv.index("--data.validation_split") + 1]) == pytest.approx(0.25)
+    # 4 clips: 1/n would floor to an empty val split, so it asks for 1.5 clips.
+    assert float(argv[argv.index("--data.validation_split") + 1]) == pytest.approx(0.375)
     assert argv[argv.index("--data.num_test_examples") + 1] == "0"
     assert argv[argv.index("--data.num_workers") + 1] == "0"
     assert argv[argv.index("--trainer.max_epochs") + 1] == "50"
@@ -362,10 +381,17 @@ def test_normalize_csv_skips_rows_without_text(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_validation_split_always_holds_out_a_clip():
-    assert pt._validation_split({"clips": 8}) == pytest.approx(0.125)
+    assert pt._validation_split({"clips": 8}) == pytest.approx(0.1875)
     assert pt._validation_split({"clips": 30}) == pytest.approx(0.1)
     assert pt._validation_split({"clips": 100}) == pytest.approx(0.1)
-    assert pt._validation_split({"clips": 3}) == pytest.approx(1 / 3)
+    assert pt._validation_split({"clips": 3}) == pytest.approx(0.5)
+
+
+def test_validation_split_never_floors_to_an_empty_loader():
+    """piper does int(n * split): asking for 1/n is 0 for 3 clips."""
+    for clips in (3, 4, 5, 7, 8, 9, 10, 30):
+        split = pt._validation_split({"clips": clips})
+        assert int(clips * split) >= 1, clips
 
 
 def test_parse_epoch_reads_the_lightning_bar():
@@ -688,6 +714,57 @@ async def test_a_failed_run_records_the_error_and_stops(dirs, fast_probe, monkey
 
 
 @pytest.mark.asyncio
+async def test_a_dataset_too_small_to_learn_from_is_refused(dirs, fast_probe, monkeypatch):
+    """8 seconds of audio produced a robotic-noise .onnx — refuse before spawning."""
+    pkg = make_package(clips=3, wav_seconds=1.0)
+    monkeypatch.setattr(vp, "MIN_TRAIN_SECONDS", 60.0)
+    called = {"n": 0}
+
+    async def spawn(*a, **kw):  # pragma: no cover - must not be reached
+        called["n"] += 1
+
+    monkeypatch.setattr(pt, "_spawn", spawn)
+    job = pt.new_job()
+    pt.begin(job, kind="train", package=str(pkg), epochs=2, python="py")
+    await pt.run_train(job, package=str(pkg), voice_name="pt_BR-luna_br-medium",
+                       epochs=2, batch_size=8, accelerator="cpu")
+
+    assert called["n"] == 0
+    assert job["status"] == "error"
+    assert "too small" in job["error"] and "noise" in job["error"]
+    assert job["seconds"] == pytest.approx(3.0, abs=0.1)
+    run = Path(job["run_dir"])
+    # The verdict is on disk, not only in the dashboard's memory: the log tail
+    # and run.json survive a restarted dashboard.
+    log = (run / "train.log").read_text(encoding="utf-8")
+    assert "TRAINING FAILED" in log and "noise" in log
+    record = json.loads((run / "run.json").read_text(encoding="utf-8"))
+    assert record["status"] == "error"
+    assert record["seconds"] == pytest.approx(3.0, abs=0.1)
+    assert record["error"] == job["error"]
+
+
+@pytest.mark.asyncio
+async def test_batch_size_is_capped_to_the_train_split(dirs, fast_probe, monkeypatch):
+    pkg = make_package(clips=4)
+    seen: dict = {}
+    _fake_spawner(monkeypatch, seen)
+
+    job = pt.new_job()
+    pt.begin(job, kind="train", package=str(pkg), epochs=2, python="py")
+    await pt.run_train(job, package=str(pkg), voice_name="pt_BR-luna_br-medium",
+                       epochs=2, batch_size=8, accelerator="cpu")
+
+    assert job["status"] == "done", job["error"]
+    argv = seen["argv"][0]
+    # 4 clips, one held out → 3 training clips, so a batch of 8 becomes 3.
+    assert argv[argv.index("--data.batch_size") + 1] == "3"
+    record = json.loads((Path(job["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+    assert record["batch_size"] == 3
+    assert "batch size 8 is larger than the 3-clip train split" in job["log"]
+
+
+@pytest.mark.asyncio
 async def test_a_tiny_dataset_is_refused(dirs, fast_probe, monkeypatch):
     pkg = make_package(clips=2)
     _fake_spawner(monkeypatch)
@@ -746,6 +823,28 @@ def _app(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     state = DashboardState()
     return TestClient(_build_app(state, None)), state
+
+
+def test_a_run_trained_on_too_little_audio_cannot_be_attached(dirs, monkeypatch, profile):
+    """The old 8s run must not install a noise model under a real voice name."""
+    pkg = make_package(clips=3, wav_seconds=1.0)
+    run = pkg / "train" / "run-20260101-010101"
+    run.mkdir(parents=True)
+    onnx = run / "pt_BR-luna_br-medium.onnx"
+    onnx.write_bytes(b"ONNX")
+    cfg = run / "pt_BR-luna_br-medium.onnx.json"
+    cfg.write_text("{}", encoding="utf-8")
+    (run / "run.json").write_text(json.dumps({
+        "status": "done", "voice_name": "pt_BR-luna_br-medium", "seconds": 3.0,
+        "exported": {"onnx": str(onnx), "config": str(cfg)},
+    }), encoding="utf-8")
+    monkeypatch.setattr(vp, "MIN_TRAIN_SECONDS", 60.0)
+
+    with pytest.raises(pt.TrainError) as e:
+        pt.attach_run(profile="luna", package=str(pkg), run_dir=str(run))
+    assert "noise" in str(e.value) and "3.0s" in str(e.value)
+    assert voice_lab.load_library("luna") == []
+    assert not (piper_setup.voices_dir() / "pt_BR-luna_br-medium.onnx").exists()
 
 
 def test_attach_run_installs_the_trained_pair(dirs, fast_probe, monkeypatch, profile):
@@ -1342,3 +1441,425 @@ def test_voice_lab_ships_the_train_panel():
     assert '"/api/voices/port/train/cancel"' in app
     assert '"/api/voices/port/train/attach"' in app
     assert '"/api/voices/port/train/setup"' in app
+
+
+# ---------------------------------------------------------------------------
+# monotonic_align — the core piper's wheel forgets to ship
+# ---------------------------------------------------------------------------
+
+
+def fake_piper_tree(root: Path, *, core: str | None = None) -> str:
+    """The installed piper layout, with or without a compiled core file."""
+    pkg = root / "site-packages" / "piper"
+    outer = pkg / "train" / "vits" / "monotonic_align"
+    outer.mkdir(parents=True)
+    (outer / "monotonic_align").mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (outer / "__init__.py").write_text(
+        "from .monotonic_align.core import maximum_path_c\n", encoding="utf-8"
+    )
+    if core:
+        (outer / "monotonic_align" / core).write_bytes(b"")
+    return str(pkg)
+
+
+# A raw probe payload for an env whose export dependency is satisfied.
+_SANE = {"torch_v": "2.14.1+cpu", "onnxscript": True}
+
+
+def test_env_payload_flags_the_missing_alignment_core(dirs):
+    missing = fake_piper_tree(dirs)
+    raw = {"gpl": True, "legacy": False, "torch": True, "lightning": True,
+           "piper_root": missing, **_SANE}
+    env = pt._env_payload("py", raw)
+    assert env["can_train"] and env["monotonic"] is False
+    assert "monotonic_align" in env["hint"]
+
+    filled = fake_piper_tree(dirs / "other", core="core.cp312-win_amd64.pyd")
+    raw = {"gpl": True, "legacy": False, "torch": True, "lightning": True,
+           "piper_root": filled, **_SANE}
+    env = pt._env_payload("py", raw)
+    assert env["monotonic"] is True
+
+
+def test_the_legacy_trainer_never_demands_the_core(dirs):
+    raw = {"gpl": False, "legacy": True, "torch": True, "lightning": True,
+           "piper_root": "", **_SANE}
+    env = pt._env_payload("py", raw)
+    assert env["monotonic"] is True
+
+
+def test_ensure_installs_the_fallback_into_the_empty_slot(dirs):
+    root = fake_piper_tree(dirs)
+    healed = pt.ensure_monotonic_align("py", root)
+    assert healed["state"] == "installed"
+    core_py = Path(healed["target"])
+    assert core_py.is_file() and core_py.name == "core.py"
+    assert "maximum_path_c" in core_py.read_text(encoding="utf-8")
+    # a second pass sees the slot filled and writes nothing over the file
+    assert pt.ensure_monotonic_align("py", root)["state"] == "present"
+
+
+def test_ensure_skips_a_locally_compiled_core(dirs):
+    root = fake_piper_tree(dirs, core="core.cp312-win_amd64.pyd")
+    assert pt.ensure_monotonic_align("py", root)["state"] == "present"
+    slot = Path(root) / "train" / "vits" / "monotonic_align" / "monotonic_align"
+    assert not (slot / "core.py").exists()
+
+
+def test_ensure_without_a_gpl_install_is_a_noop(dirs, monkeypatch):
+    assert pt.ensure_monotonic_align("py", str(dirs / "nowhere"))["state"] == "absent"
+    # An empty root falls back to probing the interpreter — stub "no piper"
+    # so the check can never reach the real venv from a test.
+    monkeypatch.setattr(pt, "_piper_root", lambda python: "")
+    assert pt.ensure_monotonic_align("py", "")["state"] == "absent"
+
+
+def test_ensure_reports_an_unwritable_target(dirs, monkeypatch):
+    from tts import monotonic_core
+
+    root = fake_piper_tree(dirs)
+    monkeypatch.setattr(monotonic_core, "__file__", str(dirs / "gone.py"))
+    healed = pt.ensure_monotonic_align("py", root)
+    assert healed["state"] == "error"
+    assert healed["detail"] and healed["target"].endswith("core.py")
+
+
+@pytest.mark.asyncio
+async def test_run_train_heals_the_missing_core_before_the_trainer_starts(dirs, monkeypatch):
+    pkg = make_package()
+    root = fake_piper_tree(dirs)
+
+    async def probe(python="", *, force=False):
+        env = fake_env(python=pt.interpreter(python))
+        env.update(monotonic=False, piper_root=root)
+        return env
+
+    seen: dict = {}
+
+    def heal(python, root_arg=""):
+        seen["args"] = (python, root_arg)
+        return {"state": "installed", "target": "core.py"}
+
+    streams: list[list[str]] = []
+
+    async def stream(job, argv, **kw):
+        streams.append(list(argv))
+        return 1  # fake trainer failure — late enough to prove the heal ran first
+
+    monkeypatch.setattr(pt, "probe", probe)
+    monkeypatch.setattr(pt, "ensure_monotonic_align", heal)
+    monkeypatch.setattr(pt, "_stream", stream)
+
+    job = pt.new_job()
+    pt.begin(job, kind="train", package=str(pkg), epochs=1, python="py")
+    await pt.run_train(job, package=str(pkg), epochs=1, batch_size=1,
+                       accelerator="cpu")
+
+    assert seen["args"][0] == pt.interpreter("")
+    assert seen["args"][1] == root
+    assert streams, "the heal must run before the trainer"
+    assert "monotonic_align" in job["log"]
+
+
+@pytest.mark.asyncio
+async def test_run_train_refuses_to_start_without_an_alignment_core(dirs, monkeypatch):
+    pkg = make_package()
+    root = fake_piper_tree(dirs)
+
+    async def probe(python="", *, force=False):
+        env = fake_env(python=pt.interpreter(python))
+        env.update(monotonic=False, piper_root=root)
+        return env
+
+    async def spawn(*a, **kw):  # pragma: no cover - must not be reached
+        raise AssertionError("training must not start without an alignment core")
+
+    monkeypatch.setattr(pt, "probe", probe)
+    monkeypatch.setattr(pt, "ensure_monotonic_align",
+                        lambda *a, **kw: {"state": "error", "detail": "denied",
+                                          "target": "x"})
+    monkeypatch.setattr(pt, "_spawn", spawn)
+
+    job = pt.new_job()
+    pt.begin(job, kind="train", package=str(pkg), epochs=1, python="py")
+    await pt.run_train(job, package=str(pkg), epochs=1, batch_size=1,
+                       accelerator="cpu")
+
+    assert job["status"] == "error"
+    assert "monotonic_align" in job["error"] and "denied" in job["error"]
+
+
+@pytest.mark.asyncio
+async def test_setup_fills_the_alignment_slot_even_when_the_trainer_is_there(dirs, monkeypatch):
+    root = fake_piper_tree(dirs)
+
+    async def probe(python="", *, force=False):
+        env = fake_env(python=pt.interpreter(python))
+        env.update(monotonic=False, piper_root=root)
+        return env
+
+    seen: dict = {}
+
+    def heal(python, root_arg=""):
+        seen["args"] = (python, root_arg)
+        return {"state": "installed", "target": "core.py"}
+
+    monkeypatch.setattr(pt, "probe", probe)
+    monkeypatch.setattr(pt, "ensure_monotonic_align", heal)
+
+    job = pt.new_job()
+    pt.begin(job, kind="setup", python=pt.interpreter(""), epochs=0)
+    await pt.run_setup(job, "")
+
+    assert job["status"] == "done", job.get("error")
+    assert seen["args"][1] == root
+    assert "already installed" in job["log"]
+    assert "monotonic_align" in job["log"]
+
+
+# ---------------------------------------------------------------------------
+# onnxscript — the export dependency piper's [train] extra never declares
+# ---------------------------------------------------------------------------
+
+
+def test_env_payload_flags_the_undeclared_onnxscript(dirs):
+    raw = {"gpl": True, "legacy": False, "torch": True, "lightning": True,
+           "torch_v": "2.14.1+cpu", "onnxscript": False,
+           "piper_root": fake_piper_tree(dirs)}
+    env = pt._env_payload("py", raw)
+    assert env["export_missing"] is True
+    assert "onnxscript" in env["missing"] and env["can_train"] is False
+    assert env["setup_command"].endswith(" onnxscript")
+    assert "onnxscript" in env["hint"]
+
+
+def test_an_old_torch_needs_no_onnxscript(dirs):
+    raw = {"gpl": True, "legacy": False, "torch": True, "lightning": True,
+           "torch_v": "2.8.0", "onnxscript": False,
+           "piper_root": fake_piper_tree(dirs)}
+    env = pt._env_payload("py", raw)
+    assert env["export_missing"] is False
+    assert "onnxscript" not in env["missing"] and env["can_train"] is True
+    assert not env["setup_command"].endswith(" onnxscript")
+
+
+def test_a_fresh_install_counts_as_needing_onnxscript(dirs):
+    # No torch yet: pip resolves the extra to the latest, which is past 2.9.
+    raw = {"gpl": False, "legacy": False, "torch": False, "lightning": False,
+           "torch_v": "", "onnxscript": False, "piper_root": ""}
+    env = pt._env_payload("py", raw)
+    assert env["export_missing"] is True
+    assert env["setup_command"].endswith(" onnxscript")
+
+
+@pytest.mark.asyncio
+async def test_setup_installs_onnxscript_when_the_export_needs_it(dirs, monkeypatch):
+    seen: list[list[str]] = []
+    probes = {"n": 0}
+
+    async def probe(python="", *, force=False):
+        probes["n"] += 1
+        env = fake_env("piper1-gpl")
+        if probes["n"] == 1:
+            env.update(can_train=False, missing=["onnxscript"],
+                       export_missing=True, hint="onnxscript is missing")
+        return env
+
+    async def spawn(argv, *, cwd, env):
+        seen.append(list(argv))
+        return _Proc([b"Successfully installed onnxscript\n"])
+
+    monkeypatch.setattr(pt, "probe", probe)
+    monkeypatch.setattr(pt, "_spawn", spawn)
+
+    job = pt.new_job()
+    pt.begin(job, kind="setup", python=pt.interpreter(""), epochs=0)
+    await pt.run_setup(job, "")
+
+    assert job["status"] == "done", job.get("error")
+    assert seen and seen[0][1:5] == ["-m", "pip", "install", "--upgrade"]
+    assert seen[0][-1] == "onnxscript"
+    assert "onnxscript" in job["log"]
+
+
+# ---------------------------------------------------------------------------
+# export_onnx.py — piper's call predates the dynamo default (torch 2.9+)
+# ---------------------------------------------------------------------------
+
+_FAKE_EXPORT = (
+    "OPSET_VERSION = 15\r\n"
+    "\r\n"
+    "def main():\r\n"
+    "    torch.onnx.export(\r\n"
+    "        model=model_g,\r\n"
+    "        args=dummy_input,\r\n"
+    "        opset_version=OPSET_VERSION,\r\n"
+    "    )\r\n"
+)
+
+
+def fake_export_src(root: Path) -> Path:
+    src = root / "site-packages" / "piper" / "train" / "export_onnx.py"
+    src.parent.mkdir(parents=True)
+    src.write_bytes(_FAKE_EXPORT.encode("utf-8"))
+    return src
+
+
+def test_export_compat_patches_dynamo_false_and_is_idempotent(dirs):
+    src = fake_export_src(dirs)
+    root = str(dirs / "site-packages" / "piper")
+    healed = pt.ensure_export_compat("", root)
+    assert healed["state"] == "installed"
+
+    text = src.read_bytes().decode("utf-8")
+    assert "dynamo=False," in text
+    compile(text, "export_onnx.py", "exec")        # still valid Python
+    assert text.count("torch.onnx.export(") == 1
+    # the patched line follows the file's own CRLF style, the rest untouched
+    assert "\r\n        dynamo=False," in text
+
+    before = src.read_bytes()
+    again = pt.ensure_export_compat("", root)
+    assert again["state"] == "present"
+    assert src.read_bytes() == before, "a second pass must rewrite nothing"
+
+
+def test_export_compat_leaves_a_fixed_exporter_alone(dirs):
+    fixed = _FAKE_EXPORT.replace("torch.onnx.export(", "torch.onnx.export(dynamo=False,")
+    src = fake_export_src(dirs)
+    src.write_bytes(fixed.encode("utf-8"))
+    healed = pt.ensure_export_compat("", str(dirs / "site-packages" / "piper"))
+    assert healed["state"] == "present"
+    assert src.read_bytes().decode("utf-8") == fixed
+
+
+def test_export_compat_without_a_known_install_is_a_noop(dirs, monkeypatch):
+    assert pt.ensure_export_compat("", str(dirs / "nowhere"))["state"] == "absent"
+    # An empty root falls back to probing the test interpreter, which must
+    # never reach the real venv: stub "no piper here" in.
+    monkeypatch.setattr(pt, "_piper_root", lambda python: "")
+    assert pt.ensure_export_compat("", "")["state"] == "absent"
+
+
+def test_export_compat_reports_an_unpatchable_file(dirs):
+    train = dirs / "site-packages" / "piper" / "train"
+    train.mkdir(parents=True)
+    (train / "export_onnx.py").write_text("something else entirely\n", encoding="utf-8")
+    healed = pt.ensure_export_compat("", str(dirs / "site-packages" / "piper"))
+    assert healed["state"] == "error"
+    assert "torch.onnx.export(" in healed["detail"]
+    assert healed["target"].endswith("export_onnx.py")
+
+
+@pytest.mark.asyncio
+async def test_run_train_patches_pipers_export_before_the_training(dirs, monkeypatch):
+    pkg = make_package()
+    fake_export_src(dirs)
+    root = str(dirs / "site-packages")
+
+    async def probe(python="", *, force=False):
+        env = fake_env(python=pt.interpreter(python))
+        env.update(piper_root=root)
+        return env
+
+    seen: dict = {}
+
+    def compat(python, root_arg=""):
+        seen["root"] = root_arg
+        return {"state": "installed", "target": "export_onnx.py"}
+
+    streams: list[list[str]] = []
+
+    async def stream(job, argv, **kw):
+        streams.append(list(argv))
+        return 1  # fake trainer failure — late enough to prove the patch ran first
+
+    monkeypatch.setattr(pt, "probe", probe)
+    monkeypatch.setattr(pt, "ensure_export_compat", compat)
+    monkeypatch.setattr(pt, "_stream", stream)
+
+    job = pt.new_job()
+    pt.begin(job, kind="train", package=str(pkg), epochs=1, python="py")
+    await pt.run_train(job, package=str(pkg), epochs=1, batch_size=1,
+                       accelerator="cpu")
+
+    assert seen["root"] == root
+    assert streams, "the export patch must run before the trainer"
+    assert "dynamo=False" in job["log"]
+
+
+# ---------------------------------------------------------------------------
+# train/__main__.py — the optional val_mos callback aborts validation
+# ---------------------------------------------------------------------------
+
+_FAKE_MAIN = (
+    "from lightning.pytorch.callbacks import ModelCheckpoint\n"
+    "\n"
+    "_DEFAULT_CALLBACKS = [\n"
+    "    ModelCheckpoint(\n"
+    "        monitor=\"val_mel\",\n"
+    "        mode=\"min\",\n"
+    "    ),\n"
+    "    ModelCheckpoint(\n"
+    "        monitor=\"val_mos\",\n"
+    "        mode=\"max\",\n"
+    "    ),\n"
+    "]\n"
+)
+
+
+def fake_main_src(root: Path) -> Path:
+    src = root / "site-packages" / "piper" / "train" / "__main__.py"
+    src.parent.mkdir(parents=True)
+    src.write_text(_FAKE_MAIN, encoding="utf-8")
+    return src
+
+
+def test_checkpoint_compat_removes_val_mos_and_is_idempotent(dirs):
+    src = fake_main_src(dirs)
+    root = str(dirs / "site-packages" / "piper")
+
+    healed = pt.ensure_checkpoint_compat("", root)
+    assert healed["state"] == "installed"
+
+    text = src.read_text(encoding="utf-8")
+    assert 'monitor="val_mos"' not in text
+    assert 'monitor="val_mel"' in text
+    compile(text, "train/__main__.py", "exec")       # still valid Python
+    assert text.count("ModelCheckpoint(") == 1       # only the val_mel one
+
+    before = src.read_bytes()
+    again = pt.ensure_checkpoint_compat("", root)
+    assert again["state"] == "present"
+    assert src.read_bytes() == before, "a second pass must rewrite nothing"
+
+
+def test_checkpoint_compat_leaves_a_fixed_cli_alone(dirs):
+    fixed = _FAKE_MAIN.replace('    ModelCheckpoint(\n        monitor="val_mos",',
+                               '    ModelCheckpoint(\n        monitor="other",')
+    src = fake_main_src(dirs)
+    src.write_text(fixed, encoding="utf-8")
+
+    healed = pt.ensure_checkpoint_compat("", str(dirs / "site-packages" / "piper"))
+    assert healed["state"] == "present"
+    assert src.read_text(encoding="utf-8") == fixed
+
+
+def test_checkpoint_compat_without_a_known_install_is_a_noop(dirs, monkeypatch):
+    assert pt.ensure_checkpoint_compat("", str(dirs / "nowhere"))["state"] == "absent"
+    monkeypatch.setattr(pt, "_piper_root", lambda python: "")
+    assert pt.ensure_checkpoint_compat("", "")["state"] == "absent"
+
+
+def test_checkpoint_compat_reports_an_unpatchable_file(dirs):
+    train = dirs / "site-packages" / "piper" / "train"
+    train.mkdir(parents=True)
+    (train / "__main__.py").write_text(
+        '# monitor="val_mos" but the callback is gone\n', encoding="utf-8"
+    )
+
+    healed = pt.ensure_checkpoint_compat("", str(dirs / "site-packages" / "piper"))
+    assert healed["state"] == "error"
+    assert "val_mos" in healed["detail"]
+    assert healed["target"].endswith("__main__.py")
