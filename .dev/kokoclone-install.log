@@ -1,0 +1,104 @@
+Collecting git+https://github.com/frothywater/kanade-tokenizer
+  Cloning https://github.com/frothywater/kanade-tokenizer to C:\Users\Yato\AppData\Local\Temp\pip-req-build-g0ve85jx
+  Running command git clone --filter=blob:none --quiet https://github.com/frothywater/kanade-tokenizer 'C:\Users\Yato\AppData\Local\Temp\pip-req-build-g0ve85jx'
+  Resolved https://github.com/frothywater/kanade-tokenizer to commit 961f20bf892c59f391d0b6c5f7b88e70ed919b99
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: torch in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (2.14.1)
+Collecting torchaudio
+  Using cached torchaudio-2.11.1-py3-none-win_amd64.whl.metadata (7.5 kB)
+Requirement already satisfied: soundfile in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (0.14.0)
+Requirement already satisfied: huggingface_hub in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (1.33.0)
+Collecting kokoro-onnx
+  Using cached kokoro_onnx-0.6.1-py3-none-any.whl.metadata (3.5 kB)
+Requirement already satisfied: misaki in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (0.9.4)
+Requirement already satisfied: jsonargparse[signatures] in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from kanade-tokenizer==0.1.0) (4.52.0)
+Requirement already satisfied: numpy in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from kanade-tokenizer==0.1.0) (2.5.3)
+Requirement already satisfied: safetensors in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from kanade-tokenizer==0.1.0) (0.8.0)
+Requirement already satisfied: tqdm in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from kanade-tokenizer==0.1.0) (4.70.1)
+Collecting vocos (from kanade-tokenizer==0.1.0)
+  Using cached vocos-0.1.0-py3-none-any.whl.metadata (4.8 kB)
+Requirement already satisfied: filelock in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from torch) (4.0.12)
+Requirement already satisfied: typing-extensions>=4.10.0 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from torch) (4.16.0)
+Requirement already satisfied: setuptools>=77.0.3 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from torch) (84.0.0)
+Requirement already satisfied: sympy>=1.13.3 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from torch) (1.14.0)
+Requirement already satisfied: networkx>=2.5.1 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from torch) (3.7)
+Requirement already satisfied: jinja2 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from torch) (3.1.6)
+Requirement already satisfied: fsspec>=0.8.5 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from torch) (2026.9.0)
+Requirement already satisfied: cffi>=1.0 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from soundfile) (2.1.1)
+Requirement already satisfied: click<9.0.0,>=8.4.2 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from huggingface_hub) (8.5.0)
+Requirement already satisfied: hf-xet<2.0.0,>=1.6.0 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from huggingface_hub) (1.7.0)
+Requirement already satisfied: httpx<1,>=0.23.0 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from huggingface_hub) (0.28.1)
+Requirement already satisfied: packaging>=20.9 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from huggingface_hub) (26.3)
+Requirement already satisfied: pyyaml>=5.1 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from huggingface_hub) (6.0.3)
+Requirement already satisfied: anyio in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from httpx<1,>=0.23.0->huggingface_hub) (4.15.1)
+Requirement already satisfied: certifi in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from httpx<1,>=0.23.0->huggingface_hub) (2026.7.22)
+Requirement already satisfied: httpcore==1.* in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from httpx<1,>=0.23.0->huggingface_hub) (1.0.9)
+Requirement already satisfied: idna in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from httpx<1,>=0.23.0->huggingface_hub) (3.20)
+Requirement already satisfied: h11>=0.16 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from httpcore==1.*->httpx<1,>=0.23.0->huggingface_hub) (0.16.0)
+Requirement already satisfied: espeakng-loader>=0.2.4 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from kokoro-onnx) (0.2.4)
+Requirement already satisfied: onnxruntime>=1.20.1 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from kokoro-onnx) (1.30.0)
+Collecting phonemizer>=3.4.0 (from kokoro-onnx)
+  Using cached phonemizer-3.6.0-py3-none-any.whl.metadata (48 kB)
+Requirement already satisfied: addict in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from misaki) (2.4.0)
+Requirement already satisfied: regex in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from misaki) (2026.9.29)
+Requirement already satisfied: pycparser in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from cffi>=1.0->soundfile) (3.1)
+Requirement already satisfied: flatbuffers in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from onnxruntime>=1.20.1->kokoro-onnx) (25.12.19)
+Requirement already satisfied: protobuf>=4.25.8 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from onnxruntime>=1.20.1->kokoro-onnx) (7.36.2)
+Requirement already satisfied: joblib in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from phonemizer>=3.4.0->kokoro-onnx) (1.6.0)
+Requirement already satisfied: attrs>=18.1 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from phonemizer>=3.4.0->kokoro-onnx) (26.1.0)
+Requirement already satisfied: dlinfo in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from phonemizer>=3.4.0->kokoro-onnx) (2.0.0)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from sympy>=1.13.3->torch) (1.3.0)
+Requirement already satisfied: colorama in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from tqdm->kanade-tokenizer==0.1.0) (0.4.6)
+Requirement already satisfied: MarkupSafe>=2.0 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from jinja2->torch) (3.0.4)
+Requirement already satisfied: cloudpickle>=3.0 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from joblib->phonemizer>=3.4.0->kokoro-onnx) (3.1.2)
+Requirement already satisfied: docstring-parser>=0.17 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from jsonargparse[signatures]->kanade-tokenizer==0.1.0) (0.18.0)
+Requirement already satisfied: typeshed-client>=2.8.2 in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from jsonargparse[signatures]->kanade-tokenizer==0.1.0) (2.14.0)
+Requirement already satisfied: scipy in C:\Users\Yato\Desktop\kansai\.venv\Lib\site-packages (from vocos->kanade-tokenizer==0.1.0) (1.18.1)
+Collecting einops (from vocos->kanade-tokenizer==0.1.0)
+  Using cached einops-0.8.2-py3-none-any.whl.metadata (13 kB)
+Collecting encodec==0.1.1 (from vocos->kanade-tokenizer==0.1.0)
+  Downloading encodec-0.1.1.tar.gz (3.7 MB)
+     ---------------------------------------- 3.7/3.7 MB 37.0 MB/s  0:00:00
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Downloading torchaudio-2.11.1-py3-none-win_amd64.whl (334 kB)
+Downloading kokoro_onnx-0.6.1-py3-none-any.whl (26 kB)
+Downloading phonemizer-3.6.0-py3-none-any.whl (125 kB)
+Downloading vocos-0.1.0-py3-none-any.whl (24 kB)
+Using cached einops-0.8.2-py3-none-any.whl (65 kB)
+Building wheels for collected packages: kanade-tokenizer, encodec
+  Building wheel for kanade-tokenizer (pyproject.toml): started
+  Building wheel for kanade-tokenizer (pyproject.toml): finished with status 'done'
+  Created wheel for kanade-tokenizer: filename=kanade_tokenizer-0.1.0-py3-none-any.whl size=45123 sha256=1a4f1f19f6e5f8bee5021d07805b5de2d18e0d9b40fbdd5cd6d00a22a1fb544f
+  Stored in directory: C:\Users\Yato\AppData\Local\Temp\pip-ephem-wheel-cache-vm6lqtzz\wheels\6b\4c\98\051b65e21c88951326d9334241397fa3871e5e32297176d7d8
+  Building wheel for encodec (pyproject.toml): started
+  Building wheel for encodec (pyproject.toml): finished with status 'done'
+  Created wheel for encodec: filename=encodec-0.1.1-py3-none-any.whl size=45900 sha256=ab387a74a92096a4bc446d0decad26cb187af16647a375ffe9492089629b1dee
+  Stored in directory: c:\users\yato\appdata\local\pip\cache\wheels\b8\eb\9f\e13610cc46ab39d3199fbabebd1c3e142d44b679526e0f228a
+Successfully built kanade-tokenizer encodec
+Installing collected packages: einops, phonemizer, torchaudio, kokoro-onnx, encodec, vocos, kanade-tokenizer
+
+Successfully installed einops-0.8.2 encodec-0.1.1 kanade-tokenizer-0.1.0 kokoro-onnx-0.6.1 phonemizer-3.6.0 torchaudio-2.11.1 vocos-0.1.0
+
+[notice] A new release of pip is available: 26.2.1 -> 26.3
+[notice] To update, run: C:\Users\Yato\Desktop\kansai\.venv\Scripts\python.exe -m pip install --upgrade pip
+KokoClone — optional zero-shot cloning on top of Kokoro
+
+→ pip install torch torchaudio soundfile huggingface_hub kokoro-onnx misaki git+https://github.com/frothywater/kanade-tokenizer
+  (not requirements.txt: it also asks for misaki[ja,zh], which builds
+   pyopenjtalk with CMake, and for gradio, their web UI — this worker needs
+   neither. Use --upstream for their file verbatim.)
+  (the first install pulls PyTorch — a few GB; go make a coffee)
+
+✓ KokoClone is installed.
+  Next: restart the dashboard (it probes the packages at startup), then pick a
+  reference clip in the Voice Lab. The first synthesis downloads ~1 GB of models.

@@ -52,6 +52,8 @@ highlights/
 models/
 runs/
 dataset/
+# Optional KokoClone checkout (clone it, don't vendor it) — its clips live in voices/
+kokoclone/
 diag_*.png
 wlabel_*.png
 

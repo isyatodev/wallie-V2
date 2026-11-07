@@ -1,0 +1,41 @@
+[32m2026-11-07 14:25:19.437[0m | [1mINFO    [0m | [36mdashboard.server[0m:[36mserve[0m:[36m3585[0m - [1mdashboard: PIN auth active (from DASHBOARD_PIN)[0m
+[32m2026-11-07 14:25:19.772[0m | [1mINFO    [0m | [36mdashboard.server[0m:[36mserve[0m:[36m3607[0m - [1mdashboard: http://127.0.0.1:8765[0m
+INFO:     Started server process [17696]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8765 (Press CTRL+C to quit)
+INFO:     127.0.0.1:61199 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:61200 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:61202 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:49162 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:49164 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:49165 - "GET /login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49166 - "GET /api/voices/kokoclone HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:49167 - "POST /api/voices/kokoclone/install HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:49168 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:54491 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:54492 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:54494 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:62429 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:62431 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:62433 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:62435 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:56502 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:56504 - "WebSocket /ws/events" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:56505 - "WebSocket /ws/events" [accepted]
+INFO:     connection open

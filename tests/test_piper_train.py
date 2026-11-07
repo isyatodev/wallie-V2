@@ -102,6 +102,7 @@ def fake_env(flavor: str = "piper1-gpl", python: str = "") -> dict:
         "lightning": True,
         "monotonic": True,
         "piper_root": "",
+        "warmstart": True,
         "export_missing": False,
         "missing": [],
         "can_train": True,
@@ -179,6 +180,10 @@ def _fake_spawner(monkeypatch, seen: dict | None = None, train_rc: int = 0,
         argv = list(argv)
         if seen is not None:
             seen.setdefault("argv", []).append(argv)
+        if "piper_reference.py" in " ".join(argv):
+            # The converter runs with the training interpreter; stand in for it.
+            Path(argv[argv.index("--out") + 1]).write_bytes(b"REF-CKPT")
+            return _Proc([b"[reference] recovered 12 weight tensor(s)\n"])
         if "export_onnx" in " ".join(argv):
             out = Path(argv[argv.index("--output-file") + 1]) if "--output-file" in argv \
                 else Path(argv[-1])
@@ -422,6 +427,12 @@ def test_find_checkpoint_prefers_last(tmp_path):
     assert pt.find_checkpoint(tmp_path) == last
     (last).unlink()
     assert pt.find_checkpoint(tmp_path) == newer
+    # A warm-start reference is not a training result — never export/resume it.
+    (tmp_path / pt.REFERENCE_FILE).write_bytes(b"ref")
+    (newer).unlink()
+    assert pt.find_checkpoint(tmp_path) == older
+    (older).unlink()
+    assert pt.find_checkpoint(tmp_path) is None
     assert pt.find_checkpoint(tmp_path / "empty") is None
 
 
@@ -596,6 +607,57 @@ def test_validate_start_clamps_and_validates(dirs, tmp_path):
                           accelerator="auto", python="", checkpoint="")
 
 
+def test_onnx_reference_is_a_warm_start_not_a_resume(dirs, tmp_path):
+    """A .onnx can seed the weights, but it is not a checkpoint: no optimizer,
+    no epoch — so it must reach piper as a warm start, never as --ckpt_path."""
+    pkg = make_package()
+    ref = tmp_path / "pt_BR-faber-medium.onnx"
+    ref.write_bytes(b"ONNX")
+
+    opts = pt.validate_start(package=str(pkg), voice_name="", epochs=10, batch_size=2,
+                             accelerator="cpu", python="", checkpoint=str(ref))
+    assert opts["warmstart"] is True
+    assert opts["checkpoint"] == str(ref.resolve())
+
+    run = pt.new_run_dir(pkg)
+    prepared = pt.prepare_run(pkg, run, "piper1-gpl", opts["voice_name"])
+    argv = pt.train_argv(fake_env("piper1-gpl", "py"), prepared, run,
+                         voice_name=opts["voice_name"], epochs=10, batch_size=2,
+                         accelerator="cpu", checkpoint=opts["checkpoint"], warmstart=True)
+    assert argv[argv.index("--model.warmstart_ckpt") + 1] == opts["checkpoint"]
+    assert "--ckpt_path" not in argv
+
+
+def test_a_ckpt_still_resumes_strictly(dirs, tmp_path):
+    pkg = make_package()
+    ckpt = tmp_path / "last.ckpt"
+    ckpt.write_bytes(b"CKPT")
+    opts = pt.validate_start(package=str(pkg), voice_name="", epochs=10, batch_size=2,
+                             accelerator="cpu", python="", checkpoint=str(ckpt))
+    assert opts["warmstart"] is False
+
+
+def test_other_reference_types_are_refused(dirs, tmp_path):
+    pkg = make_package()
+    bogus = tmp_path / "voice.pt"
+    bogus.write_bytes(b"PT")
+    with pytest.raises(pt.TrainError) as e:
+        pt.validate_start(package=str(pkg), voice_name="", epochs=10, batch_size=2,
+                          accelerator="cpu", python="", checkpoint=str(bogus))
+    assert ".ckpt" in str(e.value) and ".onnx" in str(e.value)
+
+
+def test_the_legacy_trainer_has_no_warm_start(dirs):
+    pkg = make_package()
+    run = pt.new_run_dir(pkg)
+    prepared = pt.prepare_run(pkg, run, "legacy", "pt_BR-luna-medium")
+    with pytest.raises(pt.TrainError) as e:
+        pt.train_argv(fake_env("legacy", "py"), prepared, run,
+                      voice_name="pt_BR-luna-medium", epochs=5, batch_size=2,
+                      accelerator="cpu", checkpoint="/tmp/ref.ckpt", warmstart=True)
+    assert "legacy" in str(e.value)
+
+
 # ---------------------------------------------------------------------------
 # The run itself (fake process)
 # ---------------------------------------------------------------------------
@@ -636,6 +698,68 @@ async def test_run_trains_exports_and_persists(dirs, fast_probe, monkeypatch):
     args = seen["argv"]
     assert args[0][:4] == [exe, "-m", "piper.train", "fit"]
     assert args[-1][:3] == [exe, "-m", "piper.train.export_onnx"]
+
+
+@pytest.mark.asyncio
+async def test_run_converts_the_onnx_reference_and_warms_up(dirs, fast_probe, monkeypatch):
+    """The converted checkpoint travels with the run, and piper gets it as the
+    warm start — the raw .onnx is never handed to the trainer."""
+    pkg = make_package()
+    ref = dirs / "pt_BR-faber-medium.onnx"
+    ref.write_bytes(b"ONNX")
+    seen: dict = {}
+    _fake_spawner(monkeypatch, seen)
+
+    job = pt.new_job()
+    pt.begin(job, kind="train", package=str(pkg), voice_name="pt_BR-luna_br-medium",
+             epochs=2, python="py")
+    await pt.run_train(
+        job, package=str(pkg), voice_name="pt_BR-luna_br-medium", epochs=2,
+        batch_size=2, accelerator="cpu", python="", checkpoint=str(ref),
+    )
+
+    assert job["status"] == "done", job["error"]
+    converted = Path(job["run_dir"]) / pt.REFERENCE_FILE
+    assert converted.read_bytes() == b"REF-CKPT"
+    assert job["reference"] == {"onnx": str(ref.resolve()), "checkpoint": str(converted)}
+    assert "[reference] recovered 12" in job["log"]
+
+    args = seen["argv"]
+    converter = [a for a in args if "piper_reference.py" in " ".join(a)][0]
+    assert converter[0] == pt.interpreter("")
+    assert converter[converter.index("--onnx") + 1] == str(ref.resolve())
+    train = [a for a in args if a[:3] == [pt.interpreter(""), "-m", "piper.train"]][0]
+    assert train[train.index("--model.warmstart_ckpt") + 1] == str(converted)
+    assert "--ckpt_path" not in train
+
+    record = json.loads((converted.parent / "run.json").read_text(encoding="utf-8"))
+    assert record["warmstart"] is True
+    assert record["reference"]["onnx"] == str(ref.resolve())
+
+
+@pytest.mark.asyncio
+async def test_run_refuses_an_onnx_on_the_legacy_trainer(dirs, monkeypatch):
+    pkg = make_package()
+    ref = dirs / "voice.onnx"
+    ref.write_bytes(b"ONNX")
+
+    async def legacy_probe(python="", *, force=False):
+        env = fake_env("legacy", python=pt.interpreter(python))
+        return env
+
+    monkeypatch.setattr(pt, "probe", legacy_probe)
+    seen: dict = {}
+    _fake_spawner(monkeypatch, seen)
+
+    job = pt.new_job()
+    pt.begin(job, kind="train", package=str(pkg), voice_name="pt_BR-luna_br-medium",
+             epochs=2, python="py")
+    await pt.run_train(job, package=str(pkg), voice_name="pt_BR-luna_br-medium",
+                       epochs=2, batch_size=2, accelerator="cpu", checkpoint=str(ref))
+
+    assert job["status"] == "error"
+    assert "piper1-gpl" in job["error"]
+    assert not seen.get("argv"), "nothing should be spawned for a reference it cannot use"
 
 
 @pytest.mark.asyncio
@@ -693,6 +817,30 @@ async def test_run_can_be_cancelled(dirs, fast_probe, monkeypatch):
     # Nothing to attach: no exported model was written.
     assert job["exported"] == {}
     assert await pt.cancel(job) is False
+
+
+@pytest.mark.asyncio
+async def test_a_killed_child_with_the_cancel_marker_is_a_stop_not_an_error(
+    dirs, fast_probe, monkeypatch,
+):
+    """cancel_job terminates the trainer directly; the process can be gone before
+    the supervisor's watcher copies the flag onto the job. The marker is the
+    truth, so a stop must not be reported as a training error."""
+    pkg = make_package()
+
+    async def spawn(argv, *, cwd, env):
+        (Path(cwd) / pt.CANCEL_FILE).write_text("1", encoding="utf-8")
+        _checkpoint_and_config(list(argv))
+        return _Proc([b"Epoch 0: 100%|x| 1/1 [00:00<00:00, 1.0it/s]\n"], rc=1)
+
+    monkeypatch.setattr(pt, "_spawn", spawn)
+    job = pt.new_job()
+    pt.begin(job, kind="train", package=str(pkg), epochs=2, python="py")
+    await pt.run_train(job, package=str(pkg), voice_name="pt_BR-luna_br-medium",
+                       epochs=2, batch_size=2, accelerator="cpu", python="")
+
+    assert job["status"] == "cancelled"
+    assert job["error"] == ""
 
 
 @pytest.mark.asyncio
@@ -921,6 +1069,27 @@ def test_train_status_lists_packages_and_the_job(dirs, fast_probe, monkeypatch):
         assert r.status_code == 200
         bad = client.get("/api/voices/port/train", params={"package": "/etc"})
         assert bad.status_code == 400
+
+
+def test_references_list_every_onnx_voice_on_disk(dirs):
+    """The Train panel offers the models already here, not just a path box."""
+    root = piper_setup.DEFAULT_VOICES_DIR
+    installed = root / "pt_BR-faber-medium.onnx"
+    installed.parent.mkdir(parents=True, exist_ok=True)
+    installed.write_bytes(b"ONNX")
+    (root / "pt_BR-faber-medium.onnx.json").write_text("{}", encoding="utf-8")
+    run_export = root / "ported" / "luna-piper" / "train" / "run-20260101-010101" / "pt_BR-luna-medium.onnx"
+    run_export.parent.mkdir(parents=True)
+    run_export.write_bytes(b"ONNX")
+    os.utime(run_export, (1_700_000_000, 1_700_000_000))   # older than the download
+
+    refs = pt.list_references()
+
+    assert [Path(r["path"]).name for r in refs] == [
+        "pt_BR-faber-medium.onnx", "pt_BR-luna-medium.onnx",
+    ]
+    assert refs[0]["config"] is True and refs[0]["trained"] is False
+    assert refs[1]["config"] is False and refs[1]["trained"] is True
 
 
 def test_status_route_reconnects_to_a_detached_run(dirs, fast_probe, monkeypatch):
@@ -1429,8 +1598,12 @@ def test_voice_lab_ships_the_train_panel():
     assert "Train the Piper voice" in html
     for hook in ('@click="trainVoice()"', "@click=\"cancelVoiceTrain()\"",
                  "@click=\"trainAttach()\"", "@click=\"trainSetup()\"",
-                 "@click=\"trainResume()\"", 'x-ref="trainlog"'):
+                 "@click=\"trainResume()\"", 'x-ref="trainlog"',
+                 'list="trainRefVoices"', 'id="trainRefVoices"'):
         assert hook in html, hook
+    # A .onnx can seed the weights; the field must say so and offer saved voices.
+    assert ".onnx reference" in html
+    assert 'x-for="r in voiceTrain.references"' in html
     assert "voiceTrain.resume" in html
     for method in ("loadVoiceTrain", "trainVoice", "trainResume", "cancelVoiceTrain",
                    "trainSetup", "trainAttach", "trainStatusLine"):

@@ -69,6 +69,11 @@ EXPORT_TIMEOUT = 1800.0
 # not need — that is why the panel says so before starting the install.
 TRAIN_EXTRA = "piper-tts[train]"
 
+# An inference .onnx cannot be resumed like a checkpoint (no optimizer, no
+# discriminator), so it is converted into a warm-start checkpoint inside the run
+# and the trainer copies the weights whose name and shape still match.
+REFERENCE_FILE = "reference.ckpt"
+
 
 class TrainError(RuntimeError):
     """A failure worth showing verbatim (bad package, no trainer, …)."""
@@ -104,6 +109,13 @@ _PROBE_CODE = (
     "        return str(locs[0]) if locs else ''\n"
     "    except Exception:\n"
     "        return ''\n"
+    "def warmstart():\n"
+    "    try:\n"
+    "        s = u.find_spec('piper.train.vits.lightning')\n"
+    "        with open(s.origin, encoding='utf-8') as f:\n"
+    "            return 'warmstart_ckpt' in f.read()\n"
+    "    except Exception:\n"
+    "        return False\n"
     "print(json.dumps({\n"
     "    'version': platform.python_version(),\n"
     "    'gpl': h('piper.train'),\n"
@@ -113,6 +125,7 @@ _PROBE_CODE = (
     "    'onnxscript': h('onnxscript'),\n"
     "    'lightning': h('lightning'),\n"
     "    'piper_root': piper_root(),\n"
+    "    'warmstart': warmstart(),\n"
     "}))\n"
 )
 
@@ -224,6 +237,7 @@ def _env_payload(python: str, raw: dict[str, Any]) -> dict[str, Any]:
         "lightning": bool(raw.get("lightning")),
         "monotonic": monotonic,
         "piper_root": root,
+        "warmstart": bool(raw.get("warmstart")),
         "export_missing": export_missing,
         "missing": missing,
         "can_train": ok,
@@ -679,6 +693,18 @@ def preprocess_argv(env: dict[str, Any], prepared: dict[str, Any], run_dir: Path
     ]
 
 
+def reference_argv(python: str, onnx: str, out: Path) -> list[str]:
+    """Convert an inference .onnx into a warm-start checkpoint.
+
+    Runs with the TRAINING interpreter: piper-tts[train] is what installs torch
+    and onnx there, and the dashboard's own venv is kept free of torch. The
+    script is called by path so the training venv does not need this package on
+    its import path.
+    """
+    script = Path(__file__).with_name("piper_reference.py")
+    return [python, str(script), "--onnx", onnx, "--out", str(out)]
+
+
 def train_argv(
     env: dict[str, Any],
     prepared: dict[str, Any],
@@ -689,8 +715,15 @@ def train_argv(
     batch_size: int,
     accelerator: str,
     checkpoint: str = "",
+    warmstart: bool = False,
 ) -> list[str]:
-    """The training command for the detected trainer."""
+    """The training command for the detected trainer.
+
+    ``checkpoint`` is either a Lightning .ckpt (strict resume: optimizer and
+    epoch come along) or a checkpoint converted from an inference .onnx
+    (``warmstart``: piper copies the weights by name and shape and starts a
+    fresh optimizer, which is all a .onnx can support).
+    """
     if env["flavor"] == "piper1-gpl":
         argv = [
             env["python"], "-m", "piper.train", "fit",
@@ -714,8 +747,14 @@ def train_argv(
             "--trainer.default_root_dir", str(run_dir),
         ]
         if checkpoint:
-            argv += ["--ckpt_path", checkpoint]
+            argv += (["--model.warmstart_ckpt", checkpoint] if warmstart
+                     else ["--ckpt_path", checkpoint])
         return argv
+    if warmstart:
+        raise TrainError(
+            "the legacy piper_train has no warm start — use the piper1-gpl "
+            "trainer (piper-tts[train]) or a .ckpt checkpoint"
+        )
     argv = [
         env["python"], "-m", "piper_train",
         "--dataset-dir", str(run_dir / "dataset"),
@@ -763,8 +802,14 @@ def export_argv(env: dict[str, Any], checkpoint: Path, onnx: Path) -> list[str]:
 
 
 def find_checkpoint(run_dir: Path) -> Path | None:
-    """Newest checkpoint under the run — ``last.ckpt`` wins when it exists."""
-    ckpts = [p for p in run_dir.rglob("*.ckpt") if p.is_file()]
+    """Newest checkpoint under the run — ``last.ckpt`` wins when it exists.
+
+    ``reference.ckpt`` is the warm-start copy of an inference .onnx, not a
+    training checkpoint: exporting or resuming it would ship the reference
+    instead of the run.
+    """
+    ckpts = [p for p in run_dir.rglob("*.ckpt")
+             if p.is_file() and p.name != REFERENCE_FILE]
     if not ckpts:
         return None
     ckpts.sort(key=lambda p: p.stat().st_mtime)
@@ -841,6 +886,8 @@ def new_job() -> dict[str, Any]:
         "error": "",
         "cancelled": False,
         "resumed_from": {},
+        "warmstart": False,
+        "reference": {},
         "log": "",
         "steps": [],
         "exported": {},
@@ -867,6 +914,7 @@ def begin(job: dict[str, Any], *, kind: str, package: str = "", voice_name: str 
         python=python, clips=0, seconds=0.0, batch_size=DEFAULT_BATCH,
         started_at=time.time(), finished_at=None, error="",
         cancelled=False, resumed_from=dict(resumed_from or {}), log="",
+        warmstart=False, reference={},
         steps=[], exported={}, notified={}, attached={}, attach_error="",
     )
     job["_saved_epoch"] = -1          # per-run cache for the epoch checkpoint write
@@ -994,6 +1042,22 @@ async def _stream(
         return int(proc.returncode or 0)
     finally:
         job["_proc"] = None
+
+
+def _stopped_by_user(job: dict[str, Any], run_dir: Path) -> bool:
+    """Whether a failed step is really the user's stop.
+
+    ``cancel`` writes the marker and terminates the child directly, so the
+    process can exit before the supervisor's 0.5 s watcher has copied the flag
+    onto the job — without reading the marker here, the stop would surface as
+    "training exited with an error".
+    """
+    if job.get("cancelled"):
+        return True
+    try:
+        return (Path(run_dir) / CANCEL_FILE).is_file()
+    except OSError:
+        return False
 
 
 def _write_run(run_dir: Path, record: dict[str, Any]) -> None:
@@ -1172,6 +1236,7 @@ def validate_start(
         if not path.is_file():
             raise TrainError(f"training interpreter not found: {python.strip()}")
         exe = str(path.resolve())
+    warmstart = False
     if resume:
         # A resumed run continues the checkpoint it stopped at; a separate
         # checkpoint field would be a second, contradictory starting point.
@@ -1181,9 +1246,16 @@ def validate_start(
         if ckpt:
             path = Path(ckpt)
             if not path.is_file():
-                raise TrainError(f"checkpoint not found: {ckpt}")
-            if not ckpt.lower().endswith(".ckpt"):
-                raise TrainError("the checkpoint must be a .ckpt file")
+                raise TrainError(f"reference not found: {ckpt}")
+            suffix = path.suffix.lower()
+            if suffix == ".onnx":
+                # An inference model: warm start from its weights.
+                warmstart = True
+            elif suffix != ".ckpt":
+                raise TrainError(
+                    "the reference must be a .ckpt training checkpoint or an "
+                    ".onnx voice"
+                )
             # The child runs with cwd=run_dir, so a relative path would not resolve.
             ckpt = str(path.resolve())
     return {
@@ -1194,6 +1266,7 @@ def validate_start(
         "accelerator": accel,
         "python": exe,
         "checkpoint": ckpt,
+        "warmstart": warmstart,
         "resume": resume,
         "spec": spec,
     }
@@ -1213,6 +1286,7 @@ async def run_train(
     accelerator: str = "auto",
     python: str = "",
     checkpoint: str = "",
+    warmstart: bool = False,
     resume_from: str = "",
     run_dir: Path | None = None,
     on_change: Callable[[], None] | None = None,
@@ -1241,6 +1315,8 @@ async def run_train(
         "accelerator": accelerator,
         "python": interpreter(python),
         "checkpoint": checkpoint,
+        "warmstart": bool(warmstart),
+        "reference": {},
         "resumed_from": {},
         "epoch": 0,
         "error": "",
@@ -1289,6 +1365,9 @@ async def run_train(
         job["voice_name"] = options["voice_name"]
         job["epochs"] = options["epochs"]
         job["python"] = options["python"]
+        warmstart = bool(options.get("warmstart"))
+        job["warmstart"] = warmstart
+        record["warmstart"] = warmstart
         resume = options.get("resume") or {}
         job["resumed_from"] = dict(resume)
 
@@ -1296,6 +1375,18 @@ async def run_train(
         job["flavor"] = env["flavor"]
         if not env["can_train"]:
             raise TrainError(env["hint"] + " — press “install train deps” or set another interpreter")
+        if warmstart and env["flavor"] != "piper1-gpl":
+            raise TrainError(
+                "an .onnx reference needs the piper1-gpl trainer (python -m "
+                "piper.train), but this interpreter has the legacy piper_train — "
+                "install piper-tts[train] in it, or start from a .ckpt"
+            )
+        if warmstart and not env.get("warmstart"):
+            raise TrainError(
+                "this piper-tts build has no warm-start option "
+                "(--model.warmstart_ckpt) — update it with "
+                'pip install -U "piper-tts[train]" or start from a .ckpt'
+            )
         if env["flavor"] == "piper1-gpl" and not env.get("monotonic", True):
             # The wheel ships without the alignment core, so fit would die in
             # its first training_step. Heal it before any prep, and refuse to
@@ -1375,8 +1466,8 @@ async def run_train(
         if seconds < voice_port.MIN_TRAIN_SECONDS:
             raise TrainError(
                 f"the dataset is too small to train a voice: {clips} clip(s) / "
-                f"{seconds:.1f}s of speech. This trainer starts from random weights, "
-                f"so it needs at least {int(voice_port.MIN_TRAIN_SECONDS)}s "
+                f"{seconds:.1f}s of speech. Piper needs at least "
+                f"{int(voice_port.MIN_TRAIN_SECONDS)}s "
                 "(10+ minutes recommended); below that it only learns noise — that is "
                 "the robotic audio a run like this exports. Add more audio and build "
                 "the package again."
@@ -1442,6 +1533,40 @@ async def run_train(
                 )
             mark("preprocess", "done")
 
+        # An inference .onnx has no optimizer/discriminator state, so it cannot
+        # be resumed — it is converted inside the run and handed to piper's
+        # non-strict warm start, which copies whatever matches the new model.
+        reference_ckpt = ""
+        if warmstart:
+            reference_ckpt = str(run_dir / REFERENCE_FILE)
+            source = Path(options["checkpoint"]).name
+            job.update(phase="reference", phase_label=f"reading {source}…", progress=6.0)
+            _write_run(run_dir, {**record, "steps": job["steps"], "status": "running"})
+            notify()
+            rc = await _stream(
+                job, reference_argv(env["python"], options["checkpoint"], Path(reference_ckpt)),
+                cwd=run_dir, log_file=log_file, on_line=log, on_spawn=notify,
+            )
+            if rc != 0:
+                if _stopped_by_user(job, run_dir):
+                    raise _Cancelled()
+                raise TrainError(
+                    "the .onnx reference could not be read — the log above has the "
+                    "converter's reason (a corrupted export or a model that is not "
+                    "a Piper voice)"
+                )
+            if not Path(reference_ckpt).is_file():
+                raise TrainError(
+                    "the .onnx reference produced no checkpoint — the log above has "
+                    "the converter's output"
+                )
+            job["reference"] = {"onnx": options["checkpoint"], "checkpoint": reference_ckpt}
+            record["reference"] = job["reference"]
+            log(
+                "• the trainer now copies the reference's matching weights "
+                "(non-strict warm start) and trains a fresh optimizer"
+            )
+
         mark("train", "running")
         start_epoch = int(resume.get("epoch") or 0) if resume else 0
         job.update(
@@ -1482,7 +1607,8 @@ async def run_train(
                 epochs=options["epochs"],
                 batch_size=effective_batch,
                 accelerator=options["accelerator"],
-                checkpoint=options["checkpoint"],
+                checkpoint=reference_ckpt or options["checkpoint"],
+                warmstart=warmstart,
             ),
             cwd=run_dir,
             log_file=log_file,
@@ -1490,7 +1616,7 @@ async def run_train(
             on_spawn=notify,
         )
         if rc != 0:
-            if job["cancelled"]:
+            if _stopped_by_user(job, run_dir):
                 raise _Cancelled()
             raise TrainError(
                 "training exited with an error — the log above has the trainer's reason"
@@ -1515,7 +1641,7 @@ async def run_train(
             on_spawn=notify,
         )
         if rc != 0:
-            if job["cancelled"]:
+            if _stopped_by_user(job, run_dir):
                 raise _Cancelled()
             raise TrainError("the ONNX export failed — the log has the exporter's reason")
         if not onnx.is_file():
@@ -1812,6 +1938,7 @@ def supervise(run_dir: Path | str) -> None:
                 accelerator=str(config.get("accelerator") or "auto"),
                 python=str(config.get("python") or ""),
                 checkpoint=str(config.get("checkpoint") or ""),
+                warmstart=bool(config.get("warmstart")),
                 resume_from=str(config.get("resume_from") or ""),
                 run_dir=run_dir,
                 on_change=persist,
@@ -1876,6 +2003,7 @@ def start_run(job: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
         "accelerator": options["accelerator"],
         "python": options["python"],
         "checkpoint": options.get("checkpoint", ""),
+        "warmstart": bool(options.get("warmstart")),
         "resume_from": options.get("resume_from", ""),
         "flavor": options.get("flavor", ""),
         "resumed_from": options.get("resume") or {},
@@ -1915,7 +2043,8 @@ def start_run(job: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
         resumed_from=options.get("resume") or {},
     )
     job.update(status="running", run_dir=str(run_dir), pid=proc.pid,
-               phase_label="starting the trainer…", started_at=time.time())
+               phase_label="starting the trainer…", started_at=time.time(),
+               warmstart=bool(options.get("warmstart")))
     write_job_snapshot(run_dir, job)
     return snapshot(job)
 
@@ -2136,11 +2265,47 @@ def auto_attach(
 # Panel payload
 # ---------------------------------------------------------------------------
 
+MAX_REFERENCES = 40
+
+
+def list_references() -> list[dict[str, Any]]:
+    """Every Piper ``.onnx`` on this machine that can seed a training run.
+
+    Downloaded voices, attached models and models exported by earlier runs all
+    live under the voices tree, so the panel can offer a picker instead of
+    asking for a path. Newest first: the voice you trained last is usually the
+    one worth fine-tuning from. The file is only a *reference* — training never
+    modifies it.
+    """
+    root = Path(piper_setup.DEFAULT_VOICES_DIR)
+    if not root.is_dir():
+        return []
+    found: list[dict[str, Any]] = []
+    for path in root.rglob("*.onnx"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        found.append({
+            "path": str(path.resolve()),
+            "name": path.name,
+            "size": int(stat.st_size),
+            "modified": float(stat.st_mtime),
+            # The exported model and its config travel together; a lone .onnx
+            # can still warm-start, this is only a hint for the panel.
+            "config": path.with_name(path.name + ".json").is_file(),
+            "trained": any(p.name.startswith("run-") for p in path.parents),
+        })
+    found.sort(key=lambda r: r["modified"], reverse=True)
+    return found[:MAX_REFERENCES]
+
+
 async def status_payload(python: str = "") -> dict[str, Any]:
     env = await probe(python)
     return {
         "env": env,
         "packages": list_packages(),
+        "references": list_references(),
         "defaults": {
             "epochs": DEFAULT_EPOCHS,
             "min_epochs": MIN_EPOCHS,

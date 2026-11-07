@@ -340,7 +340,9 @@ class LLMConfig(BaseModel):
 
 
 class TTSConfig(BaseModel):
-    provider: Literal["fish", "elevenlabs", "piper", "kokoro", "openai_compatible"] = "fish"
+    provider: Literal[
+        "fish", "elevenlabs", "piper", "kokoro", "kokoclone", "openai_compatible",
+    ] = "fish"
     voice_id: str = ""
     sample_rate: int = 24000
     # Output device for Wallie's voice. "" = system default. Accepts a device index
@@ -382,6 +384,14 @@ class TTSConfig(BaseModel):
     kokoro_speed: float = 1.0
     # Pitch shift in semitones, same effect and range as Piper's.
     kokoro_pitch: float = 0.0
+    # KokoClone — zero-shot cloning ON TOP of Kokoro: Kokoro synthesises the line
+    # and a Kanade voice-conversion pass reshapes it into the reference speaker.
+    # Optional third-party backend (see tts/kokoclone.py); ref is a wav in
+    # voices/kokoclone/<voice>/ref.wav, lang is KokoClone's own code (pt/en/es/…)
+    # and pitch is a semitone shift applied to the finished PCM.
+    kokoclone_ref: str = ""
+    kokoclone_lang: str = "en"
+    kokoclone_pitch: float = 0.0
     # OpenAI-compatible speech endpoint (POST {base}/audio/speech, PCM output).
     # Works with OpenAI itself, self-hosted gateways (e.g. faster-whisper servers
     # exposing the same API), and most aggregators. Key lives in Secrets (.env).

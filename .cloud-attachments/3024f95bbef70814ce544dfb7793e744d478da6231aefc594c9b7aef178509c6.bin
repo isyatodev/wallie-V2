@@ -1,0 +1,145 @@
+---
+name: freebuff-session-logs
+description: >-
+  Recover context from an interrupted or lost Freebuff session. Reads the local
+  Desktop SQLite store (conversation, compaction summaries, ask_questions
+  answers, changed files) and the CLI chat folders with one read-only helper
+  script. Verified against this machine on 2026-10-12.
+---
+
+# Freebuff Session Logs — recover an interrupted session
+
+Freebuff keeps every session on this computer. One read-only helper script,
+`scripts/fbsess.py`, finds and reads them, so a crashed or restarted session can
+be resumed without asking the user again. Python 3.8+, standard library only,
+works on Windows / Linux / macOS.
+
+## When to use
+
+- The user refers to past work ("as we discussed yesterday", "continue that task").
+- Context was lost ("where were we?", "the session was interrupted").
+- A fresh conversation where the user expects continuity.
+- The user asks for logs or a dump of a previous session.
+- `ask_questions` answers were lost to a restart: recover them verbatim instead
+  of asking the same question again.
+
+## Decision rule
+
+| Situation | Command |
+|---|---|
+| A topic is named | `find <keyword>` → then `brief <thread_id>` |
+| "Continue from last time" | `brief` (newest thread of the newest store) |
+| Lost question answers | `answers` |
+| User is in the CLI | `cli` |
+| Unsure where the data is | `doctor` |
+| Wants the whole thread as text | `dump <thread_id> --out <path>` |
+
+Typical recovery: `doctor` once per machine → `list` → `find <topic>` →
+`brief <thread_id>` → read the brief, `dump` only if more detail is needed →
+continue the work from the compaction summary and the last user message.
+
+## Setup (once)
+
+Keep the script next to this file and call it with Python:
+
+```bash
+python scripts/fbsess.py doctor     # where the data is on this machine (python3 on Linux/macOS)
+```
+
+No install, no config, no keys. It never writes to the app store: connections are
+`mode=ro` + `PRAGMA query_only`, and if the app holds a lock it reads a temporary
+copy of the DB plus its `-wal`/`-shm` files. The only file it ever writes is the
+dump you explicitly ask for.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `doctor` | Detected paths, store sizes, thread/message counts, schema check, FTS availability, CLI chat folders, app log |
+| `list` | Desktop stores (newest first, with size, message count, open threads, last activity, project path) and the 30 newest CLI chats |
+| `find <keyword>` | Keyword search over the stores in scope; uses the store's own full-text index when present |
+| `brief [thread_id]` | Resume brief: thread state, last compaction summary, last user message, last assistant reply, notices, changed files, unanswered `ask_questions` |
+| `dump [thread_id] --out <path>` | Full readable text of one thread, skipping reasoning and UI/sponsor noise; refuses to replace an existing file without `--force` |
+| `answers [thread_id]` | Every `ask_questions` question with the recorded answer, newest first; unanswered ones are marked |
+| `cli [chat_dir_name]` | Lists CLI chats, or prints one (default newest) |
+
+Scope flags for `find`, `brief`, `dump`, `answers`:
+
+- `--project SUBSTR` — only stores whose folder slug or `projectPath` contains SUBSTR (repeatable).
+- `--exclude SUBSTR` — skip matching stores. The private workspace
+  `workspace_personal` is excluded by default; `--exclude ""` includes everything.
+- `--limit N` — cap results / dumped messages / printed CLI entries.
+
+Examples:
+
+```bash
+python scripts/fbsess.py find "топология" --project workspace-36e8284b
+python scripts/fbsess.py brief 98203c25-f1f1-4a40-9aad-046e3a8b250f
+python scripts/fbsess.py dump --out ../fbsess/2026-10-12-dump.md --limit 400
+python scripts/fbsess.py cli 2026-09-19T00-41-30.148Z --limit 20
+```
+
+## Where the data lives
+
+`references/device-layout.md` holds the layout verified on this machine on
+2026-10-12 (store paths, schema, observed part kinds, the full-text index, CLI
+folders, log path, known limits). Read it before trusting any path from memory —
+the app moved from `.freebuff/desktop.db` to
+`~/.config/freebuff-desktop/projects/<slug>/desktop-v2.db` once already, and it
+now also keeps `cloud-projects/`, `local-projects/`, `runtimes/` and
+`account-skills/` next to the stores.
+
+Short version:
+
+- Desktop store: `~/.config/freebuff-desktop/projects/<slug>/desktop-v2.db`
+  (`%USERPROFILE%\.config\...` on Windows); `project.json` beside it maps the
+  folder to the workspace on disk.
+- CLI chats: `~/.config/manicode/projects/<project>/chats/<ISO-time>/`
+  (`FREEBUFF_CONFIG_DIR` replaces `~/.config/manicode` when set).
+- App log: `%APPDATA%\Freebuff\logs\orchestrator-stderr.log` on Windows,
+  `~/Library/Logs/Freebuff/` on macOS, `~/.config/Freebuff/logs/` on Linux.
+
+### Schema that matters
+
+`messages` has no text column. Content is a JSON array in `parts_json`, one entry
+per part, with `kind` = `text`, `compaction` (`receipt.summary`), `reasoning`,
+`tool` (`toolName`, `input`, `output`/`result`, `exitCode`), `notice`, `changes`,
+`agent`, `ad`, `sponsored_*`, `*_setup_invitation`. Thread state lives in
+`threads`, including `status`, `model`, `title`, `updated_at` and
+`sidebar_archived_at` (archive marker — prefer it over the legacy `archived_at`).
+Searching `parts_json` with `LIKE` also hits hidden reasoning and tool payloads;
+the script uses the store's full-text table when it exists.
+
+## Safety rules
+
+- Everything here is read-only. Never delete, move or edit the DB, its `-wal` or
+  `-shm` files, and never write to a store while Freebuff is running.
+- If the app holds a lock, the script reads a temporary copy; the original is not touched.
+- Keep dumps out of version control — they can contain private content.
+- Do not paste a whole dump back to the user. Summarize, and quote only the lines
+  that answer the question.
+- Do not print credentials, tokens or config contents that happen to sit in a
+  recovered turn; paraphrase or withhold them.
+- A broad search reads other projects' history. Scope it with `--project` when the
+  question is about one workspace, and leave `workspace_personal` out unless the
+  user asks for it.
+
+## Quick checklist
+
+1. `doctor` — is there a live store for this workspace, and does the schema match?
+2. Topic named? `find <keyword>`, then `brief <thread_id>`.
+3. "Continue from last time"? `brief` (newest thread).
+4. Lost question answers? `answers`.
+5. On the CLI? `cli`.
+6. Crash? Read the app log path from `doctor` and pick the relevant lines only.
+7. Nothing found? Confirm the store list from `doctor` — a build run from source
+   uses its own profile folder, so search the disk for `desktop-v2.db` instead of
+   trusting the table.
+
+## Verification status
+
+`doctor`, `list`, `find`, `brief`, `dump`, `answers`, `cli` were exercised on this
+machine on 2026-10-12 against a 1.4 GB live workspace store (12 166 messages) and
+returned correct results in under a second per command; the store's size and
+mtimes (`.db`, `-wal`, `-shm`) were unchanged afterwards. The lock-fallback path
+(temporary copy) has not been triggered on this machine.

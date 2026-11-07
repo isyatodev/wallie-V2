@@ -160,7 +160,7 @@ function emptyCfg() {
       vision_first_person: true, vision_commentary_density: "balanced",
     },
     llm: { provider: "groq", model: "", temperature: 0.85, top_p: 0.95, max_tokens: 500, presence_penalty: 0.3, frequency_penalty: 0.4, vision_capable: false, ollama_base_url: "http://localhost:11434", ollama_keep_alive: "5m", vision_provider: "main", vision_model: "", vision_provider_ref: "", vision_openai_compatible_base_url: "", vision_openai_compatible_timeout: 30, vision_max_tokens: 200, provider_ref: "", openai_compatible_base_url: "", openai_compatible_timeout: 25 },
-    tts: { provider: "fish", voice_id: "", sample_rate: 24000, el_model_id: "eleven_turbo_v2_5", el_stability: 0.45, el_similarity_boost: 0.75, el_style: 0.0, el_optimize_streaming_latency: 3, fish_latency_mode: "balanced", fish_chunk_length: 100, piper_model_path: "", piper_length_scale: 1.0, piper_noise_scale: 0.667, piper_noise_w: 0.8, piper_pitch: 0.0, kokoro_voice: "af_heart", kokoro_lang_code: "a", kokoro_speed: 1.0, kokoro_pitch: 0.0, openai_compatible_base_url: "", openai_compatible_model: "", openai_compatible_timeout: 30, openai_compatible_voice: "alloy", openai_compatible_speed: 1.0, openai_compatible_pcm_sample_rate: 24000, provider_ref: "", output_device: "" },
+    tts: { provider: "fish", voice_id: "", sample_rate: 24000, el_model_id: "eleven_turbo_v2_5", el_stability: 0.45, el_similarity_boost: 0.75, el_style: 0.0, el_optimize_streaming_latency: 3, fish_latency_mode: "balanced", fish_chunk_length: 100, piper_model_path: "", piper_length_scale: 1.0, piper_noise_scale: 0.667, piper_noise_w: 0.8, piper_pitch: 0.0, kokoro_voice: "af_heart", kokoro_lang_code: "a", kokoro_speed: 1.0, kokoro_pitch: 0.0, kokoclone_ref: "", kokoclone_lang: "en", kokoclone_pitch: 0.0, openai_compatible_base_url: "", openai_compatible_model: "", openai_compatible_timeout: 30, openai_compatible_voice: "alloy", openai_compatible_speed: 1.0, openai_compatible_pcm_sample_rate: 24000, provider_ref: "", output_device: "" },
     vision: { enabled: false, source: "monitor", monitor_index: 1, interval_sec: 3.0, min_change_threshold: 8, max_edge_px: 768, startup_delay_sec: 5 },
     play: { enabled: false, game: "minecraft", goal: "Build a thriving Minecraft empire LIVE for an audience — gather, craft full gear, build, fight and explore. Make the journey entertaining, not a speedrun.", talk_from_agent: true, hide_chat: true, avoid_water: true },
     hearing: { enabled: false, window_sec: 5.0, model_size: "small", language: "", silence_threshold: 0.006, sound_event_threshold: 0.06, max_context_age_sec: 12.0, engine: "", openai_compatible_base_url: "", openai_compatible_model: "whisper-1", openai_compatible_timeout: 20, openai_compatible_prompt: "", provider_ref: "", loopback_device: "", speaker_id: { enabled: false, threshold: 0.68, unknown_threshold: 0.45, collect_other_voices: false } },
@@ -322,6 +322,31 @@ function app() {
     voiceLabSaveName: "",
     voiceLabRecordSeconds: 8,
     voiceLabRecording: false,
+    // Kokoro blending — in-between local voices mixed from the packs on disk.
+    // ``sources`` holds the picked voices and their slider weights.
+    voiceBlend: {
+      voices: [], blends: [], sources: [], name: "", pick: "",
+      text: AB_DEFAULT_TEXT, speed: 1.0, busy: "", msg: "", clip: "",
+    },
+    // KokoClone — zero-shot cloning on top of Kokoro (optional backend). The
+    // panel holds ONE reference clip in ``kokoRef`` until the voice is created.
+    kokoClone: {
+      installed: false, hint: "", missing: [], root: "", clips: [], presets: [],
+      worker: null, languages: [], minSeconds: 2, maxSeconds: 30,
+      recommended: "3–10 s", canInstall: false, installerPresent: true, git: true,
+      pythonOk: true, pythonRange: "3.10–3.12",
+    },
+    // The KokoClone install job (server-side): the panel shows its log and
+    // re-probes the backend when it ends.
+    kokoInstall: { running: false, log: "", returncode: null, started_at: null },
+    _kokoInstallPoll: null,
+    kokoName: "",
+    kokoLang: "pt",
+    kokoMsg: "",
+    kokoBusy: "",
+    kokoRef: null,
+    kokoRecordSeconds: 8,
+    kokoRecording: false,
     // Voice port — a cloned cloud voice carried over to a local engine. The
     // .json only holds the id, so the port captures audio and packages it.
     voicePort: {
@@ -343,7 +368,7 @@ function app() {
     // job is polled while it runs; the run's own run.json keeps the exported
     // model attachable even after a dashboard restart.
     voiceTrain: {
-      env: null, packages: [], package: "", voiceName: "", epochs: 200,
+      env: null, packages: [], references: [], package: "", voiceName: "", epochs: 200,
       batchSize: 8, accelerator: "auto", python: "", checkpoint: "",
       advanced: false, busy: "", msg: "", attachMsg: "", follow: true,
       job: null, lastRun: null, resume: null, resumeFrom: "",
@@ -480,6 +505,8 @@ function app() {
       await this.loadSpeakers();
       await this.loadLtm();
       await this.loadVoiceLibrary();
+      await this.loadKokoroBlends();   // the blender's packs + saved blends
+      await this.loadKokoClone();      // optional backend: never starts the worker
       await this.loadVoicePort();
       await this.loadLocalVoices();
       // Training is heavy: only resume polling when a run is still alive.
@@ -1536,6 +1563,8 @@ function app() {
       await this.loadConfig();
       await this.loadProfiles();
       await this.loadVoiceLibrary();
+      await this.loadKokoroBlends();    // the packs are shared, the blends with them
+      await this.loadKokoClone();      // its voices are per profile
       await this.loadVoicePort();   // saved voices are per profile
       await this.loadVoiceTrain();     // …and so are the ported packages
       await this.loadVoicePartners();  // ...and so is the voice partner
@@ -2642,6 +2671,383 @@ function app() {
       }
     },
 
+    // ----- Kokoro blending — average packs into a new local voice -----
+    async loadKokoroBlends() {
+      try {
+        const r = await fetch("/api/tts/kokoro/blends");
+        if (!r.ok) return;
+        const d = await r.json();
+        this.voiceBlend.voices = d.voices || [];
+        this.voiceBlend.blends = d.blends || [];
+      } catch { /* the panel says "no packs" on its own */ }
+    },
+
+    // Voices not already in the mix — a blend may reuse an earlier blend.
+    blendChoices() {
+      const picked = new Set((this.voiceBlend.sources || []).map(s => s.voice));
+      return (this.voiceBlend.voices || []).filter(v => !picked.has(v.name));
+    },
+
+    addBlendSource() {
+      const name = (this.voiceBlend.pick || "").trim();
+      if (!name || this.voiceBlend.sources.length >= 4) return;
+      this.voiceBlend.sources.push({ voice: name, weight: 50 });
+      this.voiceBlend.pick = "";
+      this.voiceBlend.msg = "";
+    },
+
+    blendTotal() {
+      const total = (this.voiceBlend.sources || [])
+        .reduce((n, s) => n + (Number(s.weight) || 0), 0);
+      return total > 0 ? total : 1;
+    },
+
+    blendPercent(i) {
+      const s = this.voiceBlend.sources[i];
+      if (!s) return 0;
+      return Math.round((Number(s.weight) || 0) * 100 / this.blendTotal());
+    },
+
+    // The blend reads with ONE phoneme language: the sources must agree.
+    blendLangLabel() {
+      const codes = new Set();
+      for (const s of this.voiceBlend.sources || []) {
+        const v = (this.voiceBlend.voices || []).find(x => x.name === s.voice);
+        if (v && v.lang_code) codes.add(v.lang_code);
+      }
+      if (!codes.size) return "";
+      if (codes.size > 1) return "mixed languages — pick voices from one language";
+      const code = [...codes][0];
+      const lang = (this.kokoroLangs || []).find(l => l.code === code);
+      return lang ? lang.label : code;
+    },
+
+    blendReady() {
+      return this.voiceBlend.sources.length >= 2 && !!(this.voiceBlend.name || "").trim();
+    },
+
+    async previewBlend() {
+      if (this.voiceBlend.busy || this.voiceBlend.sources.length < 2) return;
+      const text = (this.voiceBlend.text || "").trim() || AB_DEFAULT_TEXT;
+      this.voiceBlend.busy = "preview";
+      this.voiceBlend.msg = "mixing the packs and synthesising…";
+      try {
+        const r = await fetch("/api/tts/kokoro/blends/preview", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sources: this.voiceBlend.sources, text,
+            speed: Number(this.voiceBlend.speed) || 1.0,
+          }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceBlend.msg = "✗ " + (d.detail || `HTTP ${r.status}`);
+          return;
+        }
+        this.voiceBlend.clip = "data:audio/wav;base64," + d.wav_b64;
+        this.voiceBlend.msg = `✓ ${d.seconds}s · ${d.lang_code} · ${d.voice_id}`;
+      } catch (e) {
+        this.voiceBlend.msg = "✗ " + e;
+      } finally {
+        this.voiceBlend.busy = "";
+      }
+    },
+
+    async saveBlend() {
+      const name = (this.voiceBlend.name || "").trim();
+      if (this.voiceBlend.busy || !this.blendReady()) return;
+      this.voiceBlend.busy = "save";
+      this.voiceBlend.msg = "saving the blend…";
+      try {
+        const r = await fetch("/api/tts/kokoro/blends", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name, sources: this.voiceBlend.sources,
+            tts: { kokoro_speed: Number(this.voiceBlend.speed) || 1.0 },
+          }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceBlend.msg = "✗ " + (d.detail || `HTTP ${r.status}`);
+          return;
+        }
+        this.voiceBlend.voices = d.voices || this.voiceBlend.voices;
+        this.voiceBlend.blends = d.blends || this.voiceBlend.blends;
+        this.voiceLab.presets = d.presets || this.voiceLab.presets;
+        this._pruneVoicePick();
+        this.voiceBlend.name = "";
+        this.voiceBlend.msg = d.warning
+          ? "⚠ " + d.warning
+          : `✓ “${d.blend.name}” saved as ${d.blend.id} — it is in the saved voices above`;
+        this.loadLocalVoices();
+        this.loadVoicePartners();
+      } catch (e) {
+        this.voiceBlend.msg = "✗ " + e;
+      } finally {
+        this.voiceBlend.busy = "";
+      }
+    },
+
+    async deleteBlend(blend) {
+      if (this.voiceBlend.busy) return;
+      const ok = window.confirm(
+        `Delete the blend “${blend.name}” and the saved voice that uses it? `
+        + "The packs it was mixed from stay on disk.");
+      if (!ok) return;
+      this.voiceBlend.busy = "delete";
+      try {
+        const r = await fetch(`/api/tts/kokoro/blends/${encodeURIComponent(blend.id)}`,
+          { method: "DELETE" });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.voiceBlend.msg = "✗ " + (d.detail || `HTTP ${r.status}`);
+          return;
+        }
+        this.voiceBlend.voices = d.voices || [];
+        this.voiceBlend.blends = d.blends || [];
+        this.voiceLab.presets = d.presets || this.voiceLab.presets;
+        this._pruneVoicePick();
+        this.voiceBlend.msg = `✓ “${blend.name}” deleted`;
+        this.loadLocalVoices();
+      } catch (e) {
+        this.voiceBlend.msg = "✗ " + e;
+      } finally {
+        this.voiceBlend.busy = "";
+      }
+    },
+
+    // A blend is saved as a normal saved voice, so "use" is the same path.
+    async useBlend(blend) {
+      const preset = this.voiceLab.presets.find(
+        p => p.voice_id === blend.id && (p.provider || "") === "kokoro");
+      if (preset) return this.applyVoice(preset);
+      Object.assign(this.cfg.tts, {
+        provider: "kokoro", kokoro_voice: blend.id,
+        kokoro_lang_code: blend.lang_code || this.cfg.tts.kokoro_lang_code,
+      });
+      await this.save();
+    },
+
+    // ----- KokoClone — zero-shot cloning on top of Kokoro -----
+    async loadKokoClone() {
+      try {
+        const r = await fetch("/api/voices/kokoclone");
+        if (!r.ok) return null;
+        const d = await r.json();
+        this.kokoClone = {
+          installed: !!d.installed,
+          hint: d.hint || "",
+          missing: d.missing || [],
+          root: d.root || "",
+          clips: d.clips || [],
+          presets: d.koko_presets || [],
+          worker: d.worker || null,
+          languages: d.languages || [],
+          canInstall: !!d.can_install,
+          installerPresent: d.installer_present !== false,
+          git: d.git !== false,
+          pythonOk: d.python_ok !== false,
+          pythonRange: d.python_range || "3.10–3.12",
+          minSeconds: d.min_seconds || 2,
+          maxSeconds: d.max_seconds || 30,
+          recommended: d.recommended_seconds || "3–10 s",
+        };
+        if (d.install) this.kokoInstall = d.install;
+        // Keep the chosen language when it is still valid.
+        const known = this.kokoClone.languages.map(l => l.id);
+        if (!known.includes(this.kokoLang)) {
+          this.kokoLang = known[0] || "en";
+        }
+        return d;
+      } catch {
+        return null;
+      }
+    },
+
+    kokoCloneLine() {
+      const k = this.kokoClone;
+      if (this.kokoInstall && this.kokoInstall.running) {
+        return "… installing KokoClone (cloning + pip, this can take a while)";
+      }
+      if (!k.root) return "checking the KokoClone backend…";
+      if (!k.installed) {
+        return "✗ KokoClone not ready"
+          + (k.missing && k.missing.length ? " · missing " + k.missing.join(", ") : "");
+      }
+      const w = k.worker || {};
+      if (w.running && w.ready) return "✓ KokoClone ready — the models are loaded";
+      if (w.running) return "… KokoClone is loading its models";
+      return "✓ KokoClone installed · the first synthesis loads the models";
+    },
+
+    async kokoPickFile(event) {
+      const file = (event.target.files || [])[0];
+      event.target.value = "";          // the same clip can be re-picked
+      if (!file) return;
+      this.kokoMsg = "";
+      try {
+        const data = await this._readBase64(file);
+        this.kokoRef = { filename: file.name, data, mime: file.type || "audio/wav" };
+      } catch (e) {
+        this.kokoMsg = "✗ " + e;
+      }
+    },
+
+    async recordKokoRef() {
+      if (this.kokoRecording) return;
+      this.kokoRecording = true;
+      this.kokoMsg = "recording from the default microphone…";
+      try {
+        const r = await fetch("/api/voices/record", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ seconds: this.kokoRecordSeconds || 8 }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.kokoMsg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        this.kokoRef = { filename: "microphone.wav", data: d.wav_b64, mime: "audio/wav" };
+        this.kokoMsg = `✓ recorded ${d.seconds}s — audition it before creating the voice`;
+      } catch (e) {
+        this.kokoMsg = "✗ " + e;
+      } finally {
+        this.kokoRecording = false;
+      }
+    },
+
+    kokoRefSrc() {
+      if (!this.kokoRef) return "";
+      return `data:${this.kokoRef.mime || "audio/wav"};base64,${this.kokoRef.data}`;
+    },
+
+    async createKokoCloneVoice() {
+      const name = (this.kokoName || "").trim();
+      if (this.kokoBusy || !name || !this.kokoRef) return;
+      this.kokoBusy = "create";
+      this.kokoMsg = "saving the reference clip…";
+      try {
+        const r = await fetch("/api/voices/kokoclone", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name, lang: this.kokoLang,
+            sample: { filename: this.kokoRef.filename, data: this.kokoRef.data },
+          }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.kokoMsg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        this.kokoClone.clips = d.clips || [];
+        this.kokoClone.presets = d.koko_presets || [];
+        this.voiceLab.presets = d.presets || this.voiceLab.presets;
+        this._pruneVoicePick();
+        this.kokoName = "";
+        this.kokoRef = null;
+        this.kokoMsg = d.warning
+          ? "⚠ " + d.warning
+          : (d.installed
+            ? `✓ “${d.clip.name}” saved — press ▶ test to hear it in that voice`
+            : `✓ “${d.clip.name}” saved. ${d.hint}`);
+        this.loadLocalVoices();
+        this.loadVoicePartners();
+      } catch (e) {
+        this.kokoMsg = "✗ " + e;
+      } finally {
+        this.kokoBusy = "";
+      }
+    },
+
+    async deleteKokoVoice(preset) {
+      if (this.kokoBusy) return;
+      const ok = window.confirm(`Delete the KokoClone voice “${preset.name}” and its reference clip?`);
+      if (!ok) return;
+      this.kokoBusy = "delete";
+      try {
+        const r = await fetch(`/api/voices/kokoclone/${encodeURIComponent(preset.name)}`,
+          { method: "DELETE" });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.kokoMsg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        this.kokoClone.clips = d.clips || [];
+        this.kokoClone.presets = d.koko_presets || [];
+        this.voiceLab.presets = d.presets || this.voiceLab.presets;
+        this._pruneVoicePick();
+        this.kokoMsg = `✓ “${preset.name}” deleted`;
+        this.loadLocalVoices();
+      } catch (e) {
+        this.kokoMsg = "✗ " + e;
+      } finally {
+        this.kokoBusy = "";
+      }
+    },
+
+    async stopKokoWorker() {
+      this.kokoBusy = "stop";
+      try {
+        const r = await fetch("/api/voices/kokoclone/stop", { method: "POST" });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok) {
+          this.kokoClone.worker = d.worker || null;
+          this.kokoMsg = d.stopped
+            ? "worker stopped — the next synthesis loads the models again"
+            : "the worker was not running";
+        } else {
+          this.kokoMsg = "✗ " + this._apiError(d, r.status);
+        }
+      } catch (e) {
+        this.kokoMsg = "✗ " + e;
+      } finally {
+        this.kokoBusy = "";
+      }
+    },
+
+    // The install runs on the server (it clones the checkout and shells out to
+    // pip), so the panel only starts it and polls the log.
+    async installKokoClone() {
+      if (this.kokoInstall.running) return;
+      this.kokoMsg = "";
+      this.kokoInstall = { ...this.kokoInstall, running: true, log: "starting the installer…" };
+      try {
+        const r = await fetch("/api/voices/kokoclone/install", { method: "POST" });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok && r.status !== 409) {
+          this.kokoInstall = { ...this.kokoInstall, running: false, log: "" };
+          this.kokoMsg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        this._pollKokoInstall();
+      } catch (e) {
+        this.kokoInstall = { ...this.kokoInstall, running: false };
+        this.kokoMsg = "✗ " + e;
+      }
+    },
+
+    _pollKokoInstall() {
+      if (this._kokoInstallPoll) clearInterval(this._kokoInstallPoll);
+      this._kokoInstallPoll = setInterval(async () => {
+        try {
+          const r = await fetch("/api/voices/kokoclone/install");
+          if (!r.ok) return;                 // keep polling: a restart takes a moment
+          const d = await r.json();
+          if (d.install) this.kokoInstall = d.install;
+          if (this.kokoInstall.running) return;
+          clearInterval(this._kokoInstallPoll);
+          this._kokoInstallPoll = null;
+          await this.loadKokoClone();
+          const rc = this.kokoInstall.returncode;
+          this.kokoMsg = rc === 0
+            ? "✓ KokoClone is installed — add a reference clip below"
+            : "✗ the installer stopped (exit " + rc + ") — the log above says why";
+        } catch {
+          /* a transient failure is not the end of the job */
+        }
+      }, 2000);
+    },
+
     // ----- Pull: bring voices FROM another profile (inverse of ⇪) -----
     async loadPullSource() {
       const src = (this.voicePull.source || "").trim();
@@ -3630,6 +4036,7 @@ function app() {
         }
         this.voiceTrain.env = d.env || null;
         this.voiceTrain.packages = d.packages || [];
+        this.voiceTrain.references = d.references || [];
         this.voiceTrain.job = d.job || null;
         // The supervisor installs the model by itself; adopt it here so the
         // library pickers (and the saved-voices list) show it without a reload.

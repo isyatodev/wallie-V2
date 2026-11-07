@@ -25,6 +25,7 @@ from .base import TTSError, TTSProvider
 from .pitch import clamp_semitones, shift_pcm16
 
 _SAMPLE_RATE = 24000  # Kokoro generates at 24 kHz
+SAMPLE_RATE = _SAMPLE_RATE      # public alias: preview routes report this rate
 
 # Loading the model costs seconds and a few hundred MB. A live session, the
 # Voice page's ▶ Play preview and each A/B take all build a KokoroTTS, so the
@@ -85,6 +86,49 @@ def clear_pipeline_cache() -> None:
         _PIPELINES.clear()
 
 
+def iter_style_pcm(
+    text: str,
+    style: object,
+    *,
+    lang_code: str = "a",
+    speed: float = 1.0,
+    pitch: float = 0.0,
+    pipeline: object = None,
+):
+    """Yield PCM16 chunks for ``text`` spoken with an explicit style tensor.
+
+    The style argument is whatever the pipeline accepts as ``voice``: a voice
+    id, a path, or the style tensor itself. That last form is what the Voice
+    Lab's blender needs — a blend exists only in memory until it is saved, so
+    previewing it must not require a file on disk. Kept module-level (and
+    public) so the dashboard can render a preview through the exact same
+    synthesis path a live segment uses.
+    """
+    import numpy as np
+
+    pipe = pipeline or _get_pipeline(lang_code)
+    speed = float(speed) if speed else 1.0
+    pitch = clamp_semitones(pitch)
+    for result in pipe(text, voice=style, speed=speed):
+        # KPipeline yields (graphemes, phonemes, audio); audio is a float
+        # tensor/array in [-1, 1]. Support tuple or object forms.
+        audio = (
+            result[2]
+            if isinstance(result, (tuple, list))
+            else getattr(result, "audio", None)
+        )
+        if audio is None:
+            continue
+        arr = np.asarray(audio, dtype=np.float32)
+        if arr.size == 0:
+            continue
+        pcm = np.clip(arr, -1.0, 1.0)
+        data = (pcm * 32767.0).astype(np.int16).tobytes()
+        if pitch:
+            data = shift_pcm16(data, pitch, _SAMPLE_RATE)
+        yield data
+
+
 class KokoroTTS(TTSProvider):
     name = "kokoro"
 
@@ -123,26 +167,15 @@ class KokoroTTS(TTSProvider):
 
     def _iter_pcm(self, text: str):
         """Yield PCM16 chunks for ``text`` from the kokoro generator."""
-        import numpy as np
-
-        for result in self._pipeline(text, voice=self._voice_arg(), speed=self._speed):
-            # KPipeline yields (graphemes, phonemes, audio); audio is a float
-            # tensor/array in [-1, 1]. Support tuple or object forms.
-            audio = (
-                result[2]
-                if isinstance(result, (tuple, list))
-                else getattr(result, "audio", None)
-            )
-            if audio is None:
-                continue
-            arr = np.asarray(audio, dtype=np.float32)
-            if arr.size == 0:
-                continue
-            pcm = np.clip(arr, -1.0, 1.0)
-            data = (pcm * 32767.0).astype(np.int16).tobytes()
-            if self._pitch:
-                data = shift_pcm16(data, self._pitch, self.sample_rate)
-            yield data
+        # The pipeline is already the one for this voice's language, so the
+        # style path only needs the style, speed and pitch.
+        return iter_style_pcm(
+            text,
+            self._voice_arg(),
+            speed=self._speed,
+            pitch=self._pitch,
+            pipeline=self._pipeline,
+        )
 
     async def synthesize(self, text: str) -> AsyncIterator[bytes]:
         text = text.strip()

@@ -6,9 +6,11 @@
 >
 > This fork keeps the upstream engine and adds dashboard-level work on top: a **Voice Lab** with
 > provider voice cloning — and the way back down, turning a cloned voice (or audio you already own)
-> into a **trained local Piper/Kokoro model** — plus **any-model vision testing**, a fuller **Kokoro**
-> voice picker (including pt-BR), and per-profile themes. See [What this fork adds](#what-this-fork-adds) —
-> everything else in this document describes behavior inherited from upstream.
+> into a **trained local Piper/Kokoro model** — plus **Kokoro voice blending** (mix two packs into a
+> voice that sits between them), an optional **KokoClone** backend for zero-shot cloning on top of
+> Kokoro, **any-model vision testing**, a fuller **Kokoro** voice picker (including pt-BR), and
+> per-profile themes. See [What this fork adds](#what-this-fork-adds) — everything else in this
+> document describes behavior inherited from upstream.
 
 <p align="center">
   <h1 align="center">Wallie <small>(fork)</small></h1>
@@ -82,6 +84,8 @@ Everything below is fork-specific. If a feature is not listed here, assume it ca
 | **Piper tuning** | Speed (`length_scale`), **Expressiveness** (`noise_scale`) and **Pacing variety** (`noise_w`) as sliders, so a local voice can be tuned to taste instead of taking Piper's defaults | Dashboard → **Voice** |
 | **Kokoro languages** | A real language picker instead of US/UK only — including **Portuguese (Brazil)** (`pf_dora` / `pm_alex` / `pm_santa`), plus Spanish, French, Hindi, Italian, Japanese and Mandarin. Voice ids stay in sync with the language, and the voice field autocompletes per language | Dashboard → **Voice** |
 | **Kokoro voice catalogue** | Browse every voice Kokoro publishes **inside the dashboard** and download only the ones you want with a progress bar. A downloaded voice is used straight from disk — offline, and never re-downloaded | Dashboard → **Voice** |
+| **Kokoro voice blending** | Mix **2–4 downloaded Kokoro voices** with weights and get a **new local voice** that sits between them — the missing middle ground between the handful of published packs. Preview the line before naming it, and the blend lands in the pickers as a normal voice | Dashboard → **Voice Lab** → Blend |
+| **KokoClone** | Optional zero-shot cloning **on top of Kokoro**: drop in a reference clip (or record one), pick its language and the voice reads *any* line in Kokoro's own quality — no training run, no provider. Installs as a separate backend **with one button** (clone + pip, live log) and is selectable as a TTS provider | Dashboard → **Voice Lab** → KokoClone |
 | **Grouped API Keys** | The API Keys page groups provider blocks by service (LLM / Vision / TTS / STT / Memory / Thoughts) in collapsible sections, each block with its own inline API-key field plus rename and delete; the built-in platform keys collapse too | Dashboard → **API Keys** |
 | **Vision test with any model** | The Vision test strip can probe **any provider + model** (and base URL) *without saving it* — the escape hatch when a provider retires a model mid-stream | Dashboard → **Vision** |
 | **Current Gemini defaults** | New profiles and the setup wizard now point at `gemini-3.8-flash`; the deprecated `gemini-2.0-flash` entry is gone and the restricted 2.5 family is labelled as such | Dashboard → **Engine** / setup wizard |
@@ -101,7 +105,7 @@ work — see [Features](#features) and [Architecture](#architecture).
 
 ## The Voice Lab
 
-The fork's biggest addition. Dashboard → **Voice Lab** has four parts:
+The fork's biggest addition. Dashboard → **Voice Lab** has six parts:
 
 **1. Saved voices (presets).** A preset snapshots the Voice page's current settings — provider,
 voice id, speed, stability, the Kokoro language, and so on — under a name. Presets are stored per
@@ -111,7 +115,20 @@ preset and saves; **▶ test** applies it *and* synthesizes a sample line throug
 pipeline so you hear it before going live. The output device is deliberately excluded from a
 preset — it routes audio, it isn't part of a voice.
 
-**2. Clone a voice.** Creates a *real* voice on your own provider account:
+**2. Blend Kokoro voices.** Kokoro publishes a handful of voices per language, and the one you
+want is usually halfway between two of them. **Blend** takes 2–4 *downloaded* Kokoro packs, gives
+each a weight, and stores the weighted average of their style tensors as a **new local voice**
+(`voices/kokoro/kb_<name>.pt`). The weights are shares, not absolutes — 25/75 and 1/3 are the same
+voice — and the line you type is previewed through the same Kokoro pipeline the stream uses before
+you name it. From then on a blend is a normal voice: it shows up in the Voice page picker, in the
+A/B, in this library (`source: blend:kokoro`), and it travels with every export, pull and mirror.
+The recipe of every blend lives in `voices/kokoro/blends.json`, so the voice is documented rather
+than a mystery `.pt`: the page can show you which packs and weights made it. Sources must share a
+phoneme language (the style packs are language-specific) and a tensor shape, and a pack that is not
+downloaded yet is named instead of being quietly skipped. Deleting a blend removes the pack, the
+recipe **and** the saved presets that pointed at it, so nothing is left aiming at a missing file.
+
+**3. Clone a voice.** Creates a *real* voice on your own provider account:
 
 | Provider | Endpoint used | Key needed | Notes |
 |---|---|---|---|
@@ -124,7 +141,26 @@ wrapped into a WAV with the Python stdlib, so no `soundfile`/`ffmpeg` install is
 audition every clip in the browser before cloning. On success the new voice id is saved into the
 library above, ready to apply.
 
-**3. A/B compare.** Pick two voices — a saved voice, or "current Voice page settings" for whatever the
+**4. KokoClone.** Zero-shot cloning that never leaves the machine: **KokoClone** drives Kokoro
+with a Kanade speaker encoder, so ~10 seconds of reference audio is enough for Kokoro to read
+*any* line — no training run, no provider account, no weights to export. Record from the default
+mic or drop in a clip, tag it with the language it speaks, and the Voice Lab keeps it as 24 kHz
+mono WAV under `voices/kokoclone/<name>/ref.wav` with its metadata beside it; a clip under 2 s or
+over 30 s is refused with its measured length rather than becoming a broken voice. It is an
+**optional backend** with its own checkout (`WALLIE_KOKOCLONE_DIR`, default `./kokoclone`) and
+press **⬇ install KokoClone** once: the panel clones the repository and `pip install`s the packages
+this backend imports into the interpreter Wallie runs on, streaming pip's own log while it goes (a
+few GB on the first run, PyTorch included) and re-probing when it ends. It deliberately does **not**
+install the checkout's `requirements.txt` as-is: that asks for `misaki[ja,zh]`, which builds
+`pyopenjtalk` with CMake (no wheels — it fails without a C++ toolchain) and for `gradio`, their own
+web UI. Wallie's worker imports neither, and the panel offers the espeak languages (pt/en/es/fr/it/hi).
+`--upstream` installs their file verbatim if you want the whole app. The Voice page only offers the
+provider once it is really installed. The models load **once**, into a
+persistent worker process — the library is heavy and not thread-safe — so the first line waits
+for them and later lines stream normally, and the panel's status line says whether they are loaded
+— plus a **stop worker** button for when you want the RAM back.
+
+**5. A/B compare.** Pick two voices — a saved voice, or "current Voice page settings" for whatever the
 Voice page shows right now, including unsaved edits — type one line, hit **synthesize both**. Both
 clips come back to the page as playable WAVs (with per-side provider/voice/bytes/seconds metadata),
 so you can hit **play A → B** to hear them back to back, or replay either one. Nothing is routed
@@ -132,7 +168,7 @@ through the output device — comparing a voice must not talk over the stream �
 If one side fails (provider plan limits, a bad voice id), its own message is shown on its card and the
 clip that *did* synthesize is kept, since it was already billed.
 
-**4. Moving voices around.** The library is per profile, so there are four ways to move voices —
+**6. Moving voices around.** The library is per profile, so there are four ways to move voices —
 between profiles on this machine, or out of it entirely. Tick rows with the checkboxes on the left
 (**select all** / **clear** sit next to the list) to act on several voices at once:
 
@@ -204,8 +240,12 @@ A few honest notes:
 
 - Cloning is **provider-side**. The audio is uploaded to ElevenLabs/Fish Audio under *your* account
   and the provider's terms apply to whatever you clone. Only clone voices you have the rights to use.
-- **Piper and Kokoro cannot be cloned into** — they're local, fixed-voice models. The page says so
-  instead of failing silently. Kokoro's language picker is the closest equivalent for local voices.
+- **Provider cloning is the paid path.** For a local voice there are three free ones: **Kokoro
+  blending** and **KokoClone** (both above) and **Piper training** (below). Piper itself cannot be
+  cloned into by either, and the page says so instead of failing silently.
+- **A KokoClone reference clip is a voice.** It is only ever read from `voices/kokoclone/`, sent
+  nowhere, and anyone with the folder has the voice — the same rule as any audio you clone on a
+  provider applies to whatever you clone locally.
 - Malformed or too-short samples are rejected by the provider; the provider's own message is shown
   so you can fix it rather than guess.
 - Piper/Kokoro voices saved on the **Voice** page live in this same library — that is what makes them
@@ -240,11 +280,20 @@ a background process: epochs, batch size and accelerator are yours, the log and 
 stream into the page, a stopped run resumes from its last checkpoint, and the end of the run can
 notify Windows and/or Discord. The trainer may live in a **separate interpreter** — the panel
 probes it, says what is missing and offers the install command instead of failing minutes later.
+**Fine-tuning needs a starting point, and the panel takes either kind:** a `.ckpt` from an earlier
+run (continues exactly, optimizer included) or an inference `.onnx` of any voice you already have
+— a **warm start** that copies its generator weights (text encoder, flow, decoder) into the new
+model and leaves the posterior encoder and discriminators fresh. The `.onnx` is converted inside
+the run with the training interpreter (which `piper-tts[train]` already gives torch and onnx), so
+the dashboard stays free of torch. Tensors are matched by name and shape: the same language and
+quality transfer almost everything, a different one only what lines up — the training log reports
+how many the trainer actually copied.
 
 **4. Install.** When the run exports its model, **attach** copies `pt_BR-<voice>-medium.onnx` +
 `.onnx.json` into `voices/` and registers it as a saved local voice, so it appears in the Voice page
-pickers, the A/B and every copy/pull/backup of the library. Kokoro is the exception: it cannot learn
-a voice from audio, so its package is a reference corpus and a `.pt` voicepack is attached by hand.
+pickers, the A/B and every copy/pull/backup of the library. Kokoro is the exception: nothing trains
+it from audio, so its package is a reference corpus — a new Kokoro voice comes from **blending**
+existing packs or from **KokoClone**, which needs no `.pt` export at all.
 
 **Automatic on both paths.** The **train + attach automatically** switch (on by default) belongs to
 both the capture and the local-import path. "Automatic" means no second click and no open tab: the
@@ -313,6 +362,7 @@ No Python knowledge, no terminal. Download → double-click → done.
 |---|---|---|---|---|
 | **Free** | Gemini 3.8 Flash | Piper (local) | $0 | Good for testing |
 | **Free, better voice** | Gemini 3.8 Flash | Kokoro (local, incl. **pt-BR**) | $0 | Best free voice |
+| **Free, your own voice** | Gemini 3.8 Flash | KokoClone (local) | $0 | Cloned voice, no provider |
 | **Cheap & fast** | Groq (Llama 4 Scout) | Fish Audio | ~$1.50 | Best balance |
 | **Premium** | Claude Sonnet | ElevenLabs | ~$6.50 | Best quality + vision |
 
@@ -450,7 +500,7 @@ Wallie plays audio through the output device you pick in **Voice → Output devi
 
 ### Bring your own everything
 
-Six LLM providers, five TTS engines, three chat platforms, two donation platforms. Mix and match per profile.
+Six LLM providers, six TTS engines, three chat platforms, two donation platforms. Mix and match per profile.
 
 | LLM | TTS | Chat | Donations | Avatar |
 |---|---|---|---|---|
@@ -458,15 +508,15 @@ Six LLM providers, five TTS engines, three chat platforms, two donation platform
 | Anthropic (Claude) | ElevenLabs | YouTube | Streamlabs (Socket API) | — |
 | Google (Gemini) | Piper (local, free) | Kick | — | — |
 | Groq | Kokoro (local, free · multilingual) | — | — | — |
+| Ollama (local, free) | KokoClone (local, free · cloned voice) | — | — | — |
 | OpenRouter | **OpenAI-Compatible (speech)** | — | — | — |
-| Ollama (local, free) | — | — | — | — |
 | **OpenAI-Compatible (any endpoint)** | — | — | — | — |
 
 Beyond that, **Vision** and **Hearing (STT)** can each run on their own OpenAI-compatible block —
 see [Dedicated vision & STT blocks](#dedicated-vision--stt-blocks) — and Wallie ships a
 self-clearing **caption overlay** for OBS: [Captions](#captions-browser-source-overlay).
 
-Swap providers without changing code. Run a fully offline stream with Ollama + Piper/Kokoro, or go premium with Claude + ElevenLabs — and build the voice you actually want in the **Voice Lab**.
+Swap providers without changing code. Run a fully offline stream with Ollama + Piper/Kokoro/KokoClone, or go premium with Claude + ElevenLabs — and build the voice you actually want in the **Voice Lab**, by blending Kokoro packs or cloning a clip.
 
 ### Full persona design
 
@@ -765,6 +815,9 @@ wallie-v2/
 │   ├── voice_port.py      # ← fork: capture a cloud voice into a Piper/Kokoro package
 │   ├── local_port.py      # ← fork: the same package from local audio, fully offline
 │   ├── piper_train.py     # ← fork: dataset → trained Piper voice, then self-install
+│   ├── kokoro_blend.py    # ← fork: average Kokoro packs into a new local voice
+│   ├── kokoclone.py       # ← fork: optional zero-shot cloning on top of Kokoro
+│   ├── kokoclone_worker.py # ← fork: the persistent JSON-lines worker it talks to
 │   └── ...                # TTS adapters (fish, elevenlabs, piper, kokoro, any gateway)
 ├── audio/                 # sounddevice player with alignment safety
 ├── vision/                # screen capture + change detection + activity classification
@@ -799,7 +852,8 @@ wallie-v2/
 |---|---|---|---|---|
 | **Fish Audio** | ✅ | ✅ **via Voice Lab** | ~$15/M chars | Creates a private model from your clips |
 | **ElevenLabs** | ✅ | ✅ **via Voice Lab** | ~$30/M chars | Instant voice cloning |
-| **Kokoro** | ✅ (local) | ❌ | $0 | 8 languages incl. **pt-BR**; pick voice + language in Voice — saved voices land in the Voice Lab library |
+| **Kokoro** | ✅ (local) | ✅ **blending + KokoClone** | $0 | 8 languages incl. **pt-BR**; pick voice + language in Voice — saved voices and **blends** land in the Voice Lab library |
+| **KokoClone** | ✅ (local) | ✅ **from a reference clip** | $0 | Kokoro + Kanade zero-shot: ~10 s of audio and the voice reads any line. Optional backend, installed from the Voice Lab |
 | **Piper** | ✅ (local) | ✅ **via Voice Lab training** | $0 | Fastest local option. One-click runtime install, the whole official catalogue downloadable from the dashboard, speed/expressiveness/pacing sliders — and a trainer that turns a captured or imported dataset into **your own** voice |
 | **OpenAI-Compatible (speech)** | ✅ | ❌ | any gateway | Depends on the gateway |
 
@@ -813,6 +867,9 @@ wallie-v2/
 - Atomic writes prevent `.env` corruption
 - Provider error messages are scrubbed of key-shaped strings before display
 - Allowed env variables are hard-coded — the UI cannot write arbitrary keys
+- Local voice material stays local: blended packs (`voices/kokoro/*.pt` + `blends.json`) and
+  KokoClone reference clips (`voices/kokoclone/`) are only read by the local engines, and the
+  panel says so — unlike provider cloning, nothing about them is uploaded
 
 **Voice cloning uploads audio to the provider you choose.** ElevenLabs/Fish Audio receive your
 clips and create the voice under your account; their terms and privacy policies apply to that
@@ -851,6 +908,45 @@ Non-English Kokoro sets need a recent `kokoro` (≥ 0.9.4). Japanese/Mandarin ma
 `pip install "misaki[ja]"` / `"misaki[zh]"` and espeak-ng. The server log shows the exact missing
 package. Voice ids must belong to the selected language (`pf_dora` for pt-BR, not `af_heart`) —
 switching the language in the dashboard swaps the voice automatically.
+</details>
+
+<details>
+<summary><strong>A Kokoro blend is refused</strong></summary>
+
+Three reasons, all stated in the panel: the packs' **languages** differ (they are language-specific,
+so `af_heart` + `pf_dora` cannot be mixed — pick two voices of the same language), a pack is **not
+downloaded** yet (fetch it in **Voice → Kokoro catalogue**; blends only read packs already on disk),
+or the packs have **different tensor shapes** (a re-released pack against an old one — re-download the
+outdated voice). Weights are shares, so 25/75 and 1/3 give the same voice; they must all be above 0.
+</details>
+
+<details>
+<summary><strong>KokoClone says it is not installed</strong></summary>
+
+Press **⬇ install KokoClone**: it runs `scripts/install_kokoclone.py --install`, which clones
+`https://github.com/Ashish-Patnaik/kokoclone` into `./kokoclone` (or wherever
+`WALLIE_KOKOCLONE_DIR` points) and installs the packages the worker imports
+(`torch`, `torchaudio`, `soundfile`, `huggingface_hub`, `kokoro-onnx`, `misaki`, `kanade-tokenizer`),
+with pip's log in the panel. If pip stops, the log above has its own reason — on Windows the usual
+one is the checkout's `requirements.txt` wanting `pyopenjtalk`, which needs CMake/MSVC; the button's
+subset exists exactly to avoid that. Until the checkout and its packages are both present the Voice page does not offer the
+provider — deliberate, not a bug. The worker runs on **the dashboard's own interpreter**, so the
+same command from a terminal must use that `.venv`, and the `missing:` names in the panel are the
+exact ones it could not import. The button is hidden when it cannot work (Python outside 3.10–3.12,
+or no installer script), and it never clones into a folder that already holds something else —
+move it away or point `WALLIE_KOKOCLONE_DIR` elsewhere. If `git` is not on PATH, clone by hand:
+the panel's hint says so, with the two commands.
+</details>
+
+<details>
+<summary><strong>KokoClone is slow on the first line, or the worker dies</strong></summary>
+
+The first synthesis downloads/loads Kokoro + Kanade (hundreds of MB) into the worker, so it takes a
+while once; later lines stream normally. If the worker dies, the next request starts a new one — use
+the panel's **stop worker** button to free that RAM on purpose (the next synthesis loads it again).
+A failing line reports the library's own message (`RuntimeError: …`) in the panel; the server log
+has the traceback. Reference clips must be 2–30 s of clean speech — anything else is refused with
+its measured length before synthesis, so a bad clip never becomes a bad voice.
 </details>
 
 <details>
@@ -947,7 +1043,7 @@ Train panel, then press **Train** on the new package; nothing was lost in the me
 Fork-specific:
 
 - **More cloning backends** — add any provider with a create-a-voice API behind the same Voice Lab interface
-- **Voice blending for local engines** — average Kokoro voice embeddings to make in-between local voices (no cloud, no cloning)
+- **Blending other local engines** — the same idea for Piper speakers, where each voice already carries several
 - **Blind A/B** — hide which clip is which until you pick, so the choice stops being biased by the label
 - **Dashboard i18n** — start with pt-BR, since the fork's audience is largely Brazilian
 

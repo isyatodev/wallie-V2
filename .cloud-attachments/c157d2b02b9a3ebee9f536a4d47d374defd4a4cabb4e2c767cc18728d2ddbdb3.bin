@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+"""fbsess.py - read Freebuff session history (Desktop SQLite store and CLI chat folders).
+
+Read-only. Python 3.8+, standard library only, Linux / macOS / Windows.
+Never writes to the app store: opens it `mode=ro` with `query_only`, and if the
+app holds a lock it reads a temporary copy (db + -wal + -shm) instead.
+
+  python fbsess.py doctor                     # where the data is on THIS machine + schema check
+  python fbsess.py list                       # Desktop stores (newest first) + CLI chat folders
+  python fbsess.py find <keyword>             # keyword search across the selected stores
+  python fbsess.py brief [thread_id]          # resume brief (default: newest thread)
+  python fbsess.py dump  [thread_id]          # full readable dump of one thread
+  python fbsess.py answers [thread_id]        # ask_questions questions and recorded answers
+  python fbsess.py cli [chat_dir_name]        # list CLI chats, or print one (default: newest)
+
+Scope filters (content commands):  --project SUBSTR (repeatable), --exclude SUBSTR
+The private workspace `workspace_personal` is excluded by default; pass
+`--exclude ""` to include it deliberately.
+"""
+import argparse
+import datetime
+import glob
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import tempfile
+
+HOME = os.path.expanduser('~')
+DESKTOP_PROJECTS = os.path.join(HOME, '.config', 'freebuff-desktop', 'projects')
+DESKTOP_GLOB = os.path.join(DESKTOP_PROJECTS, '*', 'desktop-v2.db')
+CLI_ROOT = os.path.join(
+    os.environ.get('FREEBUFF_CONFIG_DIR') or os.path.join(HOME, '.config', 'manicode'), 'projects')
+LOG_CANDIDATES = [
+    os.path.join(os.environ.get('APPDATA', ''), 'Freebuff', 'logs', 'orchestrator-stderr.log'),
+    os.path.join(HOME, 'Library', 'Logs', 'Freebuff', 'orchestrator-stderr.log'),
+    os.path.join(HOME, '.config', 'Freebuff', 'logs', 'orchestrator-stderr.log'),
+]
+FTS_TABLE = 'freebuff_conversation_search'
+EXCLUDE_DEFAULT = ['workspace_personal']
+TOOL_NAMES = ('ask_questions', 'str_replace', 'write_file', 'run_terminal_command', 'call_mcp_tool')
+
+
+# ---------------------------------------------------------------- helpers
+
+def when(ms):
+    try:
+        return datetime.datetime.fromtimestamp(ms / 1000).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        return '-'
+
+
+def human(n):
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if n < 1024 or unit == 'GB':
+            return f'{n:.1f}{unit}' if unit != 'B' else f'{n}B'
+        n /= 1024
+
+
+def project_path(db):
+    """projectPath from project.json next to the store (maps folder -> workspace on disk)."""
+    meta = os.path.join(os.path.dirname(db), 'project.json')
+    try:
+        with open(meta, encoding='utf-8') as fh:
+            return json.load(fh).get('projectPath') or '?'
+    except Exception:
+        return '?'
+
+
+def slug_of(db):
+    return os.path.basename(os.path.dirname(db))
+
+
+def all_dbs():
+    return sorted(glob.glob(DESKTOP_GLOB), key=os.path.getmtime, reverse=True)
+
+
+def dbs(projects=None, excludes=None):
+    out = []
+    for db in all_dbs():
+        hay = f'{slug_of(db)} {project_path(db)}'.lower()
+        if projects and not any(p.lower() in hay for p in projects):
+            continue
+        if excludes and any(e.lower() in hay for e in excludes):
+            continue
+        out.append(db)
+    return out
+
+
+def open_ro(path):
+    """Open read-only; if the app holds a lock, fall back to a temporary copy."""
+    try:
+        con = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=3)
+        con.execute('PRAGMA query_only=ON')
+        con.execute('SELECT 1 FROM messages LIMIT 1')
+        return con
+    except sqlite3.Error:
+        tmp = tempfile.mkdtemp(prefix='fbsess-')
+        for suf in ('', '-wal', '-shm'):
+            if os.path.exists(path + suf):
+                shutil.copy2(path + suf, os.path.join(tmp, 'desktop-v2.db' + suf))
+        con = sqlite3.connect(f'file:{os.path.join(tmp, "desktop-v2.db")}?mode=ro', uri=True)
+        con.execute('PRAGMA query_only=ON')
+        return con
+
+
+def schema_problems(con):
+    want = {'threads': {'id', 'project_path', 'sidebar_archived_at'},
+            'messages': {'seq', 'thread_id', 'role', 'parts_json', 'ts'}}
+    bad = []
+    for table, cols in want.items():
+        try:
+            have = {r[1] for r in con.execute(f'PRAGMA table_info({table})')}
+        except sqlite3.Error as exc:
+            bad.append(f'{table}: {exc}')
+            continue
+        missing = cols - have
+        if missing:
+            bad.append(f'{table} missing {sorted(missing)}')
+    return bad
+
+
+def has_fts(con):
+    try:
+        return bool(con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (FTS_TABLE,)).fetchone())
+    except sqlite3.Error:
+        return False
+
+
+def newest_thread(con):
+    row = con.execute('SELECT id, title FROM threads WHERE sidebar_archived_at IS NULL '
+                      'ORDER BY updated_at DESC LIMIT 1').fetchone()
+    if not row:
+        row = con.execute('SELECT id, title FROM threads ORDER BY updated_at DESC LIMIT 1').fetchone()
+    return row
+
+
+def locate(thread_id, projects=None, excludes=None):
+    """Return (con, thread_id, title, db_path). thread_id None = newest thread of the newest store."""
+    tried = dbs(projects, excludes)
+    for db in tried:
+        con = open_ro(db)
+        if thread_id is None:
+            row = newest_thread(con)
+        else:
+            row = con.execute('SELECT id, title FROM threads WHERE id = ?', (thread_id,)).fetchone()
+        if row:
+            print(f'store: {db}\nproject: {project_path(db)}', file=sys.stderr)
+            return con, row[0], row[1], db
+        con.close()
+    if thread_id is not None:
+        sys.exit(f'thread {thread_id} not found in {len(tried)} store(s); '
+                 f'check filters or run: fbsess.py list')
+    sys.exit(f'no thread found under {DESKTOP_PROJECTS} (try: fbsess.py doctor)')
+
+
+def parts(parts_json):
+    try:
+        value = json.loads(parts_json or '[]')
+        return value if isinstance(value, list) else []
+    except Exception:
+        return []
+
+
+def clip(text, limit):
+    text = str(text)
+    return text if len(text) <= limit else text[:limit] + f'… (+{len(text) - limit} chars)'
+
+
+def render(part, limit=1200):
+    """Readable line for one part. Hidden reasoning and UI/sponsor noise are skipped."""
+    kind = part.get('kind')
+    if kind == 'text' and part.get('text'):
+        return clip(part['text'], limit)
+    if kind == 'compaction':
+        return 'compaction summary:\n' + clip((part.get('receipt') or {}).get('summary', ''), 2500)
+    if kind == 'tool' and part.get('toolName') in TOOL_NAMES:
+        line = f'tool {part["toolName"]} input: ' + clip(json.dumps(part.get('input'), ensure_ascii=False), 500)
+        out = part.get('output') or part.get('result')
+        if out:
+            line += '\n  output: ' + clip(out, 800)
+        if part.get('exitCode') not in (None, 0):
+            line += f'\n  exit={part["exitCode"]} status={part.get("status")}'
+        return line
+    if kind == 'notice':
+        return f'notice {part.get("notice")}: {clip(part.get("text", ""), 300)}'
+    if kind == 'changes':
+        files = part.get('files') or []
+        return 'changed files: ' + ', '.join(str(f.get('path', '?')) for f in files[:15])
+    return None  # reasoning, agent, ad, sponsored_*, *_setup_invitation
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_doctor(args):
+    print(f'platform: {sys.platform} | python {sys.version.split()[0]}')
+    print(f'home: {HOME}')
+    print(f'FREEBUFF_CONFIG_DIR: {os.environ.get("FREEBUFF_CONFIG_DIR") or "(unset)"}')
+    print(f'\n[Desktop store] {DESKTOP_PROJECTS}')
+    found = all_dbs()
+    print(f'  stores found: {len(found)}')
+    for db in found:
+        con = open_ro(db)
+        problems = schema_problems(con)
+        try:
+            msgs = con.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
+            threads = con.execute('SELECT COUNT(*) FROM threads').fetchone()[0]
+            open_threads = con.execute("SELECT COUNT(*) FROM threads WHERE status='open'").fetchone()[0]
+            kinds = {}
+            for (pj,) in con.execute('SELECT parts_json FROM messages LIMIT 200'):
+                for p in parts(pj):
+                    if isinstance(p, dict):
+                        kinds[p.get('kind')] = kinds.get(p.get('kind'), 0) + 1
+        except sqlite3.Error as exc:
+            msgs = threads = open_threads = 0
+            kinds = {}
+            problems.append(str(exc))
+        flagged = 'EXCLUDED-BY-DEFAULT' if any(
+            e.lower() in f'{slug_of(db)} {project_path(db)}'.lower() for e in EXCLUDE_DEFAULT) else 'in default scope'
+        print(f'  - {slug_of(db)} ({human(os.path.getsize(db))}) [{flagged}]')
+        print(f'      project: {project_path(db)}')
+        print(f'      db: {db}')
+        print(f'      threads={threads} (open={open_threads}) messages={msgs} '
+              f'fts={"yes" if has_fts(con) else "no"}')
+        print(f'      schema: {"OK" if not problems else "; ".join(problems)}')
+        if kinds:
+            top = ', '.join(f'{k}={v}' for k, v in sorted(kinds.items(), key=lambda kv: -kv[1]))
+            print(f'      part kinds (200-message sample): {top}')
+        con.close()
+    print(f'\n[CLI store] {CLI_ROOT}')
+    chats = sorted(glob.glob(os.path.join(CLI_ROOT, '*', 'chats', '*')), key=os.path.getmtime, reverse=True)
+    print(f'  chat folders: {len(chats)}')
+    for chat in chats[:5]:
+        names = sorted(os.listdir(chat))
+        print(f'  - {os.path.basename(chat)} -> {", ".join(names) or "(empty)"}')
+    print(f'\n[app log]')
+    for path in LOG_CANDIDATES:
+        if path and os.path.exists(path):
+            print(f'  {path} ({human(os.path.getsize(path))})')
+            break
+    else:
+        print('  orchestrator-stderr.log not found in the known locations')
+
+
+def cmd_list(args):
+    print('== Desktop stores (newest first; metadata only, nothing is read from other projects)')
+    found = all_dbs()
+    if not found:
+        print(f'  none under {DESKTOP_PROJECTS}')
+    for db in found:
+        con = open_ro(db)
+        try:
+            msgs, last = con.execute('SELECT COUNT(*), MAX(ts) FROM messages').fetchone()
+            threads = con.execute('SELECT COUNT(*) FROM threads').fetchone()[0]
+            open_threads = con.execute("SELECT COUNT(*) FROM threads WHERE status='open'").fetchone()[0]
+        except sqlite3.Error as exc:
+            print(f'  ERROR {db}: {exc}')
+            con.close()
+            continue
+        flagged = ' [excluded by default]' if any(
+            e.lower() in f'{slug_of(db)} {project_path(db)}'.lower() for e in EXCLUDE_DEFAULT) else ''
+        print(f'{when(last)} | msgs={msgs} | threads={threads} open={open_threads} | '
+              f'{human(os.path.getsize(db))}{flagged}')
+        print(f'    {project_path(db)}\n    {db}')
+        con.close()
+    print('\n== CLI chats (newest first)')
+    chats = sorted(glob.glob(os.path.join(CLI_ROOT, '*', 'chats', '*')), key=os.path.getmtime, reverse=True)
+    for chat in chats[:30]:
+        names = sorted(os.listdir(chat))
+        state = 'conversation' if 'chat-messages.json' in names else (', '.join(names) or 'empty')
+        print(f'{when(os.path.getmtime(chat) * 1000)} | {state} | {chat}')
+    if not chats:
+        print(f'  none under {CLI_ROOT}')
+
+
+def cmd_find(args):
+    keyword = args.keyword
+    scope = dbs(args.project, args.exclude)
+    if not scope:
+        sys.exit('no store in scope; check --project/--exclude')
+    hits = 0
+    for db in scope:
+        con = open_ro(db)
+        rows, mode = [], None
+        if has_fts(con):
+            try:
+                rows = con.execute(
+                    f'SELECT thread_id, COUNT(*) c FROM {FTS_TABLE} '
+                    f'WHERE {FTS_TABLE} MATCH ? GROUP BY thread_id ORDER BY c DESC LIMIT ?',
+                    ('"' + keyword.replace('"', '""') + '"', args.limit)).fetchall()
+                mode = 'index'
+            except sqlite3.Error:
+                rows = []
+        if not rows:
+            try:
+                rows = con.execute(
+                    'SELECT m.thread_id, COUNT(*) c FROM messages m '
+                    'WHERE m.parts_json LIKE ? GROUP BY m.thread_id ORDER BY c DESC LIMIT ?',
+                    (f'%{keyword}%', args.limit)).fetchall()
+                mode = mode or 'raw scan (hidden reasoning and tool payloads included)'
+            except sqlite3.Error as exc:
+                print(f'  ERROR {db}: {exc}')
+                con.close()
+                continue
+        if rows:
+            print(f'== {project_path(db)}\n   {db}')
+            if mode:
+                print(f'   match mode: {mode}')
+            for tid, count in rows:
+                row = con.execute('SELECT title, status, updated_at FROM threads WHERE id=?', (tid,)).fetchone()
+                title, status, updated = row if row else ('?', '?', None)
+                print(f'   {tid} | hits={count} | {status} | {when(updated)} | {title}')
+                hits += 1
+        con.close()
+    for path in glob.glob(os.path.join(CLI_ROOT, '*', 'chats', '*', 'chat-messages.json')):
+        try:
+            with open(path, encoding='utf-8', errors='replace') as fh:
+                if keyword.lower() in fh.read().lower():
+                    print(f'CLI: {os.path.dirname(path)}')
+                    hits += 1
+        except OSError:
+            pass
+    if not hits:
+        print('no matches in the selected stores')
+    print('\nNext: fbsess.py brief <thread_id>')
+
+
+def cmd_brief(args):
+    con, tid, title, _ = locate(args.thread_id, args.project, args.exclude)
+    head = con.execute('SELECT status, model, sidebar_archived_at, queue_paused, updated_at '
+                       'FROM threads WHERE id=?', (tid,)).fetchone()
+    status, model, archived, paused, updated = head if head else ('?', '?', None, None, None)
+    print(f'\n# Resume brief: {tid} | {title}')
+    print(f'status={status} model={model} updated={when(updated)} '
+          f'archived={"yes" if archived else "no"} queue_paused={paused}')
+    rows = con.execute('SELECT seq, ts, role, parts_json FROM messages WHERE thread_id=? ORDER BY seq',
+                       (tid,)).fetchall()
+    print(f'messages: {len(rows)}')
+    last_user = last_assistant = last_comp = None
+    notices, changed, open_q = [], [], []
+    for seq, ts, role, pj in rows:
+        for part in parts(pj):
+            kind = part.get('kind')
+            if kind == 'text' and part.get('text'):
+                if role == 'user':
+                    last_user = (seq, ts, part['text'])
+                else:
+                    last_assistant = (seq, ts, part['text'])
+            elif kind == 'compaction':
+                last_comp = (seq, (part.get('receipt') or {}).get('summary', ''))
+            elif kind == 'notice':
+                notices.append((seq, ts, part.get('notice'), part.get('text', '')))
+            elif kind == 'changes':
+                changed += [str(f.get('path', '?')) for f in (part.get('files') or [])]
+            elif (kind == 'tool' and part.get('toolName') == 'ask_questions'
+                  and not (part.get('output') or part.get('result'))):
+                open_q.append((seq, clip(json.dumps(part.get('input'), ensure_ascii=False), 300)))
+    if last_comp:
+        print(f'\n## Last compaction summary (message {last_comp[0]})\n{clip(last_comp[1], 3000)}')
+    if last_user:
+        print(f'\n## Last user message (message {last_user[0]}, {when(last_user[1])})\n'
+              f'{clip(last_user[2], 1500)}')
+    if last_assistant:
+        print(f'\n## Last assistant reply (message {last_assistant[0]}, {when(last_assistant[1])})\n'
+              f'{clip(last_assistant[2], 1200)}')
+    if notices:
+        print('\n## Last notices (where the turn/session broke)')
+        for seq, ts, notice, text in notices[-5:]:
+            print(f'- [{seq}] {when(ts)} {notice}: {text}')
+    if changed:
+        unique = []
+        for path in changed:
+            if path not in unique:
+                unique.append(path)
+        print(f'\n## Files changed in this thread ({len(unique)} unique, last 25)')
+        print('\n'.join('- ' + p for p in unique[-25:]))
+    if open_q:
+        print('\n## ask_questions with NO recorded answer (still open — not an owner decision)')
+        for seq, question in open_q[-5:]:
+            print(f'- [{seq}] {question}')
+    print('\nNext: fbsess.py dump <thread_id>   (full readable text)')
+
+
+def cmd_dump(args):
+    con, tid, title, _ = locate(args.thread_id, args.project, args.exclude)
+    out = args.out or os.path.join('.freebuff', 'session_dump.md')
+    if os.path.exists(out) and not args.force:
+        sys.exit(f'{out} already exists; pass --out <path> or --force to replace it')
+    os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
+    written = 0
+    with open(out, 'w', encoding='utf-8') as fh:
+        fh.write(f'# Session dump: {tid} - {title}\n\n')
+        query = 'SELECT seq, ts, role, parts_json FROM messages WHERE thread_id=? ORDER BY seq'
+        for seq, ts, role, pj in con.execute(query, (tid,)):
+            if args.limit and written >= args.limit:
+                fh.write(f'\n_(truncated at {args.limit} messages; reasoning and UI noise skipped)_\n')
+                break
+            body = [line for line in (render(p) for p in parts(pj)) if line]
+            if body:
+                fh.write(f'## [{seq}] {when(ts)} | {role}\n\n' + '\n\n'.join(body) + '\n\n---\n\n')
+                written += 1
+    print(f'Dumped {written} messages to {out}')
+    print('Keep it out of version control: it can hold private content.')
+
+
+def cmd_answers(args):
+    con, tid, title, _ = locate(args.thread_id, args.project, args.exclude)
+    print(f'\n# ask_questions in {tid} | {title}')
+    total = 0
+    query = ("SELECT seq, ts, parts_json FROM messages WHERE thread_id=? "
+             "AND parts_json LIKE '%ask_questions%' ORDER BY seq DESC")
+    for seq, ts, pj in con.execute(query, (tid,)):
+        for part in parts(pj):
+            if not (part.get('kind') == 'tool' and part.get('toolName') == 'ask_questions'):
+                continue
+            total += 1
+            answer = part.get('output') or part.get('result')
+            print(f'\n=== [{seq}] {when(ts)} ===')
+            print(clip(answer, 1200) if answer
+                  else '(no recorded answer) ' + clip(json.dumps(part.get('input'), ensure_ascii=False), 400))
+    if not total:
+        print('no ask_questions found in this thread')
+
+
+def cmd_cli(args):
+    chats = sorted(glob.glob(os.path.join(CLI_ROOT, '*', 'chats', '*')),
+                   key=os.path.getmtime, reverse=True)
+    if args.chat:
+        chats = [c for c in chats if os.path.basename(c) == args.chat] or chats
+    if not chats:
+        sys.exit(f'no CLI chats under {CLI_ROOT}')
+    if not args.chat:
+        print('CLI chats (newest first):')
+        for chat in chats[:30]:
+            print(f'  {os.path.basename(chat)}  [{", ".join(sorted(os.listdir(chat))) or "empty"}]')
+        print(f'  ({len(chats)} total; listing only)')
+        return
+    chat = chats[0]
+    print(f'chat: {chat}')
+    messages_file = os.path.join(chat, 'chat-messages.json')
+    history_file = os.path.join(os.path.dirname(CLI_ROOT), 'message-history.json')
+    if os.path.exists(messages_file):
+        with open(messages_file, encoding='utf-8') as fh:
+            messages = json.load(fh)
+        print(f'{len(messages)} messages (chat-messages.json)')
+        for index, message in enumerate(messages):
+            if args.limit and index >= args.limit:
+                print(f'… truncated at {args.limit}')
+                break
+            variant = message.get('variant')
+            if variant in ('user', 'ai') and message.get('content'):
+                print(f'\n[{message.get("timestamp", "")}] {variant}:\n{clip(message["content"], 1200)}')
+            elif variant == 'error':
+                print(f'\n[{message.get("timestamp", "")}] error: {clip(message.get("content", ""), 300)}')
+        return
+    logs = sorted(glob.glob(os.path.join(chat, '*.jsonl')))
+    for path in logs:
+        print(f'\n== {os.path.basename(path)} (debug log, not the conversation)')
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            for index, line in enumerate(fh):
+                if args.limit and index >= args.limit:
+                    print(f'… truncated at {args.limit} lines')
+                    break
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    print(clip(line.rstrip(), 400))
+                    continue
+                level = record.get('level') or record.get('type') or ''
+                text = record.get('message') or record.get('msg') or json.dumps(record, ensure_ascii=False)
+                stamp = record.get('timestamp') or record.get('time') or ''
+                print(f'[{stamp}] {level}: {clip(text, 400)}')
+    if not logs:
+        print('this chat folder holds no chat-messages.json and no log.jsonl')
+    if os.path.exists(history_file):
+        try:
+            with open(history_file, encoding='utf-8') as fh:
+                history = json.load(fh)
+        except Exception as exc:
+            print(f'(message-history.json unreadable: {exc})')
+            return
+        if isinstance(history, list):
+            print(f'\n== {os.path.basename(history_file)} ({len(history)} recorded prompts)')
+            for item in history[-min(len(history), args.limit or 10):]:
+                print('  - ' + clip(item if isinstance(item, str) else json.dumps(item, ensure_ascii=False), 200))
+
+
+# ---------------------------------------------------------------- entry
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog='fbsess.py', description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest='cmd')
+
+    def add_scope(p):
+        p.add_argument('--project', action='append', metavar='SUBSTR',
+                       help='only stores whose folder slug or projectPath contains SUBSTR')
+        p.add_argument('--exclude', action='append', metavar='SUBSTR',
+                       help='skip stores matching SUBSTR (default: workspace_personal); '
+                            'pass --exclude "" to include everything')
+
+    p = sub.add_parser('doctor', help='detected paths, sizes and schema check')
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser('list', help='Desktop stores and CLI chat folders')
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser('find', help='keyword search across the selected stores')
+    p.add_argument('keyword')
+    p.add_argument('--limit', type=int, default=8, help='max threads per store (default 8)')
+    add_scope(p)
+    p.set_defaults(func=cmd_find)
+
+    p = sub.add_parser('brief', help='resume brief of one thread (default: newest)')
+    p.add_argument('thread_id', nargs='?')
+    add_scope(p)
+    p.set_defaults(func=cmd_brief)
+
+    p = sub.add_parser('dump', help='write the full readable text of one thread')
+    p.add_argument('thread_id', nargs='?')
+    p.add_argument('--out', help='output path (default .freebuff/session_dump.md)')
+    p.add_argument('--limit', type=int, default=0, help='max messages (0 = all)')
+    p.add_argument('--force', action='store_true', help='replace an existing output file')
+    add_scope(p)
+    p.set_defaults(func=cmd_dump)
+
+    p = sub.add_parser('answers', help='ask_questions with the recorded answers')
+    p.add_argument('thread_id', nargs='?')
+    add_scope(p)
+    p.set_defaults(func=cmd_answers)
+
+    p = sub.add_parser('cli', help='list CLI chats, or print one')
+    p.add_argument('chat', nargs='?')
+    p.add_argument('--limit', type=int, default=40, help='max entries to print (default 40)')
+    p.set_defaults(func=cmd_cli)
+
+    return parser
+
+
+def resolve_scope(args):
+    """None means "defaults"; "" entries are dropped so --exclude "" widens the scope."""
+    if hasattr(args, 'project'):
+        args.project = [p for p in (args.project or []) if p]
+        exclude = EXCLUDE_DEFAULT if args.exclude is None else args.exclude
+        args.exclude = [e for e in exclude if e]
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if not getattr(args, 'func', None):
+        build_parser().print_help()
+        return 1
+    resolve_scope(args)
+    args.func(args)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

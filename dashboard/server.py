@@ -223,6 +223,15 @@ class DashboardState:
             "returncode": None,
             "log": "",
         }
+        # KokoClone install job (Voice Lab): clones the optional checkout and
+        # pip-installs its requirements, streamed into the panel's log.
+        self.kokoclone_install: dict[str, Any] = {
+            "running": False,
+            "started_at": None,
+            "finished_at": None,
+            "returncode": None,
+            "log": "",
+        }
         # Kokoro voice-pack download job (separate from the pip install job so
         # the two can be reported independently). Read by
         # GET /api/tts/kokoro/status.
@@ -436,6 +445,42 @@ class LocalVoiceBody(BaseModel):
     tts: dict[str, Any] = {}
 
 
+class KokoroBlendSourceBody(BaseModel):
+    """One voice going into a blend, with its share."""
+
+    voice: str = ""
+    weight: float = 1.0
+
+
+class KokoroBlendBody(BaseModel):
+    """Save a blend: average these packs and register the result as a voice."""
+
+    name: str
+    sources: list[KokoroBlendSourceBody] = []
+    notes: str = ""
+    save_voice: bool = True
+    tts: dict[str, Any] = {}       # kokoro_speed / kokoro_pitch for the saved voice
+
+
+class KokoroBlendPreviewBody(BaseModel):
+    """Render unsaved blend settings to a WAV — nothing is written to disk."""
+
+    sources: list[KokoroBlendSourceBody] = []
+    text: str = ""
+    speed: Optional[float] = None
+    pitch: Optional[float] = None
+
+
+class KokoCloneVoiceBody(BaseModel):
+    """Create a KokoClone voice from one reference clip."""
+
+    name: str
+    lang: str = "en"
+    notes: str = ""
+    sample: Optional[VoiceSampleBody] = None
+    save_preset: bool = True
+
+
 class VoiceExportBody(BaseModel):
     """Copy saved voices from the active profile into another profile."""
 
@@ -557,7 +602,7 @@ class VoiceTrainStartBody(BaseModel):
     batch_size: int = 8
     accelerator: str = "auto"       # auto | cpu | gpu
     python: str = ""                # training interpreter (blank = this one)
-    checkpoint: str = ""            # optional .ckpt to fine-tune from
+    checkpoint: str = ""            # .ckpt to fine-tune from, or an .onnx to warm-start from
     resume_from: str = ""           # …or continue a stopped run from its last .ckpt
 
 
@@ -1342,6 +1387,155 @@ def _build_app(
             raise HTTPException(404, f"no saved {provider} voice named {name}")
         return {"ok": True, **_lvoices.providers_payload(cfg.profile_name)}
 
+    # ---------- Kokoro blending — in-between voices from the packs on disk ----------
+    from tts import kokoro_blend as _kblend
+
+    def _blend_payload() -> dict[str, Any]:
+        """Everything the blender renders: the recipes and the packs to mix."""
+        return {
+            "blends": [
+                {**blend, "description": _kblend.describe(blend)}
+                for blend in _kblend.list_blends()
+            ],
+            "voices": _kblend.available_voices(),
+            "voices_dir": str(_kblend.voices_dir()),
+        }
+
+    def _render_blend(
+        sources: list[dict[str, Any]], text: str, speed: float, pitch: float
+    ) -> tuple[dict[str, Any], bytes]:
+        """Mix the packs and synthesise one line with the in-memory style.
+
+        Runs in a worker thread (torch load + synthesis): the event loop must
+        stay free while a 300 MB model renders a preview.
+        """
+        from tts.kokoro import iter_style_pcm
+
+        mixed = _kblend.blend_sources(sources)
+        pcm = b"".join(
+            iter_style_pcm(
+                text,
+                mixed["tensor"],
+                lang_code=mixed["lang_code"],
+                speed=speed,
+                pitch=pitch,
+            )
+        )
+        return mixed, pcm
+
+    @app.get("/api/tts/kokoro/blends")
+    def api_kokoro_blends() -> dict[str, Any]:
+        """The saved blends with their recipes, plus every pack a blend can use."""
+        return {"ok": True, **_blend_payload()}
+
+    @app.post("/api/tts/kokoro/blends/preview")
+    async def api_kokoro_blend_preview(body: KokoroBlendPreviewBody) -> dict[str, Any]:
+        """Hear an unsaved blend: the line comes back as a WAV for this page only."""
+        import base64 as _b64
+
+        from tts import kokoro as _kokoro_mod
+
+        text = (body.text or "").strip()
+        if not text:
+            raise HTTPException(400, "empty text")
+        if len(text) > 600:
+            raise HTTPException(400, "text too long (max 600 chars)")
+        sources = [s.model_dump() for s in body.sources]
+        speed = 1.0 if body.speed is None else float(body.speed)
+        pitch = 0.0 if body.pitch is None else float(body.pitch)
+        # The page only offers 0.5–2.0; the API is the only way in with a
+        # hand-made body, and a NaN/inf/absurd speed would hang the render
+        # thread instead of failing.
+        if not (0.25 <= speed <= 4.0):
+            raise HTTPException(400, "speed must be between 0.25 and 4.0")
+        if not (-24.0 <= pitch <= 24.0):
+            raise HTTPException(400, "pitch must be between -24 and 24 semitones")
+        try:
+            mixed, pcm = await asyncio.to_thread(
+                _render_blend, sources, text, speed, pitch
+            )
+        except _kblend.KokoroBlendError as e:
+            raise HTTPException(400, str(e))
+        except _kokoro_mod.TTSError as e:
+            raise HTTPException(400, str(e)[:300])
+        except Exception as e:  # noqa: BLE001 — torch/kokoro failures are user-visible
+            logger.exception("dashboard: blend preview failed")
+            raise HTTPException(400, f"blend preview failed: {str(e)[:200]}")
+        if not pcm:
+            raise HTTPException(400, "the blend produced no audio — try a shorter line")
+        rate = _kokoro_mod.SAMPLE_RATE
+        wav = _vlab.pcm16_bytes_to_wav(pcm, rate, 1)
+        return {
+            "ok": True,
+            "provider": "kokoro",
+            "source": f"blend of {len(mixed['voices'])} voices",
+            "voice_id": ", ".join(mixed["voices"]),
+            "lang_code": mixed["lang_code"],
+            "sample_rate": rate,
+            "channels": 1,
+            "bytes": len(pcm),
+            "seconds": round(len(pcm) / float(rate * 2), 2),
+            "wav_b64": _b64.b64encode(wav).decode("ascii"),
+        }
+
+    @app.post("/api/tts/kokoro/blends")
+    def api_kokoro_blend_create(body: KokoroBlendBody) -> dict[str, Any]:
+        """Average the chosen packs into a new voice, then save it to the library."""
+        cfg = load_profile()
+        sources = [s.model_dump() for s in body.sources]
+        try:
+            entry = _kblend.save_blend(body.name, sources, notes=body.notes)
+        except _kblend.KokoroBlendError as e:
+            raise HTTPException(400, str(e))
+        preset = None
+        warning = ""
+        if body.save_voice:
+            tts = dict(_vlab.sanitize_tts(body.tts))
+            # The blend id carries no language, so the preset has to.
+            tts["kokoro_lang_code"] = entry["lang_code"]
+            try:
+                preset = _lvoices.add_local(cfg.profile_name, "kokoro", {
+                    "name": entry["name"],
+                    "voice_id": entry["id"],
+                    "notes": f"blend: {_kblend.describe(entry)}",
+                    "source": "blend:kokoro",
+                    "tts": tts,
+                })
+            except _lvoices.LocalVoiceError as e:
+                # The blend pack exists — report it instead of failing the call.
+                warning = f"the blend was saved, but the voice was not registered: {e}"
+        return {
+            "ok": True,
+            "blend": entry,
+            "preset": preset.to_dict() if preset else None,
+            "warning": warning,
+            **_blend_payload(),
+            **_voice_library_payload(cfg.profile_name),
+        }
+
+    @app.delete("/api/tts/kokoro/blends/{voice}")
+    def api_kokoro_blend_delete(voice: str) -> dict[str, Any]:
+        """Delete a blend pack and any saved voice that pointed at it."""
+        cfg = load_profile()
+        try:
+            removed = _kblend.remove_blend(voice)
+        except _kblend.KokoroBlendError as e:
+            raise HTTPException(400, str(e))
+        stale = [
+            p for p in _vlab.load_library(cfg.profile_name)
+            if (p.provider or "").lower() == "kokoro" and p.voice_id == voice
+        ]
+        for preset in stale:
+            _vlab.remove_preset(cfg.profile_name, preset.name)
+        if not removed and not stale:
+            raise HTTPException(404, f"no blend named {voice}")
+        return {
+            "ok": True,
+            "voices_removed": len(stale),
+            **_blend_payload(),
+            **_voice_library_payload(cfg.profile_name),
+        }
+
     @app.post("/api/voices/export")
     def api_voices_export(body: VoiceExportBody) -> dict[str, Any]:
         """Copy the active profile's saved voices (including the local
@@ -1594,6 +1788,165 @@ def _build_app(
             "preset": preset.to_dict() if preset else None,
             **_voice_library_payload(cfg.profile_name),
         }
+
+    # ---------- KokoClone — zero-shot cloning into Kokoro (optional backend) ----------
+    from tts import kokoclone as _kk
+
+    def _kokoclone_payload(profile: str) -> dict[str, Any]:
+        """The KokoClone voices of this profile, their clips, and the worker."""
+        presets = [
+            p.to_dict() for p in _vlab.load_library(profile)
+            if (p.provider or "").lower() == "kokoclone"
+        ]
+        return {
+            # koko_presets, not presets: the response also carries the WHOLE
+            # saved-voice library under ``presets``, and a silent overwrite of
+            # one by the other would be a subtle bug to chase.
+            "koko_presets": presets,
+            "clips": _kk.list_voices(),
+            "worker": _kk.worker_status(),
+            "install": dict(state.kokoclone_install),
+        }
+
+    @app.get("/api/voices/kokoclone")
+    def api_kokoclone_panel() -> dict[str, Any]:
+        """Is the backend installed, what clips exist, and what is the worker doing?"""
+        cfg = load_profile()
+        return {"ok": True, **_kk.detect(), **_kokoclone_payload(cfg.profile_name)}
+
+    @app.post("/api/voices/kokoclone")
+    def api_kokoclone_create(body: KokoCloneVoiceBody) -> dict[str, Any]:
+        """Keep a reference clip and register it as a clonable Kokoro voice.
+
+        The clip is decoded, trimmed and cut to 24 kHz mono here — the same
+        local pipeline the Voice port uses — and stays on this machine. The
+        voice is registered even when the backend is not installed yet, so a
+        clip can be prepared first and used after the checkout is in place.
+        """
+        import base64 as _b64
+
+        cfg = load_profile()
+        blob = b""
+        filename = "reference.wav"
+        if body.sample is not None:
+            raw = (body.sample.data or "").split(",", 1)[-1]
+            filename = body.sample.filename or filename
+            # base64 is 4/3 of the bytes, so this refuses an oversized clip
+            # BEFORE it becomes a large allocation here; store_voice re-checks
+            # the decoded size for callers that skip this route.
+            if len(raw) > _kk.MAX_REF_BYTES * 4 // 3 + 8:
+                raise HTTPException(
+                    400,
+                    f"the reference clip is too large — keep it under "
+                    f"{_kk.MAX_REF_BYTES // (1024 * 1024)} MB",
+                )
+            try:
+                blob = _b64.b64decode(raw, validate=False)
+            except Exception:
+                raise HTTPException(400, "the reference clip is not valid base64")
+        try:
+            clip = _kk.store_voice(
+                body.name, blob, lang=body.lang, filename=filename, notes=body.notes
+            )
+        except _kk.KokoCloneError as e:
+            raise HTTPException(400, str(e))
+        preset = None
+        warning = ""
+        if body.save_preset:
+            try:
+                preset = _vlab.add_preset(cfg.profile_name, {
+                    "name": clip["name"],
+                    "provider": "kokoclone",
+                    "voice_id": clip["ref"],
+                    "notes": body.notes or (
+                        f"KokoClone · {clip['seconds']}s reference ({clip['lang']})"
+                    ),
+                    "source": "local:kokoclone",
+                    "tts": {
+                        "kokoclone_ref": clip["ref"],
+                        "kokoclone_lang": clip["lang"],
+                    },
+                })
+            except _vlab.VoiceLabError as e:
+                warning = f"the clip was saved, but the voice was not registered: {e}"
+        return {
+            "ok": True,
+            "clip": clip,
+            "preset": preset.to_dict() if preset else None,
+            "warning": warning,
+            **_kk.detect(),
+            **_kokoclone_payload(cfg.profile_name),
+            **_voice_library_payload(cfg.profile_name),
+        }
+
+    @app.delete("/api/voices/kokoclone/{name}")
+    def api_kokoclone_delete(name: str) -> dict[str, Any]:
+        """Delete a KokoClone voice: its saved voice and its reference clip."""
+        cfg = load_profile()
+        wanted = (name or "").strip().lower()
+        stale = [
+            p for p in _vlab.load_library(cfg.profile_name)
+            if (p.provider or "").lower() == "kokoclone" and p.name.lower() == wanted
+        ]
+        for preset in stale:
+            _vlab.remove_preset(cfg.profile_name, preset.name)
+        try:
+            clip_removed = _kk.remove_voice(name)
+        except _kk.KokoCloneError as e:
+            raise HTTPException(400, str(e))
+        if not stale and not clip_removed:
+            raise HTTPException(404, f"no KokoClone voice named {name}")
+        return {
+            "ok": True,
+            "clip_removed": clip_removed,
+            **_kokoclone_payload(cfg.profile_name),
+            **_voice_library_payload(cfg.profile_name),
+        }
+
+    _KOKOCLONE_INSTALL_TIMEOUT = 3600.0
+
+    @app.post("/api/voices/kokoclone/install")
+    async def api_kokoclone_install() -> dict[str, Any]:
+        """Clone KokoClone and pip-install its requirements, as a background job.
+
+        Same shape as the Kokoro install: the panel starts it, polls the log and
+        re-probes the backend when it ends. Nothing about the checkout is
+        trusted beforehand — the probe above decides whether a button may run.
+        """
+        status = _kk.detect()
+        if status["installed"]:
+            raise HTTPException(409, "KokoClone is already installed")
+        if not status["can_install"]:
+            raise HTTPException(400, status["hint"])
+        if state.kokoclone_install["running"]:
+            raise HTTPException(409, "a KokoClone install is already running")
+        if not status["checkout"] and not status["git"]:
+            raise HTTPException(400, status["hint"])
+        state.kokoclone_install.update(
+            running=True, started_at=time.time(), finished_at=None,
+            returncode=None, log="cloning + installing KokoClone…",
+        )
+        asyncio.create_task(
+            _stream_subprocess_job(
+                state.kokoclone_install,
+                _kk.install_argv(),
+                cwd=_kk.REPO_ROOT,
+                timeout=_KOKOCLONE_INSTALL_TIMEOUT,
+            ),
+            name="kokoclone-install",
+        )
+        return {"ok": True, "started": True, "root": status["root"]}
+
+    @app.get("/api/voices/kokoclone/install")
+    def api_kokoclone_install_status() -> dict[str, Any]:
+        """The install job's progress plus a fresh probe of the backend."""
+        return {"ok": True, "install": dict(state.kokoclone_install), **_kk.detect()}
+
+    @app.post("/api/voices/kokoclone/stop")
+    def api_kokoclone_stop() -> dict[str, Any]:
+        """Stop the background worker (frees the RAM the models hold)."""
+        stopped = _kk.stop_worker()
+        return {"ok": True, "stopped": stopped, "worker": _kk.worker_status()}
 
     # ---------- Voice port — carry a cloned voice over to a local engine ----------
     from tts import voice_port as _vport

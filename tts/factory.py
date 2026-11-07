@@ -68,6 +68,17 @@ def build_tts(cfg: TTSConfig, secrets: Secrets) -> TTSProvider:
             pitch_semitones=cfg.kokoro_pitch,
         )
 
+    if cfg.provider == "kokoclone":
+        # Optional third-party backend: it runs in its own worker process, so
+        # this import is light (the heavy models are never loaded here).
+        from .kokoclone import KokoCloneTTS
+
+        return KokoCloneTTS(
+            reference=cfg.kokoclone_ref,
+            lang=cfg.kokoclone_lang,
+            pitch_semitones=cfg.kokoclone_pitch,
+        )
+
     if cfg.provider == "openai_compatible":
         try:
             from .openai_tts import OpenAICompatibleTTS
