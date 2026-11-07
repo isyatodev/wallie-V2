@@ -53,6 +53,7 @@ def build_tts(cfg: TTSConfig, secrets: Secrets) -> TTSProvider:
             length_scale=cfg.piper_length_scale,
             noise_scale=cfg.piper_noise_scale,
             noise_w=cfg.piper_noise_w,
+            pitch_semitones=cfg.piper_pitch,
         )
 
     if cfg.provider == "kokoro":
@@ -64,6 +65,7 @@ def build_tts(cfg: TTSConfig, secrets: Secrets) -> TTSProvider:
             voice=cfg.kokoro_voice,
             lang_code=cfg.kokoro_lang_code,
             speed=cfg.kokoro_speed,
+            pitch_semitones=cfg.kokoro_pitch,
         )
 
     if cfg.provider == "openai_compatible":

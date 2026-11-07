@@ -40,6 +40,7 @@ def _tts(voice, *, length_scale=1.0, noise_scale=0.667, noise_w=0.8) -> PiperTTS
     tts._length_scale = length_scale
     tts._noise_scale = noise_scale
     tts._noise_w = noise_w
+    tts._pitch = 0.0
     return tts
 
 

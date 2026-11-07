@@ -900,8 +900,9 @@ def test_kokoro_pt_br_language_reaches_the_provider(monkeypatch):
         sample_rate = 24000
         channels = 1
 
-        def __init__(self, *, voice, lang_code, speed):
-            seen.update(voice=voice, lang_code=lang_code, speed=speed)
+        def __init__(self, *, voice, lang_code, speed, pitch_semitones=0.0):
+            seen.update(voice=voice, lang_code=lang_code, speed=speed,
+                        pitch_semitones=pitch_semitones)
 
     monkeypatch.setattr(kok, "KokoroTTS", _StubKokoro)
     from config import TTSConfig
@@ -909,9 +910,10 @@ def test_kokoro_pt_br_language_reaches_the_provider(monkeypatch):
 
     build_tts(TTSConfig(
         provider="kokoro", kokoro_voice="pf_dora",
-        kokoro_lang_code="p", kokoro_speed=1.05,
+        kokoro_lang_code="p", kokoro_speed=1.05, kokoro_pitch=2.5,
     ), Secrets())
-    assert seen == {"voice": "pf_dora", "lang_code": "p", "speed": 1.05}
+    assert seen == {"voice": "pf_dora", "lang_code": "p", "speed": 1.05,
+                    "pitch_semitones": 2.5}
 
     # And the default stays US English so existing setups are untouched.
     assert TTSConfig().kokoro_lang_code == "a"

@@ -129,9 +129,11 @@ def test_factory_passes_piper_tuning(monkeypatch):
         sample_rate = 22050
         channels = 1
 
-        def __init__(self, *, model_path, length_scale, noise_scale, noise_w):
+        def __init__(self, *, model_path, length_scale, noise_scale, noise_w,
+                     pitch_semitones=0.0):
             seen.update(model_path=model_path, length_scale=length_scale,
-                        noise_scale=noise_scale, noise_w=noise_w)
+                        noise_scale=noise_scale, noise_w=noise_w,
+                        pitch_semitones=pitch_semitones)
 
     monkeypatch.setattr(piper_mod, "PiperTTS", _StubPiper)
     from config import TTSConfig
@@ -140,10 +142,11 @@ def test_factory_passes_piper_tuning(monkeypatch):
     build_tts(TTSConfig(
         provider="piper", piper_model_path="voices/x.onnx",
         piper_length_scale=1.2, piper_noise_scale=0.8, piper_noise_w=0.9,
+        piper_pitch=-3.5,
     ), Secrets())
     assert seen == {
         "model_path": "voices/x.onnx", "length_scale": 1.2,
-        "noise_scale": 0.8, "noise_w": 0.9,
+        "noise_scale": 0.8, "noise_w": 0.9, "pitch_semitones": -3.5,
     }
     # Defaults stay Piper's own so untouched profiles sound identical.
     cfg = TTSConfig()

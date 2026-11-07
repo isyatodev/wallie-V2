@@ -389,9 +389,11 @@ one you pick with a progress bar. Files land in `voices/` either way — the CLI
 alternative.
 
 Then in the dashboard: **Voice** → provider `piper`, path `voices/en_US-amy-medium.onnx` — and tune it
-right there: **Speed** (`piper_length_scale`), **Expressiveness** (`piper_noise_scale`) and **Pacing
-variety** (`piper_noise_w`). Everything you set is part of a saved voice, so it comes back with one
-click from the library in the Voice Lab.
+right there: **Speed** (`piper_length_scale`), **Expressiveness** (`piper_noise_scale`), **Pacing
+variety** (`piper_noise_w`) and **Pitch** (`piper_pitch`, semitones — negative deepens, positive
+brightens, duration unchanged; Kokoro has the same control as `kokoro_pitch`). The **Deep / Natural /
+Bright** presets jump the slider to `−4 / 0 / +4` semitones without leaving the page. Everything you set is
+part of a saved voice, so it comes back with one click from the library in the Voice Lab.
 </details>
 
 <details>

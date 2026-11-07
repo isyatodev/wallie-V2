@@ -367,6 +367,11 @@ class TTSConfig(BaseModel):
     # Defaults are Piper's own, so an untouched profile sounds identical.
     piper_noise_scale: float = 0.667
     piper_noise_w: float = 0.8
+    # Pitch shift in semitones (applied to the generated PCM, duration kept).
+    # 0 = the model's own voice; negative deepens, positive brightens. Clamped
+    # to ±12 in tts.pitch — beyond an octave formants drift too far to sound
+    # like the same speaker.
+    piper_pitch: float = 0.0
     # Kokoro — local, high-quality neural TTS (free, runs on CPU/GPU). voice e.g.
     # af_heart / am_adam / bf_emma / pf_dora. The voice id's first letter IS the
     # lang_code: 'a'=US English, 'b'=UK, 'e'=Spanish, 'f'=French, 'h'=Hindi,
@@ -375,6 +380,8 @@ class TTSConfig(BaseModel):
     kokoro_voice: str = "af_heart"
     kokoro_lang_code: str = "a"
     kokoro_speed: float = 1.0
+    # Pitch shift in semitones, same effect and range as Piper's.
+    kokoro_pitch: float = 0.0
     # OpenAI-compatible speech endpoint (POST {base}/audio/speech, PCM output).
     # Works with OpenAI itself, self-hosted gateways (e.g. faster-whisper servers
     # exposing the same API), and most aggregators. Key lives in Secrets (.env).

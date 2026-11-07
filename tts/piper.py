@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from .base import TTSError, TTSProvider
+from .pitch import clamp_semitones, shift_pcm16
 
 
 def _params(fn: Any) -> set[str]:
@@ -26,6 +27,7 @@ class PiperTTS(TTSProvider):
         length_scale: float = 1.0,
         noise_scale: float = 0.667,
         noise_w: float = 0.8,
+        pitch_semitones: float = 0.0,
     ) -> None:
         if not model_path:
             raise TTSError("piper: model_path is required (download a .onnx voice file)")
@@ -52,6 +54,8 @@ class PiperTTS(TTSProvider):
         self._length_scale = length_scale
         self._noise_scale = noise_scale
         self._noise_w = noise_w
+        # Piper has no pitch control of its own: shift the PCM after synthesis.
+        self._pitch = clamp_semitones(pitch_semitones)
 
     async def synthesize(self, text: str) -> AsyncIterator[bytes]:
         text = text.strip()
@@ -69,6 +73,8 @@ class PiperTTS(TTSProvider):
         try:
             for chunk in self._start_synthesis(text):
                 buf = self._pcm(chunk)
+                if buf and self._pitch:
+                    buf = shift_pcm16(buf, self._pitch, self.sample_rate)
                 if buf:
                     out.append(buf)
             return out

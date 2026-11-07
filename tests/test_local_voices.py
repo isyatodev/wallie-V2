@@ -45,14 +45,16 @@ def test_buckets_are_separate_per_provider(tmp_path, monkeypatch):
     from tts import local_voices as lv
 
     lv.add_local("p1", "piper", {"name": "Amy", "voice_id": "voices/amy.onnx",
-                                 "tts": {"piper_length_scale": 1.1, "kokoro_speed": 9}})
+                                 "tts": {"piper_length_scale": 1.1, "piper_pitch": -3,
+                                         "kokoro_speed": 9}})
     lv.add_local("p1", "kokoro", {"name": "Dora", "voice_id": "pf_dora",
                                   "tts": {"kokoro_lang_code": "p"}})
 
     assert [v.name for v in lv.list_local("p1", "piper")] == ["Amy"]
     assert [v.name for v in lv.list_local("p1", "kokoro")] == ["Dora"]
-    # The Piper entry kept only Piper knobs (kokoro_speed dropped, length kept).
-    assert lv.list_local("p1", "piper")[0].tts == {"piper_length_scale": 1.1}
+    # The Piper entry kept only Piper knobs (kokoro_speed dropped, pitch kept).
+    assert lv.list_local("p1", "piper")[0].tts == {
+        "piper_length_scale": 1.1, "piper_pitch": -3}
 
 
 def test_add_is_upsert_by_name_and_per_profile(tmp_path, monkeypatch):
@@ -203,12 +205,14 @@ def test_local_voices_endpoints_roundtrip(tmp_path, monkeypatch):
 
         r = client.post("/api/voices/local/piper", json={
             "name": "Amy", "voice_id": "voices/amy.onnx",
-            "tts": {"piper_length_scale": 1.05, "output_device": "dropped"},
+            "tts": {"piper_length_scale": 1.05, "piper_pitch": -4.0,
+                    "output_device": "dropped"},
         })
         assert r.status_code == 200, r.text
         assert [v["name"] for v in r.json()["providers"]["piper"]] == ["Amy"]
-        # Routing fields never travel into a saved voice.
-        assert r.json()["voice"]["tts"] == {"piper_length_scale": 1.05}
+        # Routing fields never travel into a saved voice; pitch does.
+        assert r.json()["voice"]["tts"] == {
+            "piper_length_scale": 1.05, "piper_pitch": -4.0}
 
         r = client.delete("/api/voices/local/piper/Amy")
         assert r.status_code == 200

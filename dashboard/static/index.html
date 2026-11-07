@@ -677,6 +677,32 @@
           </div>
         </template>
         <template x-if="cfg.tts.provider==='piper'">
+          <div class="field">
+            <label>Pitch <span class="slider-val" x-text="(cfg.tts.piper_pitch > 0 ? '+' : '') + cfg.tts.piper_pitch.toFixed(1) + ' st'"></span></label>
+            <input type="range" min="-12" max="12" step="0.5" x-model.number="cfg.tts.piper_pitch" />
+            <div class="chips" style="margin-top:6px">
+              <template x-for="p in pitchPresets" :key="p.value">
+                <button type="button" class="chip toggle"
+                  :class="{on: cfg.tts.piper_pitch === p.value}"
+                  @click="cfg.tts.piper_pitch = p.value"
+                  x-text="p.label"></button>
+              </template>
+              <button type="button" class="btn tiny" style="margin-left:auto"
+                @click="previewPitch()" :disabled="pitchPreview.busy"
+                x-text="pitchPreview.busy ? 'synthesizing…' : '▶ hear it'"></button>
+              <button type="button" class="btn tiny" title="Play the current pitch, then the original voice"
+                @click="previewPitchAb()" :disabled="pitchPreview.busy"
+                x-text="pitchPreview.busy ? '…' : '▶ A/B'"></button>
+            </div>
+            <small class="hint">0 = the model's own voice · negative deepens · positive brightens. Semitones, ±12 max — speed and duration stay the same.</small>
+            <small class="hint" x-show="pitchPreview.msg" x-text="pitchPreview.msg"></small>
+            <audio x-ref="pitchAudio" x-show="pitchPreview.url" :src="pitchPreview.url" controls preload="none"
+              style="width:100%;margin-top:6px" title="A · current pitch"></audio>
+            <audio x-ref="pitchAudioB" x-show="pitchPreview.abUrl" :src="pitchPreview.abUrl" controls preload="none"
+              style="width:100%;margin-top:6px" title="B · original 0 st"></audio>
+          </div>
+        </template>
+        <template x-if="cfg.tts.provider==='piper'">
           <div class="field wide">
             <label>Saved Piper voices</label>
             <div class="enroll-strip">
@@ -738,6 +764,32 @@
           <div class="field">
             <label>Speed <span class="slider-val" x-text="cfg.tts.kokoro_speed.toFixed(2)"></span></label>
             <input type="range" min="0.5" max="2.0" step="0.05" x-model.number="cfg.tts.kokoro_speed" />
+          </div>
+        </template>
+        <template x-if="cfg.tts.provider==='kokoro'">
+          <div class="field">
+            <label>Pitch <span class="slider-val" x-text="(cfg.tts.kokoro_pitch > 0 ? '+' : '') + cfg.tts.kokoro_pitch.toFixed(1) + ' st'"></span></label>
+            <input type="range" min="-12" max="12" step="0.5" x-model.number="cfg.tts.kokoro_pitch" />
+            <div class="chips" style="margin-top:6px">
+              <template x-for="p in pitchPresets" :key="p.value">
+                <button type="button" class="chip toggle"
+                  :class="{on: cfg.tts.kokoro_pitch === p.value}"
+                  @click="cfg.tts.kokoro_pitch = p.value"
+                  x-text="p.label"></button>
+              </template>
+              <button type="button" class="btn tiny" style="margin-left:auto"
+                @click="previewPitch()" :disabled="pitchPreview.busy"
+                x-text="pitchPreview.busy ? 'synthesizing…' : '▶ hear it'"></button>
+              <button type="button" class="btn tiny" title="Play the current pitch, then the original voice"
+                @click="previewPitchAb()" :disabled="pitchPreview.busy"
+                x-text="pitchPreview.busy ? '…' : '▶ A/B'"></button>
+            </div>
+            <small class="hint">0 = the voice above · negative deepens · positive brightens. Semitones, ±12 max — speed and duration stay the same.</small>
+            <small class="hint" x-show="pitchPreview.msg" x-text="pitchPreview.msg"></small>
+            <audio x-ref="pitchAudio" x-show="pitchPreview.url" :src="pitchPreview.url" controls preload="none"
+              style="width:100%;margin-top:6px" title="A · current pitch"></audio>
+            <audio x-ref="pitchAudioB" x-show="pitchPreview.abUrl" :src="pitchPreview.abUrl" controls preload="none"
+              style="width:100%;margin-top:6px" title="B · original 0 st"></audio>
           </div>
         </template>
         <template x-if="cfg.tts.provider==='kokoro'">

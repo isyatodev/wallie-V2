@@ -22,6 +22,7 @@ import threading
 from typing import AsyncIterator
 
 from .base import TTSError, TTSProvider
+from .pitch import clamp_semitones, shift_pcm16
 
 _SAMPLE_RATE = 24000  # Kokoro generates at 24 kHz
 
@@ -94,10 +95,13 @@ class KokoroTTS(TTSProvider):
         lang_code: str = "a",
         speed: float = 1.0,
         device: str = "",
+        pitch_semitones: float = 0.0,
     ) -> None:
         self._pipeline = _get_pipeline(lang_code, device)
         self._voice = voice or "af_heart"
         self._speed = float(speed) if speed else 1.0
+        # Kokoro's speed knob changes duration only; pitch needs its own pass.
+        self._pitch = clamp_semitones(pitch_semitones)
         self._voice_path = _local_voice_path(self._voice)
         self.sample_rate = _SAMPLE_RATE
         self.channels = 1
@@ -135,7 +139,10 @@ class KokoroTTS(TTSProvider):
             if arr.size == 0:
                 continue
             pcm = np.clip(arr, -1.0, 1.0)
-            yield (pcm * 32767.0).astype(np.int16).tobytes()
+            data = (pcm * 32767.0).astype(np.int16).tobytes()
+            if self._pitch:
+                data = shift_pcm16(data, self._pitch, self.sample_rate)
+            yield data
 
     async def synthesize(self, text: str) -> AsyncIterator[bytes]:
         text = text.strip()

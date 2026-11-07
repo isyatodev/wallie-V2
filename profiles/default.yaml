@@ -113,9 +113,11 @@ tts:
   piper_length_scale: 1.0
   piper_noise_scale: 0.667
   piper_noise_w: 0.8
+  piper_pitch: 0.0
   kokoro_voice: pf_dora
   kokoro_lang_code: p
   kokoro_speed: 1.0
+  kokoro_pitch: 0.0
   openai_compatible_base_url: ''
   openai_compatible_model: ''
   openai_compatible_timeout: 30.0

@@ -38,8 +38,9 @@ VOICE_ID_FIELD: dict[str, str] = {
 # override only these (voice_id is stored separately), which is what keeps the
 # per-model views clean even when the shared library holds other engines' presets.
 PROVIDER_FIELDS: dict[str, frozenset[str]] = {
-    "piper": frozenset({"piper_length_scale", "piper_noise_scale", "piper_noise_w"}),
-    "kokoro": frozenset({"kokoro_lang_code", "kokoro_speed"}),
+    "piper": frozenset({"piper_length_scale", "piper_noise_scale", "piper_noise_w",
+                        "piper_pitch"}),
+    "kokoro": frozenset({"kokoro_lang_code", "kokoro_speed", "kokoro_pitch"}),
 }
 
 MAX_LOCAL_VOICES = 40
