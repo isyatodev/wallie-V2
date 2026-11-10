@@ -1339,8 +1339,21 @@
         <small class="hint" style="flex-basis:100%;" x-show="kokoClone.hint" x-text="kokoClone.hint"></small>
         <small class="hint" style="flex-basis:100%;" x-show="kokoClone.root"
                x-text="'checkout: ' + kokoClone.root"></small>
+        <button type="button" class="btn tiny"
+                x-show="kokoClone.installed && !(kokoClone.worker && kokoClone.worker.running)"
+                :disabled="kokoWarmBusy"
+                @click="warmKokoClone()"
+                x-text="kokoWarmBusy ? 'starting…' : '▶ load models'"
+                title="start the background worker now and load Kanade + the vocoder (the first run downloads them) — then ▶ test answers in seconds"></button>
+        <span class="hint" style="flex-basis:100%;"
+              x-show="kokoClone.worker && kokoClone.worker.stage_label"
+              x-text="kokoStageNote()"></span>
       </div>
       <pre class="ih-log" x-show="kokoInstall.log" x-text="kokoInstall.log"></pre>
+      <pre class="ih-log" x-show="kokoClone.worker && kokoClone.worker.log"
+           x-effect="$el.scrollTop = $el.scrollHeight"
+           x-text="kokoClone.worker ? kokoClone.worker.log : ''"
+           title="what the KokoClone worker is doing — imports, weight loading, downloads, synthesis"></pre>
 
       <div class="grid two">
         <div class="field">

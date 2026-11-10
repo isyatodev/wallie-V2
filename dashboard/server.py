@@ -1942,6 +1942,19 @@ def _build_app(
         """The install job's progress plus a fresh probe of the backend."""
         return {"ok": True, "install": dict(state.kokoclone_install), **_kk.detect()}
 
+    @app.post("/api/voices/kokoclone/warm")
+    def api_kokoclone_warm() -> dict[str, Any]:
+        """Start the worker and its model loading (status only, no synthesis).
+
+        The panel polls /api/voices/kokoclone for the stages and the log, so a
+        cold boot (minutes on the first run) is visible instead of silent.
+        """
+        try:
+            worker = _kk.warm()
+        except _kk.KokoCloneError as e:
+            raise HTTPException(400, str(e))
+        return {"ok": True, **_kk.detect(), "worker": worker}
+
     @app.post("/api/voices/kokoclone/stop")
     def api_kokoclone_stop() -> dict[str, Any]:
         """Stop the background worker (frees the RAM the models hold)."""

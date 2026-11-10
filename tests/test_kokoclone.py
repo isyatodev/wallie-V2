@@ -30,9 +30,14 @@ class KokoClone:
     sample_rate = 24000
 
     def __init__(self):
+        import sys
         print("fake KokoClone ready")     # chatty on purpose: must not corrupt the protocol
         print("env api_key=" + os.environ.get("WALLIE_TEST_API_KEY", "<none>"))
         print("env pin=" + os.environ.get("DASHBOARD_PIN", "<none>"))
+        # A progress bar redraws ONE line with \\r and no newline — the shape of
+        # every torch/HF download. It has to reach the tail anyway.
+        sys.stderr.write("weights 10%\\rweights 55%\\rweights 100%\\n")
+        sys.stderr.flush()
 
     def generate(self, text, lang, reference_audio, output_path):
         if text == "boom":
@@ -332,6 +337,41 @@ def test_the_worker_never_inherits_credentials(fake_root, monkeypatch):
     assert "sk-must-not-leak" not in log
 
 
+def test_a_redrawn_progress_bar_reaches_the_log_tail(fake_root):
+    """A download bar must be visible while it happens, not only at 100 %."""
+    kk.store_voice("Luna", _wav(4.0), lang="pt")
+    kk.synthesize_pcm("hi", reference="Luna", lang="pt", timeout=60)
+    log = kk.worker_status()["log"]
+    assert "weights 100%" in log
+    # Frames are split one per line, so the panel never shows \r soup.
+    assert "\r" not in log
+
+
+def test_warm_starts_the_worker_without_synthesising_anything(fake_root):
+    import time as _t
+
+    status = kk.warm()
+    assert status["running"] is True
+    assert isinstance(status["pid"], int)
+    # The status carries what the panel needs to explain a slow boot.
+    assert {"stage", "stage_label", "stage_seconds", "log"} <= set(status)
+    deadline = _t.time() + 30
+    while _t.time() < deadline:
+        status = kk.worker_status()
+        if status["ready"] or status["error"]:
+            break
+        _t.sleep(0.1)
+    assert status["ready"] is True, status
+    # Ready means the boot block is done: no stale stage left on screen.
+    assert status["stage"] == "" and status["stage_label"] == ""
+    assert "✓" in status["log"]
+
+
+def test_warm_refuses_a_checkout_that_cannot_run(no_checkout):
+    with pytest.raises(kk.KokoCloneError, match="git clone"):
+        kk.warm()
+
+
 def test_the_worker_env_keeps_paths_and_drops_every_secret(monkeypatch):
     monkeypatch.setenv("ELEVENLABS_API_KEY", "k")
     monkeypatch.setenv("TWITCH_OAUTH_TOKEN", "t")
@@ -432,6 +472,19 @@ def test_dashboard_routes_create_and_delete_a_voice(tmp_path, monkeypatch, fake_
         assert r.json()["clips"] == []
         assert r.json()["clip_removed"] is True
         assert client.delete("/api/voices/kokoclone/Luna Clone").status_code == 404
+
+
+def test_dashboard_warm_loads_the_models_from_the_panel(tmp_path, monkeypatch, fake_root):
+    monkeypatch.setattr(kk, "REQUIRED_PACKAGES", ())
+    with _client(tmp_path, monkeypatch) as client:
+        r = client.post("/api/voices/kokoclone/warm")
+        assert r.status_code == 200, r.text
+        assert r.json()["worker"]["running"] is True
+        # The panel's own payload now carries the boot state and the log.
+        panel = client.get("/api/voices/kokoclone").json()
+        assert panel["worker"]["running"] is True
+        assert "stage" in panel["worker"]
+        client.post("/api/voices/kokoclone/stop")
 
 
 def _installable(monkeypatch, argv):

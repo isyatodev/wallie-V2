@@ -235,7 +235,9 @@ def detect() -> dict[str, Any]:
         "installed": installed,
         "root": str(root),
         "checkout": checkout,
-        "worker": worker_ok,
+        # NOT "worker": that key is the running worker's status everywhere else
+        # in the panel payload, and a bool there would be a nasty surprise.
+        "worker_present": worker_ok,
         "missing": missing,
         "python_ok": py_ok,
         # The panel offers the one-click install only when it could work here:
@@ -427,8 +429,14 @@ class _Worker:
         self.error = ""
         self.sample_rate = SAMPLE_RATE
         self.lock = threading.Lock()
-        self.tail: deque[str] = deque(maxlen=80)
+        self.tail: deque[str] = deque(maxlen=120)
         self.started_at = time.time()
+        # Boot progress, reported by the worker itself (imports and weight
+        # loading are otherwise a minute of silence that reads as a hang).
+        self.stage = ""
+        self.stage_label = ""
+        self.stage_since = time.time()
+        self._stage_labels: dict[str, str] = {}
         self._pending: Any = None
         self._reply_event = threading.Event()
         self._reply: dict[str, Any] | None = None
@@ -449,14 +457,44 @@ class _Worker:
 
     # -- plumbing ---------------------------------------------------------
 
+    def _push(self, text: str) -> None:
+        text = text.replace("\x00", "").strip()
+        if text:
+            self.tail.append(text[-300:])
+
     def _pump_err(self) -> None:
+        """Drain stderr, splitting on ``\\r`` as well as ``\\n``.
+
+        Progress bars (torch.hub, huggingface) redraw a single line with ``\\r``
+        and never end it until 100 %, so line-based iteration would show
+        NOTHING during a 360 MB download — the exact silence that looks like a
+        frozen backend. Reading the raw pipe in chunks and splitting on both
+        keeps the frames, throttled so the tail stays readable.
+        """
         stream = self.proc.stderr
         if stream is None:
             return
-        for line in stream:
-            line = line.rstrip()
-            if line:
-                self.tail.append(line[-300:])
+        raw = getattr(stream, "buffer", None) or stream
+        rest = ""
+        last_partial = 0.0
+        while True:
+            try:
+                chunk = raw.read1(8192) if hasattr(raw, "read1") else raw.read(8192)
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            text = chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else chunk
+            rest += text
+            frames = re.split(r"[\r\n]+", rest)
+            rest = frames.pop()
+            for frame in frames:
+                self._push(frame)
+            # Keep the in-flight bar frame visible, at most twice a second.
+            if rest.strip() and time.time() - last_partial > 0.5:
+                self._push(rest)
+                last_partial = time.time()
+        self._push(rest)
 
     def _pump_out(self) -> None:
         stream = self.proc.stdout
@@ -472,7 +510,28 @@ class _Worker:
                 self.tail.append(line[-300:])
                 continue
             event = msg.get("event")
-            if event == "ready":
+            if event == "stage":
+                stage = str(msg.get("stage") or "")
+                label = str(msg.get("label") or stage)
+                if label:
+                    self._stage_labels[stage] = label
+                if stage != self.stage:
+                    self.stage = stage
+                    self.stage_label = label
+                    self.stage_since = time.time()
+                    if label:
+                        self._push(f"→ {label}…")
+            elif event == "heartbeat":
+                # "still on this step, N seconds in" — keeps a silent import or
+                # weight load from looking like a hang.
+                if str(msg.get("stage") or "") == self.stage:
+                    self.stage_since = time.time() - _as_float(msg.get("seconds"))
+            elif event == "stage_done":
+                stage = str(msg.get("stage") or "")
+                label = self._stage_labels.get(stage, stage)
+                took = _as_float(msg.get("seconds"))
+                self._push(f"✓ {label}" + (f" ({took:.1f}s)" if took else ""))
+            elif event == "ready":
                 self.sample_rate = int(msg.get("sample_rate") or SAMPLE_RATE)
                 self.ready.set()
             elif event == "error":
@@ -583,13 +642,32 @@ def worker_status() -> dict[str, Any]:
     if not running:
         return {"running": False, "ready": False, "log": ""}
     worker = running[0]
+    ready = worker.ready.is_set() and not worker.error
     return {
         "running": True,
-        "ready": worker.ready.is_set() and not worker.error,
+        "ready": ready,
         "error": worker.error,
+        # What it is doing right now (empty once the models are up).
+        "stage": "" if ready else worker.stage,
+        "stage_label": "" if ready else worker.stage_label,
+        "stage_seconds": 0.0 if ready else round(time.time() - worker.stage_since, 1),
         "seconds": round(time.time() - worker.started_at, 1),
+        "pid": worker.proc.pid,
         "log": worker.log_tail(),
     }
+
+
+def warm() -> dict[str, Any]:
+    """Start the worker and its model loading, without synthesizing anything.
+
+    The panel's "load models" button: it lets a person watch the boot (and pay
+    the first-run download) before pressing test, instead of discovering a
+    two-minute wait inside a request that looks frozen.
+    """
+    if not detect()["installed"]:
+        raise KokoCloneError(detect()["hint"])
+    _worker_for(root_dir())
+    return worker_status()
 
 
 def stop_worker() -> bool:
@@ -663,9 +741,12 @@ def synthesize_pcm(
 
     worker = _worker_for(root_dir())
     if not worker.ready.wait(READY_TIMEOUT):
+        where = worker.stage_label or worker.stage
         raise KokoCloneError(
-            "KokoClone is still loading its models (the first run downloads them, "
-            "~1 GB) — try again in a minute"
+            "KokoClone is still loading its models"
+            + (f" (step: {where})" if where else "")
+            + f" — {int(time.time() - worker.started_at)}s so far. Watch it in the "
+            "Voice Lab panel and press test again when it says ready."
         )
     if worker.error:
         raise KokoCloneError(worker.error + (f"\n{worker.log_tail(8)}" if worker.tail else ""))

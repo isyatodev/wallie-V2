@@ -340,6 +340,10 @@ function app() {
     // re-probes the backend when it ends.
     kokoInstall: { running: false, log: "", returncode: null, started_at: null },
     _kokoInstallPoll: null,
+    // Starting the worker / loading models on purpose, and the poll that keeps
+    // the stage + log live while it boots (imports alone take ~a minute).
+    kokoWarmBusy: false,
+    _kokoWorkerPoll: null,
     kokoName: "",
     kokoLang: "pt",
     kokoMsg: "",
@@ -2653,6 +2657,12 @@ function app() {
         || "testing this voice — one, two, three.";
       this.voiceLabBusy = "test";
       this.voiceLabMsg = "… synthesizing with the saved voice";
+      // A KokoClone test IS the worker's cold start: this request waits for the
+      // models, so show the boot in the panel instead of a frozen button.
+      if (this.cfg.tts.provider === "kokoclone") {
+        setTimeout(() => { this.loadKokoClone(); }, 600);
+        setTimeout(() => { this._pollKokoWorker(); }, 2600);
+      }
       try {
         const r = await fetch("/api/test/voice", {
           method: "POST",
@@ -2853,6 +2863,14 @@ function app() {
           recommended: d.recommended_seconds || "3–10 s",
         };
         if (d.install) this.kokoInstall = d.install;
+        // Follow the boot while it lasts: a cold start is minutes of imports
+        // and downloads, and a frozen spinner during that reads as a bug.
+        const w = this.kokoClone.worker || {};
+        if (w.running && !w.ready && !w.error) this._pollKokoWorker();
+        else if (this._kokoWorkerPoll) {
+          clearInterval(this._kokoWorkerPoll);
+          this._kokoWorkerPoll = null;
+        }
         // Keep the chosen language when it is still valid.
         const known = this.kokoClone.languages.map(l => l.id);
         if (!known.includes(this.kokoLang)) {
@@ -2875,9 +2893,64 @@ function app() {
           + (k.missing && k.missing.length ? " · missing " + k.missing.join(", ") : "");
       }
       const w = k.worker || {};
-      if (w.running && w.ready) return "✓ KokoClone ready — the models are loaded";
-      if (w.running) return "… KokoClone is loading its models";
-      return "✓ KokoClone installed · the first synthesis loads the models";
+      if (w.error) return "✗ the KokoClone worker failed — " + w.error;
+      if (w.running && w.ready) {
+        return `✓ KokoClone ready — the models are loaded (${this._fmtSecs(w.seconds)})`;
+      }
+      if (w.running) {
+        const what = w.stage_label || "its dependencies";
+        return `… KokoClone is loading ${what} · ${this._fmtSecs(w.seconds)}`;
+      }
+      return "✓ KokoClone installed · press ▶ load models (or just test) to load them";
+    },
+
+    // One line for the boot's current step, purely informational.
+    kokoStageNote() {
+      const w = this.kokoClone.worker || {};
+      if (!w.stage_label) return "";
+      return `step ${this._fmtSecs(w.stage_seconds)} in “${w.stage_label}”`
+        + " · the first run also downloads the weights, once";
+    },
+
+    _fmtSecs(s) {
+      const n = Math.max(0, Math.round(Number(s) || 0));
+      return n < 60 ? `${n}s` : `${Math.floor(n / 60)}m ${String(n % 60).padStart(2, "0")}s`;
+    },
+
+    // Starts the worker (and its model loading) without synthesizing anything.
+    async warmKokoClone() {
+      if (this.kokoWarmBusy) return;
+      this.kokoWarmBusy = true;
+      this.kokoMsg = "starting the KokoClone worker…";
+      try {
+        const r = await fetch("/api/voices/kokoclone/warm", { method: "POST" });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.kokoMsg = "✗ " + this._apiError(d, r.status);
+          return;
+        }
+        if (d.worker) this.kokoClone = { ...this.kokoClone, worker: d.worker };
+        this.kokoMsg = "… loading the models — the log below follows it live";
+        this._pollKokoWorker();
+      } catch (e) {
+        this.kokoMsg = "✗ " + e;
+      } finally {
+        this.kokoWarmBusy = false;
+      }
+    },
+
+    // Polls the panel payload while the worker boots (2 s: the log grows fast).
+    _pollKokoWorker() {
+      if (this._kokoWorkerPoll) return;
+      this._kokoWorkerPoll = setInterval(async () => {
+        const d = await this.loadKokoClone();
+        const w = (d && d.worker) || this.kokoClone.worker || {};
+        if (w.running && !w.ready && !w.error) return;
+        clearInterval(this._kokoWorkerPoll);
+        this._kokoWorkerPoll = null;
+        if (w.ready) this.kokoMsg = `✓ models loaded in ${this._fmtSecs(w.seconds)}`;
+        else if (w.error) this.kokoMsg = "✗ " + w.error;
+      }, 2000);
     },
 
     async kokoPickFile(event) {

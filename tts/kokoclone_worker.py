@@ -12,10 +12,18 @@ one object out), and every print from KokoClone itself is sent to stderr:
 the library is chatty, and its "Synthesizing text…" lines would otherwise
 corrupt the protocol.
 
+Booting is *reportable*: importing torch and loading the weights take a
+minute or more with no output of their own, which used to look exactly like a
+hang. Each step now announces itself, so the dashboard can show where the
+worker is instead of a spinner.
+
 Protocol (one job at a time, sequential on purpose — the models are not
 thread-safe and there is one GPU):
 
     {"event": "starting"}
+    {"event": "stage", "stage": "imports", "label": "its dependencies (…)"}
+    {"event": "heartbeat", "stage": "imports", "seconds": 12.0}   # every 3 s
+    {"event": "stage_done", "stage": "imports", "seconds": 81.2}
     {"event": "ready", "sample_rate": 24000}       # models loaded
     {"event": "error", "error": "…"}               # boot failed
     {"id": 1, "text": "…", "lang": "pt", "ref": "…", "out": "…"}
@@ -28,12 +36,42 @@ requirements: ``python tts/kokoclone_worker.py --root <checkout>``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
 import threading
+import time
 import traceback
-from typing import Any
+from typing import Any, Callable, Iterator
+
+# How often a long step says "still here". Imports and weight loading print
+# nothing of their own for a minute or more, and silence is indistinguishable
+# from a crash in the dashboard.
+HEARTBEAT = 3.0
+
+
+@contextlib.contextmanager
+def _stage(emit: Callable[[dict[str, Any]], None], key: str, label: str) -> Iterator[dict[str, Any]]:
+    """Announce a boot step and beat while it runs."""
+    started = time.time()
+    emit({"event": "stage", "stage": key, "label": label})
+    done = threading.Event()
+
+    def beat() -> None:
+        while not done.wait(HEARTBEAT):
+            emit({"event": "heartbeat", "stage": key,
+                  "seconds": round(time.time() - started, 1)})
+
+    ticker = threading.Thread(target=beat, name=f"kokoclone-beat-{key}", daemon=True)
+    ticker.start()
+    try:
+        yield {"started": started}
+    finally:
+        done.set()
+        ticker.join(timeout=1)
+        emit({"event": "stage_done", "stage": key,
+              "seconds": round(time.time() - started, 1)})
 
 
 def _protocol_stream():
@@ -49,10 +87,11 @@ def _protocol_stream():
     # fd 1 is a pipe now, so Python would block-buffer it and the parent's log
     # tail would stay empty until the buffer filled. Line buffering makes the
     # library's progress lines show up in the dashboard as they happen.
-    try:
-        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
-    except (AttributeError, ValueError):
-        pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
     return protocol
 
 
@@ -78,23 +117,27 @@ def main(argv: list[str] | None = None) -> int:
     emit({"event": "starting"})
 
     state: dict[str, Any] = {"cloner": None, "error": "", "sample_rate": 24000}
-    ready = threading.Event()
 
-    def boot() -> None:
+    # Boot in the MAIN thread: the imports are the long pole and nothing here
+    # may answer a job before the models exist anyway.
+    with _stage(emit, "imports", "its dependencies (torch, kanade, kokoro-onnx…)"):
         try:
             from core.cloner import KokoClone  # type: ignore
+        except Exception as e:  # noqa: BLE001 — reported, never a silent hang
+            state["error"] = f"importing the KokoClone pipeline failed — {type(e).__name__}: {e}"
+            emit({"event": "error", "error": state["error"]})
+            return 2
 
+    with _stage(emit, "models", "the Kanade + vocoder weights"):
+        try:
             cloner = KokoClone()
             state["cloner"] = cloner
             state["sample_rate"] = int(getattr(cloner, "sample_rate", 24000) or 24000)
-            emit({"event": "ready", "sample_rate": state["sample_rate"]})
         except Exception as e:  # noqa: BLE001 — reported, never a silent hang
             state["error"] = f"{type(e).__name__}: {e}"
             emit({"event": "error", "error": state["error"]})
-        finally:
-            ready.set()
-
-    threading.Thread(target=boot, name="kokoclone-boot", daemon=True).start()
+            return 2
+    emit({"event": "ready", "sample_rate": state["sample_rate"]})
 
     for line in sys.stdin:
         line = line.strip()
@@ -107,18 +150,16 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         job_id = job.get("id")
-        ready.wait()
-        if state["error"] or state["cloner"] is None:
-            emit({"ok": False, "id": job_id,
-                  "error": state["error"] or "KokoClone did not initialise"})
-            continue
-
         text = str(job.get("text") or "").strip()
         if not text:
             emit({"ok": False, "id": job_id, "error": "empty text"})
             continue
+        cloner = state["cloner"]
+        if cloner is None:
+            emit({"ok": False, "id": job_id, "error": "KokoClone did not initialise"})
+            continue
         try:
-            state["cloner"].generate(
+            cloner.generate(
                 text=text,
                 lang=str(job.get("lang") or "en"),
                 reference_audio=str(job.get("ref") or ""),

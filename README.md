@@ -157,8 +157,13 @@ web UI. Wallie's worker imports neither, and the panel offers the espeak languag
 `--upstream` installs their file verbatim if you want the whole app. The Voice page only offers the
 provider once it is really installed. The models load **once**, into a
 persistent worker process — the library is heavy and not thread-safe — so the first line waits
-for them and later lines stream normally, and the panel's status line says whether they are loaded
-— plus a **stop worker** button for when you want the RAM back.
+for them and later lines stream normally. That boot is **visible**: the worker reports each step
+(importing torch/kanade, loading the weights) and beats every 3 s while a step runs, so the panel
+shows *which* step it is on and for how long, with the worker's own stderr next to it — including
+download bars, which the parent splits on `\r` so a 360 MB fetch is not a blank box. **▶ load
+models** starts the worker on purpose (the first run downloads the weights, once), **stop worker**
+gives the RAM back, and **▶ test** on a saved KokoClone voice starts the same boot and shows it in
+the panel instead of hanging on a frozen button.
 
 **5. A/B compare.** Pick two voices — a saved voice, or "current Voice page settings" for whatever the
 Voice page shows right now, including unsaved edits — type one line, hit **synthesize both**. Both
@@ -942,8 +947,13 @@ the panel's hint says so, with the two commands.
 <summary><strong>KokoClone is slow on the first line, or the worker dies</strong></summary>
 
 The first synthesis downloads/loads Kokoro + Kanade (hundreds of MB) into the worker, so it takes a
-while once; later lines stream normally. If the worker dies, the next request starts a new one — use
-the panel's **stop worker** button to free that RAM on purpose (the next synthesis loads it again).
+while once; later lines stream normally. Watch it instead of guessing: press **▶ load models** and
+the panel names the current step (`importing the KokoClone pipeline`, `the Kanade + vocoder
+weights`), counts the seconds and shows the worker's log — imports alone cost ~1 minute on a cold
+disk, and loading prints nothing of its own for tens of seconds. **▶ test** waits for that boot, so
+on a fresh machine the first click can sit for a couple of minutes before it speaks; the second one
+is seconds. If the worker dies, the next request starts a new one — use the panel's **stop worker**
+button to free that RAM on purpose (the next synthesis loads it again).
 A failing line reports the library's own message (`RuntimeError: …`) in the panel; the server log
 has the traceback. Reference clips must be 2–30 s of clean speech — anything else is refused with
 its measured length before synthesis, so a bad clip never becomes a bad voice.
