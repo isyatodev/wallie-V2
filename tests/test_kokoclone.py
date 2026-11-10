@@ -37,6 +37,8 @@ class KokoClone:
         # A progress bar redraws ONE line with \\r and no newline — the shape of
         # every torch/HF download. It has to reach the tail anyway.
         sys.stderr.write("weights 10%\\rweights 55%\\rweights 100%\\n")
+        # Colour codes and a cursor move: a third-party library owns this stream.
+        sys.stderr.write("\\x1b[31mred warning\\x1b[0m\\x1b[2K\\n")
         sys.stderr.flush()
 
     def generate(self, text, lang, reference_audio, output_path):
@@ -345,6 +347,9 @@ def test_a_redrawn_progress_bar_reaches_the_log_tail(fake_root):
     assert "weights 100%" in log
     # Frames are split one per line, so the panel never shows \r soup.
     assert "\r" not in log
+    # ANSI codes are stripped: the text survives, the escapes do not.
+    assert "red warning" in log
+    assert "\x1b" not in log
 
 
 def test_warm_starts_the_worker_without_synthesising_anything(fake_root):

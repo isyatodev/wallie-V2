@@ -868,13 +868,41 @@ wallie-v2/
 
 - API keys are stored in `.env` with restricted permissions (`chmod 600` on POSIX)
 - The dashboard never exposes raw keys — only masked previews (`sk-•••xyz`)
-- The dashboard binds to `127.0.0.1` only — not accessible from the network (set `DASHBOARD_PIN` to put a PIN in front of it)
+- `DASHBOARD_HOST` defaults to `0.0.0.0`, so the dashboard is reachable from your own network.
+  That is why it never runs unprotected there: without `DASHBOARD_PIN` it **generates a random
+  4-digit PIN** and logs it at startup (`dashboard: auto-generated PIN: …`), and every `/api/*`
+  call answers `401` until the PIN is entered. Set `DASHBOARD_PIN` in `.env` for a permanent one,
+  or `DASHBOARD_HOST=127.0.0.1` to keep it on this machine only (no PIN needed then). The session
+  cookie is `HttpOnly` and `SameSite=Lax`, so a page on another site cannot spend it with a POST.
 - Atomic writes prevent `.env` corruption
 - Provider error messages are scrubbed of key-shaped strings before display
 - Allowed env variables are hard-coded — the UI cannot write arbitrary keys
 - Local voice material stays local: blended packs (`voices/kokoro/*.pt` + `blends.json`) and
   KokoClone reference clips (`voices/kokoclone/`) are only read by the local engines, and the
   panel says so — unlike provider cloning, nothing about them is uploaded
+- **The KokoClone worker is third-party code with the minimum it needs.** The checkout is cloned
+  from GitHub and run as a child process, so it gets a copy of the environment with every
+  `*_API_KEY` / `*_TOKEN` / `*_SECRET` / `*_PASSWORD` variable and `DASHBOARD_PIN` removed (paths,
+  proxy settings and the model caches stay — it needs them to download weights). A test asserts
+  the worker sees none of them, and that includes `HF_TOKEN`, so HF downloads stay anonymous.
+- **A KokoClone voice name is a folder, never a path.** It is folded to `[a-z0-9_]` (max 40 chars)
+  before it becomes `voices/kokoclone/<slug>/`, and deleting one resolves the folder and refuses
+  anything outside that directory — `../` in a name cannot escape it.
+- **A reference clip is read-only and capped.** The path in a saved voice is honoured as given
+  (that is how a hand-picked WAV works) but it is only ever `read`: nothing is written to it, no
+  file over 40 MB is decoded, and it is passed to the local model, never to a provider.
+- **The worker's log cannot dress itself up.** Its stdout/stderr is third-party output shown in
+  the panel: it is rendered with `x-text` (never `innerHTML`), truncated per line, and stripped of
+  ANSI colour/cursor codes and control characters, so a hostile or noisy library can print text
+  but not rewrite the page or the line it lands on.
+- **Run logs are not versioned.** `.dev/` is ignored: the dashboard logs its start-up line there,
+  and on a LAN bind without `DASHBOARD_PIN` that line contains the generated PIN. Nothing secret
+  belongs in a tracked file, so the logs stay local — the same reason `.env`, `voices/` and the
+  optional `kokoclone/` checkout are ignored.
+- **Loading models never widens what the dashboard can do.** `▶ load models`,
+  `▶ test`, `stop worker` and the install button are ordinary `/api/*` routes: they sit behind the
+  same PIN gate, the install refuses to run into a folder that already holds something, and the
+  loader is idempotent — pressing it twice reuses the running worker instead of starting a second.
 
 **Voice cloning uploads audio to the provider you choose.** ElevenLabs/Fish Audio receive your
 clips and create the voice under your account; their terms and privacy policies apply to that

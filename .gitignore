@@ -8,6 +8,9 @@ config.json
 scripts/token.json
 scripts/client_secret.json
 logs/
+# Local run logs. The dashboard writes its start-up line here, and on a LAN bind
+# without DASHBOARD_PIN that line IS the PIN — never version this folder.
+.dev/
 output/
 recordings/
 voices/

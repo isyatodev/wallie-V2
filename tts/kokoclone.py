@@ -457,8 +457,15 @@ class _Worker:
 
     # -- plumbing ---------------------------------------------------------
 
+    # ANSI colour/cursor codes, and any other C0 control character a chatty
+    # library may emit. The checkout is third-party code: its output is shown
+    # verbatim, so it must not be able to rewrite the panel line it lands on.
+    _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+    _CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
     def _push(self, text: str) -> None:
-        text = text.replace("\x00", "").strip()
+        text = self._ANSI_RE.sub("", str(text))
+        text = self._CTRL_RE.sub(" ", text).strip()
         if text:
             self.tail.append(text[-300:])
 
