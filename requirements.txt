@@ -50,3 +50,7 @@ uvicorn[standard]>=0.30.0
 
 # Utilities
 orjson>=3.10.0
+
+# Observability (optional) — Respan traces every LLM call; provider routing is unchanged.
+# Leave RESPAN_API_KEY empty in .env and tracing stays off.
+respan-ai==4.2.4

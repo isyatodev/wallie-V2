@@ -4,6 +4,7 @@ from __future__ import annotations
 from config import LLMConfig, Secrets
 
 from .base import LLMError, LLMProvider
+from .tracing import init_tracing
 
 
 def _missing_sdk(name: str, pkg: str) -> LLMError:
@@ -14,6 +15,10 @@ def _missing_sdk(name: str, pkg: str) -> LLMError:
 
 
 def build_provider(cfg: LLMConfig, secrets: Secrets) -> LLMProvider:
+    # Initialize Respan (once) before the first model client exists, so the SDK's
+    # auto-instrumentation wraps the provider calls made through it. No key = no-op.
+    init_tracing()
+
     p = cfg.provider
 
     if p in ("openai", "groq", "openrouter"):

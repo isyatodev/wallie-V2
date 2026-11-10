@@ -19,6 +19,7 @@ from donations.base import DonationDedupe
 from core.highlights import HighlightTracker
 from core.persona import Persona
 from llm import LLMProvider
+from llm.tracing import flush_tracing, workflow
 from tts import TTSProvider
 from utils.sentences import SentenceStreamer
 from vision.capture import downscale_jpeg
@@ -300,6 +301,7 @@ class Orchestrator:
             self._memory.save()
         if self._ltm is not None:
             self._ltm.save()
+        flush_tracing()  # export the last buffered Respan spans before exit
         logger.info("orchestrator: stopped")
 
     # --- status ---
@@ -1325,6 +1327,7 @@ class Orchestrator:
             self._latest_frame_ts = time.time()
             logger.info(f"vision: fresh on-demand frame grabbed ({len(evt.frame.jpeg)} bytes)")
 
+    @workflow(name="wallie.reply")
     async def _run_segment(self, intent: Intent) -> None:
         """Run one segment as a producer/consumer pipeline.
 
