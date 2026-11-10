@@ -2036,3 +2036,118 @@ def test_checkpoint_compat_reports_an_unpatchable_file(dirs):
     assert healed["state"] == "error"
     assert "val_mos" in healed["detail"]
     assert healed["target"].endswith("__main__.py")
+
+
+# ---------------------------------------------------------------------------
+# The frame that is still being written
+# ---------------------------------------------------------------------------
+
+def test_a_partial_frame_is_one_row_and_becomes_the_finished_row():
+    """tqdm redraws ONE line: appending each update would drown the log."""
+    job = pt.new_job()
+    job["log"] = "starting\n"
+
+    pt._show_partial(job, "Epoch 0:  10%|#         | 120/1200")
+    pt._show_partial(job, "Epoch 0:  20%|##        | 240/1200")
+
+    assert job["log"].count("Epoch 0:") == 1          # the live frame, one row
+    assert "20%" in job["log"] and "10%" not in job["log"]
+
+    # Its \r arrives: that same row is finished, not duplicated.
+    pt._append_log(job, "Epoch 0:  20%|##        | 240/1200")
+    pt._show_partial(job, "Epoch 0:  30%|###       | 360/1200")
+    assert job["log"].count("Epoch 0:") == 2          # finished + live
+    assert job["log"].count("20%|##") == 1
+    assert job["log"].endswith("30%|###       | 360/1200\n")
+
+
+def test_the_frame_still_in_the_pipe_is_shown_before_the_next_update(monkeypatch):
+    """The invisible newest frame is why the panel looks a step behind."""
+    events: list[tuple[str, str]] = []
+
+    async def spawn(argv, *, cwd, env):
+        # tqdm puts the \r BEFORE each update, so the first frame has no
+        # separator of its own: without on_partial it is only seen when the
+        # second update arrives.
+        return _Proc([
+            b"Epoch 0:  10%|#         | 120/1200",
+            b"\rEpoch 0:  20%|##        | 240/1200",
+        ])
+
+    monkeypatch.setattr(pt, "_spawn", spawn)
+    job = pt.new_job()
+    job["cancelled"] = False
+
+    async def run() -> int:
+        return await pt._stream(
+            job, ["trainer"], cwd=Path("."), log_file=None,
+            on_line=lambda line: events.append(("line", line)),
+            on_partial=lambda frame: events.append(("partial", frame)),
+        )
+
+    assert asyncio.run(run()) == 0
+    kinds = [kind for kind, _ in events]
+    assert "partial" in kinds and "line" in kinds
+    assert kinds.index("partial") < kinds.index("line")
+    assert "10%" in events[kinds.index("partial")][1]
+    # Both frames still reach the log exactly once each.
+    assert [line for kind, line in events if kind == "line"] == [
+        "Epoch 0:  10%|#         | 120/1200",
+        "Epoch 0:  20%|##        | 240/1200",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_live_progress_frame_moves_without_duplicating_rows(
+    dirs, fast_probe, monkeypatch,
+):
+    """The newest batch is shown while it runs, and logged exactly once."""
+    pkg = make_package()
+    job = pt.new_job()
+    snapshots: list[str] = []
+
+    class _LiveReader:
+        def __init__(self, chunks: list[bytes]):
+            self.chunks = list(chunks)
+
+        async def read(self, n: int) -> bytes:
+            await asyncio.sleep(0)
+            snapshots.append(job["log"])        # what the panel would show now
+            return self.chunks.pop(0) if self.chunks else b""
+
+    class _LiveProc(_Proc):
+        def __init__(self) -> None:
+            super().__init__([])
+            # tqdm's shape: the \r comes BEFORE each later update.
+            self.stdout = _LiveReader([
+                b"Epoch 0:  50%|\xe2\x96\x88 | 1/2 [00:01<00:01, 1.0it/s]",
+                b"\rEpoch 0: 100%|\xe2\x96\x88| 2/2 [00:02<00:00, 1.0it/s]\n",
+            ])
+
+    async def spawn(argv, *, cwd, env):
+        text = " ".join(argv)
+        if "export_onnx" in text:
+            out = Path(argv[argv.index("--output-file") + 1]) \
+                if "--output-file" in argv else Path(argv[-1])
+            out.write_bytes(b"ONNX")
+            return _Proc([b"saved\n"])
+        if "piper_train.preprocess" in text:
+            run_dir = Path(argv[argv.index("--output-dir") + 1])
+            (run_dir / "dataset").mkdir(parents=True, exist_ok=True)
+            (run_dir / "dataset" / "config.json").write_text('{"audio": {}}', encoding="utf-8")
+            return _Proc([b"caching dataset...\n"])
+        _checkpoint_and_config(argv)
+        return _LiveProc()
+
+    monkeypatch.setattr(pt, "_spawn", spawn)
+    pt.begin(job, kind="train", package=str(pkg), voice_name="pt_BR-luna_br-medium",
+             epochs=1, python="py")
+    await pt.run_train(job, package=str(pkg), epochs=1, batch_size=1, accelerator="cpu")
+
+    assert job["status"] == "done", job["error"]
+    # The 50 % frame was on screen while the batch was still training…
+    assert any("50%" in snap for snap in snapshots[:-1]), snapshots
+    # …and each frame owns one row: no duplicate of the same update.
+    assert job["log"].count("Epoch 0:") == 2
+    assert job["log"].count("50%") == 1
+    assert job["log"].count("100%") == 1

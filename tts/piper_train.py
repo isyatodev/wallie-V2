@@ -898,6 +898,40 @@ def new_job() -> dict[str, Any]:
     }
 
 
+def _append_log(job: dict[str, Any], line: str) -> None:
+    """Add one finished line to the job's log, closing any in-flight frame.
+
+    The frame shown while it was being written is CONSUMED here, not appended
+    after: its ``\\r`` has now arrived, so this line is that same row finished
+    (or its completed tail). Appending would show every progress update twice
+    and halve how much real output the log can hold.
+    """
+    log = str(job.get("log") or "")
+    shown = max(0, min(int(job.get("_partial") or 0), len(log)))
+    job["_partial"] = 0
+    job["log"] = (log[:len(log) - shown] + line + "\n")[-MAX_LOG_CHARS:]
+
+
+def _show_partial(job: dict[str, Any], frame: str) -> None:
+    """Show a progress frame that has no newline yet, in place.
+
+    tqdm (Lightning's and pip's alike) redraws ONE line, putting the ``\\r``
+    BEFORE each update. So the newest frame only reaches the reader as the
+    *next* update's separator, and the panel would always be one step behind
+    the trainer — a whole batch on a slow run. Showing it as soon as it
+    arrives fixes that, but it has to REPLACE the frame it supersedes: appending
+    every update would fill the 12 000-character log with progress rows and
+    push the trainer's real output out of view.
+    """
+    text = str(frame or "").strip()
+    if not text:
+        return
+    log = str(job.get("log") or "")
+    shown = max(0, min(int(job.get("_partial") or 0), len(log)))
+    job["_partial"] = len(text) + 1      # + the newline added below
+    job["log"] = (log[:len(log) - shown] + text + "\n")[-MAX_LOG_CHARS:]
+
+
 def snapshot(job: dict[str, Any]) -> dict[str, Any]:
     """Serialisable view (the live process handle stays inside the job)."""
     return {k: v for k, v in job.items() if not k.startswith("_")}
@@ -987,8 +1021,13 @@ async def _stream(
     on_line: Callable[[str], None],
     timeout: float | None = None,
     on_spawn: Callable[[], None] | None = None,
+    on_partial: Callable[[str], None] | None = None,
 ) -> int:
-    """Run one step, feeding each line to the job; -1 when it was cancelled."""
+    """Run one step, feeding each line to the job; -1 when it was cancelled.
+
+    ``on_partial`` gets the frame that is still being written (a progress bar
+    mid-redraw), so the caller can show it before the next ``\\r`` lands.
+    """
     try:
         proc = await _spawn(argv, cwd=cwd, env=_child_env())
     except Exception as e:  # noqa: BLE001 — a bad interpreter path is user input
@@ -1002,6 +1041,7 @@ async def _stream(
         except Exception:  # noqa: BLE001
             pass
     pending = ""
+    last_partial = 0.0
     deadline = time.time() + timeout if timeout else None
     try:
         while True:
@@ -1031,6 +1071,14 @@ async def _stream(
                 if log_file is not None:
                     log_file.write(line + "\n")
                     log_file.flush()
+            # The frame still in the pipe: a bar mid-redraw. Twice a second at
+            # most — the read loop already ticks every 0.4 s, and a faster
+            # cadence would only churn the panel's DOM.
+            if on_partial is not None and pending.strip():
+                now = time.monotonic()
+                if now - last_partial >= 0.5:
+                    on_partial(pending)
+                    last_partial = now
         if pending.strip():
             on_line(pending)
             if log_file is not None:
@@ -1325,7 +1373,7 @@ async def run_train(
     }
 
     def log(line: str) -> None:
-        job["log"] = (job["log"] + line + "\n")[-MAX_LOG_CHARS:]
+        _append_log(job, line)
 
     def log_failure(message: str) -> None:
         """Put a failure where the user will look: the job and train.log.
@@ -1524,6 +1572,7 @@ async def run_train(
             rc = await _stream(
                 job, preprocess_argv(env, prepared, run_dir),
                 cwd=run_dir, log_file=log_file, on_line=log, on_spawn=notify,
+                on_partial=lambda frame: _show_partial(job, frame),
             )
             if rc != 0:
                 if job["cancelled"]:
@@ -1546,6 +1595,7 @@ async def run_train(
             rc = await _stream(
                 job, reference_argv(env["python"], options["checkpoint"], Path(reference_ckpt)),
                 cwd=run_dir, log_file=log_file, on_line=log, on_spawn=notify,
+                on_partial=lambda frame: _show_partial(job, frame),
             )
             if rc != 0:
                 if _stopped_by_user(job, run_dir):
@@ -1584,20 +1634,30 @@ async def run_train(
                              "epoch": job.get("epoch", 0)})
         notify()
 
+        def apply_epoch(line: str) -> None:
+            """Turn a trainer line into the job's epoch and progress."""
+            parsed = parse_epoch(line, job["epochs"])
+            if parsed is None:
+                return
+            job["epoch"] = parsed["epoch"]
+            job["progress"] = round(8.0 + parsed["percent"] * 0.85, 1)
+            # Persist the epoch as it advances: a cancelled run must be
+            # resumable at the right place even after a restart.
+            if parsed["epoch"] != job.get("_saved_epoch"):
+                job["_saved_epoch"] = parsed["epoch"]
+                _write_run(run_dir, {**record, "steps": job["steps"],
+                                     "status": "running",
+                                     "epoch": parsed["epoch"]})
+                notify()
+
         def on_train_line(line: str) -> None:
             log(line)
-            parsed = parse_epoch(line, job["epochs"])
-            if parsed is not None:
-                job["epoch"] = parsed["epoch"]
-                job["progress"] = round(8.0 + parsed["percent"] * 0.85, 1)
-                # Persist the epoch as it advances: a cancelled run must be
-                # resumable at the right place even after a restart.
-                if parsed["epoch"] != job.get("_saved_epoch"):
-                    job["_saved_epoch"] = parsed["epoch"]
-                    _write_run(run_dir, {**record, "steps": job["steps"],
-                                         "status": "running",
-                                         "epoch": parsed["epoch"]})
-                    notify()
+            apply_epoch(line)
+
+        def on_train_partial(frame: str) -> None:
+            """A bar mid-redraw: show it now, and let it move the bar too."""
+            _show_partial(job, frame)
+            apply_epoch(frame)
 
         rc = await _stream(
             job,
@@ -1614,6 +1674,7 @@ async def run_train(
             log_file=log_file,
             on_line=on_train_line,
             on_spawn=notify,
+            on_partial=on_train_partial,
         )
         if rc != 0:
             if _stopped_by_user(job, run_dir):
@@ -1639,6 +1700,7 @@ async def run_train(
             job, export_argv(env, ckpt, onnx),
             cwd=run_dir, log_file=log_file, on_line=log, timeout=EXPORT_TIMEOUT,
             on_spawn=notify,
+            on_partial=lambda frame: _show_partial(job, frame),
         )
         if rc != 0:
             if _stopped_by_user(job, run_dir):
@@ -1728,9 +1790,9 @@ async def run_setup(job: dict[str, Any], python: str = "") -> None:
             argv,
             cwd=piper_setup.REPO_ROOT,
             log_file=None,
-            on_line=lambda line: job.__setitem__(
-                "log", (job["log"] + line + "\n")[-MAX_LOG_CHARS:]
-            ),
+            on_line=lambda line: _append_log(job, line),
+            # pip's download bars redraw the same way: show them mid-flight.
+            on_partial=lambda frame: _show_partial(job, frame),
             timeout=SETUP_TIMEOUT,
         )
         if rc != 0:

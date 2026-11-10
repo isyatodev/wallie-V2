@@ -294,6 +294,14 @@ the dashboard stays free of torch. Tensors are matched by name and shape: the sa
 quality transfer almost everything, a different one only what lines up — the training log reports
 how many the trainer actually copied.
 
+**Watching a run.** The panel's progress bar, `phase_label` and log are driven by the trainer's own
+output, and the frame it is drawing right now is shown as it is drawn: Lightning's and pip's bars
+redraw one line with a leading `\r`, so it is displayed in place (and becomes that row once that `\r`
+arrives, never a duplicate). A run reports its epochs (`epoch 3/50`), the phase it is in
+(`preparing the dataset…`, `resuming from epoch 12…`, `exporting…`), the total elapsed time and its
+pid, and the log follows itself — the state is mirrored to `job.json`/`train.log`, so closing the tab
+or restarting the dashboard does not lose the run.
+
 **4. Install.** When the run exports its model, **attach** copies `pt_BR-<voice>-medium.onnx` +
 `.onnx.json` into `voices/` and registers it as a saved local voice, so it appears in the Voice page
 pickers, the A/B and every copy/pull/backup of the library. Kokoro is the exception: nothing trains
